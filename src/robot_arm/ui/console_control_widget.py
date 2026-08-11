@@ -25,7 +25,7 @@ from PyQt6.QtGui import QPixmap, QImage
 
 from utils import get_logger
 from robot_arm.ui.console_widget import ArmConsoleWidget, CART_AXIS_NAMES
-from devices.robot_arm import create_backend, RobotArmStatus
+from devices.robot_arm import create_backend, load_config, RobotArmStatus
 from devices.robot_arm.duco_rpc import ST_ROBOT, ST_SAFE, ST_MODE, ST_PROG
 
 logger = get_logger("robot_arm.console")
@@ -117,6 +117,7 @@ class ArmConsoleControlWidget(ArmConsoleWidget):
                  backend=None, owns_backend: bool = True,
                  on_backend_changed=None):
         super().__init__(parent)
+        self._apply_local_config_defaults()
         self._owns_backend = owns_backend
         # 后端换新实例时的通知回调：连接时 _on_connect 会 create_backend 造一个**新** http
         # 后端实例并赋给 self.backend；模块用此回调把 _shared_backend 同步到该实时后端，
@@ -146,6 +147,27 @@ class ArmConsoleControlWidget(ArmConsoleWidget):
         self._sync_timer.start(SYNC_INTERVAL_MS)
 
         logger.info("ArmConsoleControlWidget 初始化 (owns_backend=%s)", owns_backend)
+
+    def _apply_local_config_defaults(self) -> None:
+        """用 local_config.toml 的 [duco] 值初始化可编辑的连接栏。"""
+        try:
+            cfg = load_config()
+            connection = cfg.get("connection") or {}
+            ip = str(connection.get("ip") or "").strip()
+            if ip:
+                self.ip_edit.setText(ip)
+            if connection.get("rpc_port") is not None:
+                self.port_spin.setValue(int(connection["rpc_port"]))
+
+            base_url = str(cfg.get("armweb_base_url") or "").strip()
+            if base_url:
+                self.server_edit.setText(base_url)
+                self.cam_server.setText(base_url)
+        except Exception as exc:
+            logger.warning(
+                "读取 local_config.toml 的 DUCO 默认值失败，保留界面默认值: %s",
+                exc,
+            )
 
     @property
     def backend(self):

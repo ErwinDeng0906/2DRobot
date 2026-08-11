@@ -1,6 +1,6 @@
-"""调用 D:\\SNRobotLab\\scara_enable.exe（直调 RobotSDK.dll）。
+"""调用 scara_enable.exe（直调 RobotSDK.dll）。
 
-命令名对应官方 UI 含义；底层 DLL 函数见各函数注释。
+独立测试脚本：路径与 main.py 相同，读仓库根目录 local_config.toml。
 前提：关掉官方 SCARA GUI 和本程序 snrobot serve（会抢连接）。
 """
 from __future__ import annotations
@@ -8,31 +8,44 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
-_DEFAULT_SDK = Path(os.environ.get("SNROBOTLAB_DIR", r"D:\SNRobotLab"))
+_ROOT = Path(__file__).resolve().parents[2]
+_SRC = _ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from scara.config.scara_config import resolve_snrobotlab_dir  # noqa: E402
 
 
 def sdk_dir() -> Path:
-    # 独立测试脚本：优先环境变量；跑 main.py 时请改用根目录 scara_config.toml（见 换机路径说明.md）
-    return Path(os.environ.get("SNROBOTLAB_DIR", str(_DEFAULT_SDK)))
+    env = os.environ.get("SNROBOTLAB_DIR", "").strip()
+    if env:
+        return Path(env)
+    return resolve_snrobotlab_dir()
 
 
 def exe_path() -> Path:
-    env = os.environ.get("SCARA_ENABLE_EXE")
+    env = os.environ.get("SCARA_ENABLE_EXE", "").strip()
     if env:
         return Path(env)
     return sdk_dir() / "scara_enable.exe"
 
 
 def _active_ip_port() -> Tuple[str, int]:
+    from scara.config.scara_config import load_scara_config
+
     cfg = sdk_dir() / "WorkStationConfig.json"
-    rows = json.loads(cfg.read_text(encoding="utf-8"))
-    for row in rows:
-        if row.get("Active"):
-            return str(row["IP"]), int(row["Port"])
-    raise RuntimeError(f"{cfg} 没有 Active 工位")
+    if cfg.is_file():
+        rows = json.loads(cfg.read_text(encoding="utf-8"))
+        for row in rows:
+            if row.get("Active"):
+                return str(row["IP"]), int(row["Port"])
+        raise RuntimeError(f"{cfg} 没有 Active 工位")
+    sc = load_scara_config()
+    return str(sc.controller_ip), int(sc.controller_port)
 
 
 def run_cmd(
@@ -42,11 +55,14 @@ def run_cmd(
     port: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """跑 scara_enable.exe；成功返回 (True, 输出)，失败 (False, 输出/错误)。"""
-    exe = exe_path()
+    try:
+        exe = exe_path()
+    except FileNotFoundError as exc:
+        return False, str(exc)
     if not exe.is_file():
         return False, (
-            f"找不到 {exe}。请先运行 tools\\scara_enable\\build.bat "
-            f"（会编译并复制到 {sdk_dir()}）"
+            f"找不到 {exe}。请把 tools\\scara_enable\\scara_enable.exe "
+            f"复制到 {sdk_dir()}（见 local_config.toml / 路径硬编码清单.md）"
         )
     if ip is None or port is None:
         ip, port = _active_ip_port()

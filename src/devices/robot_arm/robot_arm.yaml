@@ -1,5 +1,8 @@
 # GCR3-618 机械臂配置。单位: 角度rad, 长度m, 速度rad/s 或 m/s。
 # 调试期数值偏保守, 实测后再放宽。
+#
+# 换电脑时：真机 IP / armweb 地址请改仓库根目录 local_config.toml 的 [duco]，
+# 本文件里的 connection.ip / armweb_base_url 会被覆盖（见 devices.robot_arm.load_config）。
 
 connection:
   ip: "192.168.1.10"
@@ -9,6 +12,7 @@ connection:
 
 # armweb 服务器地址（主软件经它控泵/相机/机械臂代理）。主软件泵按钮直接调它，
 # 不依赖机械臂是否已连接。生产=服务器 IP:端口；本机调试可改 127.0.0.1。
+# HARDCODED_PATH(default): 可被 local_config.toml [duco].armweb_base_url 覆盖
 armweb_base_url: "http://127.0.0.1:8080"   # 单机迁移: armweb 本机运行(2026-07-16)
 
 speed:

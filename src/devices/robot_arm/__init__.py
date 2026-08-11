@@ -19,7 +19,23 @@ DEFAULT_WAYPOINTS_PATH = str(_DIR / "waypoints.json")
 
 def load_config(path: str = DEFAULT_CONFIG_PATH) -> dict:
     with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
+
+    # 本机覆盖：根目录 local_config.toml 的 [duco]（换电脑只改那一份）
+    try:
+        from scara.config.scara_config import load_duco_overrides
+        ov = load_duco_overrides()
+    except Exception:
+        ov = {}
+    if ov:
+        conn = cfg.setdefault("connection", {})
+        if ov.get("robot_ip"):
+            conn["ip"] = str(ov["robot_ip"])
+        if ov.get("rpc_port") is not None:
+            conn["rpc_port"] = int(ov["rpc_port"])
+        if ov.get("armweb_base_url"):
+            cfg["armweb_base_url"] = str(ov["armweb_base_url"])
+    return cfg
 
 
 def create_backend(mode: str = "sim", cfg: dict = None,

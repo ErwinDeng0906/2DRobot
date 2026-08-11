@@ -1,0 +1,38 @@
+# =============================================================================
+# 本机配置模板（全局唯一需要改的路径/地址文件）
+# =============================================================================
+# 用法：
+#   1. 复制本文件为程序根目录下的 local_config.toml
+#   2. 按你电脑实际情况改下面的值
+#   3. 运行 python main.py
+#
+# 注意：
+#   - local_config.toml 不要提交到 git（每人一份）
+#   - Windows 路径请用双反斜杠：C:\\software\\SNRobotLab
+#   - snrobot / scara_do / scara_enable / RobotSDK.dll / 许可证 必须在同一目录
+# =============================================================================
+
+[paths]
+# 【必改】新松 SNRobotLab 安装目录（搜 snrobot.exe 找到它所在文件夹）
+snrobotlab_dir = "D:\\SNRobotLab"
+
+[scara]
+exe_name = "snrobot.exe"
+# 控制器地址（也会传给 scara_do / scara_enable）
+controller_ip = "192.168.1.100"
+controller_port = 20002
+command_timeout_s = 8.0
+poll_interval_ms = 300
+default_speed_percent = 20
+default_joint_step_deg = 1.0
+default_cart_step_mm = 5.0
+move_hold_s = 4
+require_enable_before_motion = true
+disable_on_disconnect = false
+allow_t2_mode = false
+
+[duco]
+# DUCO 真机（经 armweb）。一般本机调试不用改 armweb_base_url。
+robot_ip = "192.168.1.10"
+rpc_port = 7003
+armweb_base_url = "http://127.0.0.1:8080"

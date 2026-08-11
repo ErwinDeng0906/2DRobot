@@ -3,6 +3,7 @@ logs/
 __pycache__/
 *.pyc
 .env
+local_config.toml
 scara_config.toml
 Trajectory Photos/
 scara_snap_*.jpg

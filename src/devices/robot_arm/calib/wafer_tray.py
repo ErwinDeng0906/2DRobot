@@ -344,6 +344,7 @@ def _run_tests():
     print("=" * 60)
 
     # 1. Load real tray geometry and print summary.
+    # HARDCODED_PATH: 仅 wafer_tray.py 单独自测用，不影响 python main.py
     tray_path = Path("C:/Users/Lenovo/tray_geometry.json")
     geom = load_tray_geometry(tray_path)
     print(

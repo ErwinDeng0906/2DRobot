@@ -29,12 +29,14 @@ PathLike = Union[str, Path]
 
 def sdk_dir(override: Optional[PathLike] = None) -> Path:
     if override is not None:
-        return Path(override)
+        p = Path(override)
+        if str(p).strip():
+            return p
     return resolve_snrobotlab_dir()
 
 
 def exe_path(override_sdk: Optional[PathLike] = None) -> Path:
-    if override_sdk is not None:
+    if override_sdk is not None and str(override_sdk).strip():
         return Path(override_sdk) / "scara_enable.exe"
     env = os.environ.get("SCARA_ENABLE_EXE", "").strip()
     if env:
@@ -125,12 +127,20 @@ def run_cmd(
 ) -> Tuple[bool, str]:
     """跑 scara_enable.exe；成功返回 (True, 输出)，失败 (False, 输出/错误)。"""
     root = sdk_dir
-    exe = exe_path(root)
+    try:
+        exe = exe_path(root)
+    except FileNotFoundError as exc:
+        return False, str(exc)
+    if not str(exe.parent).strip() or (root is not None and not str(root).strip()):
+        return False, (
+            "未配置 SNRobotLab 目录。请复制 local_config.example.toml 为 "
+            "local_config.toml，并填写 [paths] snrobotlab_dir。"
+        )
     if not exe.is_file():
         return False, (
             f"找不到 {exe}。\n"
             f"请把 tools\\scara_enable\\scara_enable.exe 复制到 SNRobotLab"
-            f"（与 snrobot.exe 同目录），并在 scara_config.toml 设置正确的 exe_dir。"
+            f"（与 snrobot.exe 同目录），并在 local_config.toml 设置正确的 snrobotlab_dir。"
         )
     bad = _check_sdk_layout(exe)
     if bad:

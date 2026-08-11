@@ -12,7 +12,7 @@ UI 仅在机械臂已连接时允许手动改 DO；启动/断开/急停/退出�
 
 重要：scara_do.exe 必须和 RobotSDK.dll、许可证放在同一目录（SNRobotLab）。
 不要从仓库 tools\\scara_do\\ 直接运行。路径由调用方传入 sdk_dir，
-或由 SNROBOTLAB_DIR / scara_config.toml 决定。
+或由 SNROBOTLAB_DIR / local_config.toml 决定。
 """
 from __future__ import annotations
 
@@ -32,13 +32,18 @@ PathLike = Union[str, Path]
 
 def sdk_dir(override: Optional[PathLike] = None) -> Path:
     if override is not None:
-        return Path(override)
-    return resolve_snrobotlab_dir()
+        p = Path(override)
+        if str(p).strip():
+            return p
+    try:
+        return resolve_snrobotlab_dir()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(str(exc)) from exc
 
 
 def exe_path(override_sdk: Optional[PathLike] = None) -> Path:
     # 调用方已指定 SNRobotLab 目录时，强制用该目录下的 exe（避免环境变量指到 tools\\）
-    if override_sdk is not None:
+    if override_sdk is not None and str(override_sdk).strip():
         return Path(override_sdk) / "scara_do.exe"
     env = os.environ.get("SCARA_DO_EXE", "").strip()
     if env:
@@ -96,12 +101,20 @@ def set_uo_level(
     """写用户输出 UO[channel]，电平 level 为 0 或 1。"""
     # 参数名 sdk_dir 会遮蔽模块函数，用局部变量
     root = sdk_dir
-    exe = exe_path(root)
+    try:
+        exe = exe_path(root)
+    except FileNotFoundError as exc:
+        return False, str(exc)
+    if not str(exe.parent).strip() or (root is not None and not str(root).strip()):
+        return False, (
+            "未配置 SNRobotLab 目录。请复制 local_config.example.toml 为 "
+            "local_config.toml，并填写 [paths] snrobotlab_dir。"
+        )
     if not exe.is_file():
         return False, (
             f"找不到 {exe}。\n"
             f"请把 tools\\scara_do\\scara_do.exe 复制到 SNRobotLab"
-            f"（与 snrobot.exe 同目录），并在 scara_config.toml 设置正确的 exe_dir。"
+            f"（与 snrobot.exe 同目录），并在 local_config.toml 设置正确的 snrobotlab_dir。"
         )
     bad = _check_sdk_layout(exe)
     if bad:

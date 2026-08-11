@@ -143,13 +143,18 @@ class ScaraController(QObject):
             self._rx.put(None)
 
     def _start_proc(self) -> bool:
+        if not self._cfg.exe_dir:
+            self.error_occurred.emit(
+                "未配置 SNRobotLab 目录：请复制 local_config.example.toml 为 "
+                "local_config.toml，并填写 [paths] snrobotlab_dir。详见 路径硬编码清单.md"
+            )
+            return False
         exe = Path(self._cfg.exe_path)
         if not exe.is_file():
             self.error_occurred.emit(
                 f"找不到 snrobot.exe：{exe}\n"
-                f"请复制 scara_config.example.toml 为根目录 scara_config.toml，"
-                f"把 connection.exe_dir 改成你电脑上 SNRobotLab 的真实路径"
-                f"（该目录里应有 snrobot.exe、RobotSDK.dll、许可证）。详见 换机路径说明.md"
+                f"请确认 local_config.toml 的 [paths] snrobotlab_dir 正确，"
+                f"且该目录含 snrobot.exe、RobotSDK.dll、许可证。"
             )
             return False
         try:
@@ -742,6 +747,222 @@ class ScaraController(QObject):
             return True
         finally:
             self._motion_sequence_lock.release()
+
+    def move_xyzr_sync(
+        self,
+        name: str,
+        *,
+        x_mm: float = 0.0,
+        y_mm: float = 0.0,
+        z_mm: float = 0.0,
+        r_deg: float = 0.0,
+        should_stop: Optional[Callable[[], bool]] = None,
+        tolerance_mm: float = 0.2,
+        tolerance_deg: float = 0.2,
+    ) -> bool:
+        """阻塞执行相对 XYZ/R 动作，并以状态回读验证每个分量到位。
+
+        ``x_mm/y_mm/z_mm`` 是世界坐标相对位移；``r_deg`` 按本机 SCARA
+        约定映射到 J4 相对旋转。组合动作的安全顺序为：正 Z（先升高）→
+        X/Y/R → 负 Z（最后下降）。复杂路径仍建议在动作文件中拆成独立步骤。
+        """
+        if not self._motion_guard():
+            return False
+        try:
+            deltas = {
+                "X": float(x_mm),
+                "Y": float(y_mm),
+                "Z": float(z_mm),
+                "R": float(r_deg),
+            }
+            tolerance_mm = float(tolerance_mm)
+            tolerance_deg = float(tolerance_deg)
+        except (TypeError, ValueError):
+            self.warning_occurred.emit(f"执行「{name}」中止：XYZ/R 参数不是数字")
+            return False
+        if not all(math.isfinite(value) for value in deltas.values()):
+            self.warning_occurred.emit(f"执行「{name}」中止：XYZ/R 参数不是有限数")
+            return False
+        if (
+            not math.isfinite(tolerance_mm)
+            or not math.isfinite(tolerance_deg)
+            or tolerance_mm <= 0
+            or tolerance_deg <= 0
+        ):
+            self.warning_occurred.emit(f"执行「{name}」中止：到位容差无效")
+            return False
+        if not any(abs(value) > 1e-12 for value in deltas.values()):
+            self.warning_occurred.emit(f"执行「{name}」中止：XYZ/R 增量全部为 0")
+            return False
+        if not self._motion_sequence_lock.acquire(blocking=False):
+            self.warning_occurred.emit("已有运动任务正在执行，忽略重复运动命令")
+            return False
+
+        motion_started = False
+        try:
+            initial = self.read_all_sync()
+            if initial is None:
+                self.warning_occurred.emit(f"执行「{name}」中止：无法读取起始位置")
+                return False
+            pose = initial.get("pose")
+            joints = initial.get("joints")
+            if not isinstance(pose, (list, tuple)) or len(pose) != 6:
+                self.warning_occurred.emit(f"执行「{name}」中止：起始位姿无效")
+                return False
+            if not isinstance(joints, (list, tuple)) or len(joints) != 4:
+                self.warning_occurred.emit(f"执行「{name}」中止：起始关节值无效")
+                return False
+
+            targets = {
+                "X": float(pose[0]) + deltas["X"],
+                "Y": float(pose[1]) + deltas["Y"],
+                "Z": float(pose[2]) + deltas["Z"],
+                "R": float(joints[3]) + deltas["R"],
+            }
+            order: list[str] = []
+            if deltas["Z"] > 1e-12:
+                order.append("Z")
+            order.extend(axis for axis in ("X", "Y", "R") if abs(deltas[axis]) > 1e-12)
+            if deltas["Z"] < -1e-12:
+                order.append("Z")
+
+            for axis in order:
+                axis_ok = False
+                reason = "timeout"
+                tolerance = tolerance_deg if axis == "R" else tolerance_mm
+                for attempt in range(1, 4):
+                    failure = self._motion_preflight(name, should_stop)
+                    if failure:
+                        if motion_started:
+                            self._abort_motion(failure)
+                        else:
+                            self.warning_occurred.emit(failure)
+                        return False
+
+                    status = self.read_all_sync()
+                    if status is None:
+                        reason = f"执行「{name}」中止：读取 {axis} 当前位置失败"
+                        if motion_started:
+                            self._abort_motion(reason)
+                        else:
+                            self.warning_occurred.emit(reason)
+                        return False
+                    current = (
+                        float(status["joints"][3])
+                        if axis == "R"
+                        else float(status["pose"][("X", "Y", "Z").index(axis)])
+                    )
+                    remaining = targets[axis] - current
+                    if abs(remaining) > tolerance:
+                        motion_started = True
+                        self.info_occurred.emit(
+                            f"执行「{name}」：{axis} 第 {attempt}/3 次，剩余 {remaining:+.3f}"
+                        )
+                        if axis == "R":
+                            hold_s = max(1, int(self._cfg.move_hold_s))
+                            out = self._send(f"move1 4 {remaining:g} {hold_s}")
+                        else:
+                            out = self._send(f"cartstep {CART_AXIS[axis]} {remaining:g}")
+                        if not self._ok(out):
+                            self._abort_motion(f"执行「{name}」失败：{axis} 命令未成功")
+                            return False
+
+                    settled, reason = self._wait_xyzr_target_sync(
+                        axis,
+                        targets[axis],
+                        should_stop=should_stop,
+                        tolerance=tolerance,
+                        timeout_s=max(2.0, min(8.0, float(self._cfg.command_timeout_s))),
+                    )
+                    if settled:
+                        axis_ok = True
+                        break
+                    if reason != "timeout":
+                        self._abort_motion(f"执行「{name}」中止：{axis} {reason}")
+                        return False
+                    if attempt < 3:
+                        self.warning_occurred.emit(
+                            f"执行「{name}」：{axis} 未到位，重新读取残差后重试"
+                        )
+
+                if not axis_ok:
+                    self._abort_motion(f"执行「{name}」失败：{axis} 三次尝试后仍未到位")
+                    return False
+
+            final = self.read_all_sync()
+            if final is None:
+                self._abort_motion(f"执行「{name}」失败：无法验证最终位置")
+                return False
+            errors = {
+                "X": abs(float(final["pose"][0]) - targets["X"]),
+                "Y": abs(float(final["pose"][1]) - targets["Y"]),
+                "Z": abs(float(final["pose"][2]) - targets["Z"]),
+                "R": abs(float(final["joints"][3]) - targets["R"]),
+            }
+            failed = [
+                axis
+                for axis in order
+                if errors[axis] > (tolerance_deg if axis == "R" else tolerance_mm)
+            ]
+            if failed:
+                detail = ", ".join(f"{axis}={errors[axis]:.3f}" for axis in failed)
+                self._abort_motion(f"执行「{name}」最终未到位：{detail}")
+                return False
+            self.status_updated.emit(final)
+            return True
+        finally:
+            self._motion_sequence_lock.release()
+
+    def _wait_xyzr_target_sync(
+        self,
+        axis: str,
+        target: float,
+        *,
+        should_stop: Optional[Callable[[], bool]],
+        tolerance: float,
+        timeout_s: float,
+    ) -> Tuple[bool, str]:
+        """等待 XYZ 位姿分量或 J4/R 连续两次进入到位容差。"""
+        deadline = time.monotonic() + max(0.5, float(timeout_s))
+        stable_samples = 0
+        read_failures = 0
+        poll_s = max(0.05, min(0.2, self._cfg.poll_interval_ms / 1000.0))
+        while time.monotonic() < deadline:
+            if should_stop is not None and should_stop():
+                return False, "已取消"
+            if not self._connected or self._proc is None or self._proc.poll() is not None:
+                return False, "控制桥已断开"
+            status = self.read_all_sync()
+            if status is None:
+                read_failures += 1
+                if read_failures >= 3:
+                    return False, "连续三次状态读取失败"
+                time.sleep(poll_s)
+                continue
+            read_failures = 0
+            if (
+                status.get("need_clear")
+                or status.get("estop")
+                or int(status.get("warn", 0)) != 0
+            ):
+                return False, "出现急停或报警"
+            if self._cfg.require_enable_before_motion and not bool(
+                status.get("effectively_enabled")
+            ):
+                return False, "使能已丢失"
+            current = (
+                float(status["joints"][3])
+                if axis == "R"
+                else float(status["pose"][("X", "Y", "Z").index(axis)])
+            )
+            if abs(current - float(target)) <= tolerance:
+                stable_samples += 1
+                if stable_samples >= 2:
+                    return True, ""
+            else:
+                stable_samples = 0
+            time.sleep(poll_s)
+        return False, "timeout"
 
     def _motion_preflight(
         self,

@@ -1,6 +1,6 @@
 # SCARA 使能 / 急停 / 清报警 SDK 探测
 
-- C 工具：`tools/scara_enable/` → 编译到 `D:\SNRobotLab\scara_enable.exe`
+- C 工具：`tools/scara_enable/` → 编译后复制到 `local_config.toml` 里的 `snrobotlab_dir`（不要写死盘符）
 - Python：`tools/uitest/enable_client.py` + `test_enable.py`
 
 ## 当前可用命令（已真机确认）

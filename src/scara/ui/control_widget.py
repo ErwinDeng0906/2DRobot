@@ -9,12 +9,11 @@ SCARA 机械臂控制界面
 from __future__ import annotations
 
 import importlib.util
-import math
 import sys
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QImage, QPixmap
@@ -28,8 +27,8 @@ from PyQt6.QtWidgets import (
 from utils import get_logger
 from scara.config.scara_config import ScaraConfig, load_scara_config
 from scara.controller.scara_controller import ScaraController
+from scara.ui.action_worker import ActionWorker, normalize_action_task
 from scara.ui.camera_view import ScaraCameraThread
-from scara.ui.photo_trajectory_worker import PhotoTrajectoryWorker
 from robot_arm.ui import theme as T
 
 logger = get_logger("scara.ui")
@@ -205,9 +204,16 @@ class ScaraControlWidget(QWidget):
         self._owns = owns_controller
         self._ctrl = controller or ScaraController(self._cfg)
         self._cam: Optional[ScaraCameraThread] = None
-        self._trajectory_file: Optional[Path] = None
-        self._trajectory_steps: list[dict[str, object]] = []
-        self._photo_worker: Optional[PhotoTrajectoryWorker] = None
+        self._action_file: Optional[Path] = None
+        self._action_builder: Optional[Callable[[], dict]] = None
+        self._action_camera_calculator: Optional[Callable[[list[float]], dict]] = None
+        self._action_source_position_calculators: dict[
+            int, Callable[[list[float], list[float]], dict]
+        ] = {}
+        self._action_task: Optional[dict] = None
+        self._action_worker: Optional[ActionWorker] = None
+        self._action_control_states: list[tuple[QWidget, bool]] = []
+        self._resume_camera_index: Optional[int] = None
 
         self._joint_v: list[QLabel] = []
         self._joint_bar: list[QProgressBar] = []
@@ -340,13 +346,16 @@ class ScaraControlWidget(QWidget):
 
         f, g = _card("轨迹拍照")
         row = QHBoxLayout()
-        self._btn_import_trajectory = _btn("导入轨迹")
-        self._trajectory_label = QLabel("未导入")
-        self._trajectory_label.setObjectName("muted")
-        row.addWidget(self._btn_import_trajectory)
-        row.addWidget(self._trajectory_label, 1)
+        self._btn_import_action = _btn("导入动作")
+        self._action_label = QLabel("未导入")
+        self._action_label.setObjectName("muted")
+        self._btn_run_action = _btn("执行动作", "primary")
+        self._btn_run_action.setEnabled(False)
+        row.addWidget(self._btn_import_action)
+        row.addWidget(self._action_label, 1)
+        row.addWidget(self._btn_run_action)
         g.addLayout(row)
-        note = QLabel("导入轨迹后，可用源#1相机在每个到位点自动保存照片。")
+        note = QLabel("动作可组合 XYZ/R 运动、源#0/#1/#2 拍照和 JSON 途径点记录。")
         note.setObjectName("muted"); note.setWordWrap(True)
         g.addWidget(note)
         v.addWidget(f)
@@ -395,11 +404,8 @@ class ScaraControlWidget(QWidget):
         self._btn_cam = QPushButton("连接相机"); self._btn_cam.setObjectName("cambtn")
         self._btn_snap = QPushButton("快照"); self._btn_snap.setObjectName("cambtn")
         self._cam_idx = QSpinBox(); self._cam_idx.setRange(0, 8); self._cam_idx.setValue(self._default_cam_index()); self._cam_idx.setPrefix("源#")
-        self._btn_photo_trajectory = QPushButton("沿轨迹拍照")
-        self._btn_photo_trajectory.setObjectName("cambtn")
-        self._btn_photo_trajectory.setEnabled(False)
         bar.addWidget(self._btn_cam); bar.addWidget(self._btn_snap); bar.addWidget(self._cam_idx)
-        bar.addWidget(self._btn_photo_trajectory); bar.addStretch(1)
+        bar.addStretch(1)
         g.addLayout(bar)
         lights = QGridLayout(); lights.setSpacing(6)
         for i, key in enumerate(["使能", "运行状态", "急停", "模式", "循环", "机械锁"]):
@@ -485,10 +491,10 @@ class ScaraControlWidget(QWidget):
         self._btn_save_preset.clicked.connect(self._on_save_preset)
         self._btn_goto.clicked.connect(lambda: self._ctrl.cmd_goto_preset(self._preset_combo.currentText()))
         self._btn_del_preset.clicked.connect(lambda: self._ctrl.delete_preset(self._preset_combo.currentText()))
-        self._btn_import_trajectory.clicked.connect(self._choose_trajectory_file)
+        self._btn_import_action.clicked.connect(self._choose_action_file)
+        self._btn_run_action.clicked.connect(self._on_run_action)
         self._btn_cam.clicked.connect(self._toggle_camera)
         self._btn_snap.clicked.connect(self._snapshot)
-        self._btn_photo_trajectory.clicked.connect(self._on_photo_trajectory)
         self._ctrl.connection_changed.connect(self._on_conn)
         self._ctrl.status_updated.connect(self._on_status)
         self._ctrl.presets_changed.connect(self._on_presets)
@@ -519,26 +525,29 @@ class ScaraControlWidget(QWidget):
         if name:
             self._ctrl.save_preset(name); self._preset_name.clear()
 
-    def _choose_trajectory_file(self) -> None:
-        """选择并校验只描述目标点、不在导入时连接硬件的轨迹插件。"""
+    def _choose_action_file(self) -> None:
+        """选择并校验只描述步骤、导入时绝不访问硬件的动作插件。"""
         project_root = Path(__file__).resolve().parents[3]
         initial_dir = project_root / "Preset Trajectories"
         if not initial_dir.is_dir():
             initial_dir = project_root
         selected, _ = QFileDialog.getOpenFileName(
             self,
-            "选择拍照轨迹文件",
+            "选择动作文件",
             str(initial_dir),
-            "Python trajectory files (*.py);;All files (*.*)",
+            "Python action files (*.py);;All files (*.*)",
         )
         if not selected:
             return
 
         path = Path(selected).resolve()
-        self._btn_photo_trajectory.setEnabled(False)
-        self._trajectory_steps = []
+        self._btn_run_action.setEnabled(False)
+        self._action_task = None
+        self._action_builder = None
+        self._action_camera_calculator = None
+        self._action_source_position_calculators = {}
         try:
-            module_name = f"_scara_trajectory_{abs(hash(str(path)))}"
+            module_name = f"_scara_action_{abs(hash(str(path)))}"
             spec = importlib.util.spec_from_file_location(module_name, path)
             if spec is None or spec.loader is None:
                 raise ValueError("无法创建 Python 模块加载器")
@@ -546,68 +555,103 @@ class ScaraControlWidget(QWidget):
             sys.modules[module_name] = module
             spec.loader.exec_module(module)
 
-            if getattr(module, "TRAJECTORY_API_VERSION", None) != 1:
-                raise ValueError("不支持的轨迹 API 版本（需要 TRAJECTORY_API_VERSION = 1）")
-            build = getattr(module, "build_trajectory", None)
+            if getattr(module, "ACTION_API_VERSION", None) != 1:
+                raise ValueError("不支持的动作 API 版本（需要 ACTION_API_VERSION = 1）")
+            build = getattr(module, "build_action", None)
             if not callable(build):
-                raise ValueError("轨迹文件必须定义 build_trajectory()")
+                raise ValueError("动作文件必须定义 build_action()")
 
-            steps = build()
-            if not isinstance(steps, list) or not steps:
-                raise ValueError("build_trajectory() 必须返回非空列表")
-            normalized: list[dict[str, object]] = []
-            for index, step in enumerate(steps, start=1):
-                if not isinstance(step, dict) or not isinstance(step.get("name"), str):
-                    raise ValueError(f"第 {index} 步缺少有效 name")
-                joints = step.get("joints")
-                if not isinstance(joints, (list, tuple)) or len(joints) != 4:
-                    raise ValueError(f"第 {index} 步必须包含 4 个关节值")
-                values = [float(value) for value in joints]
-                if not all(math.isfinite(value) for value in values):
-                    raise ValueError(f"第 {index} 步包含非有限关节值")
-                normalized.append({"name": step["name"], "joints": values})
-
-            self._trajectory_file = path
-            self._trajectory_steps = normalized
-            self._btn_import_trajectory.setToolTip(str(path))
-            self._btn_photo_trajectory.setEnabled(True)
-            self._trajectory_label.setText(f"{path.name} · {len(normalized)} 点")
-            route = " → ".join(str(step["name"]) for step in normalized)
-            self._append("轨迹", f"已载入 {path.name}: {route}", _D["success"])
+            task = normalize_action_task(build())
+            camera_calculator = getattr(module, "camera_position_from_pose", None)
+            if camera_calculator is not None and not callable(camera_calculator):
+                raise ValueError("camera_position_from_pose 必须是可调用函数")
+            if callable(camera_calculator):
+                sample = camera_calculator([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                if not isinstance(sample, dict) or not all(
+                    key in sample for key in ("x_mm", "y_mm", "z_mm")
+                ):
+                    raise ValueError("camera_position_from_pose 必须返回 x_mm/y_mm/z_mm")
+            camera1_calculator = getattr(module, "camera1_position_from_state", None)
+            if camera1_calculator is not None and not callable(camera1_calculator):
+                raise ValueError("camera1_position_from_state 必须是可调用函数")
+            source_position_calculators = {}
+            if callable(camera1_calculator):
+                sample = camera1_calculator(
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                )
+                if not isinstance(sample, dict) or not all(
+                    key in sample for key in ("x_mm", "y_mm", "z_mm")
+                ):
+                    raise ValueError(
+                        "camera1_position_from_state 必须返回 x_mm/y_mm/z_mm"
+                    )
+                source_position_calculators[1] = camera1_calculator
+            point_count = sum(step["type"] == "record_point" for step in task["actions"])
+            photo_count = sum(step["type"] == "capture" for step in task["actions"])
+            self._action_file = path
+            self._action_builder = build
+            self._action_camera_calculator = camera_calculator
+            self._action_source_position_calculators = source_position_calculators
+            self._action_task = task
+            self._btn_import_action.setToolTip(str(path))
+            self._btn_run_action.setEnabled(True)
+            self._action_label.setText(f"{path.name} · {point_count} 点/{photo_count} 照片")
+            self._append(
+                "动作",
+                f"已载入 {path.name}: {task['name']}（{len(task['actions'])} 步）",
+                _D["success"],
+            )
         except Exception as exc:
-            self._trajectory_file = None
-            self._btn_import_trajectory.setToolTip("")
-            self._trajectory_label.setText("导入失败")
-            self._append("轨迹错误", f"无法载入 {path.name}: {exc}", _D["error"])
+            self._action_file = None
+            self._btn_import_action.setToolTip("")
+            self._action_label.setText("导入失败")
+            self._append("动作错误", f"无法载入 {path.name}: {exc}", _D["error"])
 
-    def _on_photo_trajectory(self) -> None:
-        """开始或停止源#1逐点到位拍照任务。"""
-        worker = self._photo_worker
+    def _set_action_controls_locked(self, locked: bool) -> None:
+        """锁住左栏手动控件，但让同栏的停止动作按钮保持可用。"""
+        if locked:
+            self._action_control_states = []
+            widget_types = (
+                QPushButton,
+                QLineEdit,
+                QDoubleSpinBox,
+                QSpinBox,
+                QCheckBox,
+                QComboBox,
+            )
+            seen: set[int] = set()
+            for widget_type in widget_types:
+                for widget in self._left_panel.findChildren(widget_type):
+                    if widget is self._btn_run_action or id(widget) in seen:
+                        continue
+                    seen.add(id(widget))
+                    self._action_control_states.append((widget, widget.isEnabled()))
+                    widget.setEnabled(False)
+            return
+        for widget, was_enabled in self._action_control_states:
+            widget.setEnabled(was_enabled)
+        self._action_control_states = []
+
+    def _on_run_action(self) -> None:
+        """Start or stop the imported multi-motion/multi-camera action."""
+        worker = self._action_worker
         if worker is not None and worker.isRunning():
             worker.request_stop()
-            self._btn_photo_trajectory.setText("正在停止…")
-            self._btn_photo_trajectory.setEnabled(False)
-            self._append("轨迹拍照", "已请求停止；请保持物理急停可用", _D["warning"])
+            self._btn_run_action.setText("正在停止…")
+            self._btn_run_action.setEnabled(False)
+            self._append("动作", "已请求停止；请保持物理急停可用", _D["warning"])
             return
-        if not self._trajectory_steps:
-            self._append("轨迹拍照错误", "请先导入有效轨迹", _D["error"])
+        if self._action_builder is None:
+            self._append("动作错误", "请先导入有效动作", _D["error"])
             return
         if not self._ctrl.motion_ready():
             return
 
-        camera = self._cam
-        if camera is None or not camera.isRunning():
-            self._append("轨迹拍照错误", "请将相机设为源#1并连接", _D["error"])
-            return
-        if camera.source_index != 1:
-            self._append(
-                "轨迹拍照错误",
-                f"当前为源#{camera.source_index}；请改为源#1后重新连接",
-                _D["error"],
-            )
-            return
-        if not camera.has_fresh_frame(max_age_s=1.0):
-            self._append("轨迹拍照错误", "源#1尚无新鲜画面，请稍后重试", _D["error"])
+        try:
+            task = normalize_action_task(self._action_builder())
+        except Exception as exc:
+            self._append("动作错误", f"生成动作失败：{exc}", _D["error"])
             return
 
         project_root = Path(__file__).resolve().parents[3]
@@ -616,63 +660,110 @@ class ScaraControlWidget(QWidget):
             / "Trajectory Photos"
             / datetime.now().strftime("%y%m%d%H%M%S")
         )
-        route = " → ".join(str(step["name"]) for step in self._trajectory_steps)
-        answer = QMessageBox.warning(
-            self,
-            "确认轨迹拍照",
-            "相机：源#1\n"
-            f"轨迹：{route}\n\n"
-            "每个点到位后等待 2 秒拍照，再等待 2 秒继续。\n"
-            f"输出：{output_dir}\n\n"
-            "请确认工作区无障碍物、速度较低且物理急停可用。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        sources = sorted(
+            {step["source"] for step in task["actions"] if step["type"] == "capture"}
         )
+        point_count = sum(step["type"] == "record_point" for step in task["actions"])
+        photo_count = sum(step["type"] == "capture" for step in task["actions"])
+        confirmation = QMessageBox(self)
+        confirmation.setIcon(QMessageBox.Icon.Warning)
+        confirmation.setWindowTitle("确认执行动作")
+        confirmation.setText(
+            f"动作：{task['name']}\n"
+            f"相机源：{', '.join(f'#{source}' for source in sources) or '无'}\n"
+            f"记录点：{point_count}；照片：{photo_count}\n"
+            "相机坐标：旋转相机按 Rz 计算；源1按 J1+J2 计算\n\n"
+            "动作会按脚本自动运动并直接打开所需相机源。\n"
+            f"输出：{output_dir}\n\n"
+            "请确认机械臂位于脚本要求的起点、工作区无障碍物、速度较低，"
+            "且物理急停可用。"
+        )
+        confirmation.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        confirmation.setDefaultButton(QMessageBox.StandardButton.No)
+        # 本页使用深色主题，但 Windows 的 QMessageBox 内容区可能仍是白底；
+        # 对此确认框做局部覆盖，避免全局白色文字落在原生白色背景上。
+        confirmation.setStyleSheet(
+            "QMessageBox { background-color: #FFFFFF; color: #111827; }"
+            "QMessageBox QLabel { color: #111827; background: transparent; }"
+            "QMessageBox QPushButton {"
+            " color: #111827; background-color: #F3F4F6;"
+            " border: 1px solid #9CA3AF; border-radius: 4px;"
+            " padding: 6px 18px; min-width: 70px;"
+            "}"
+            "QMessageBox QPushButton:hover { background-color: #E5E7EB; }"
+            "QMessageBox QPushButton:default {"
+            " border: 2px solid #2563EB; background-color: #DBEAFE;"
+            "}"
+        )
+        answer = confirmation.exec()
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        self._photo_worker = PhotoTrajectoryWorker(
+        # The action opens sources 0/1/2 itself.  Release the preview capture to
+        # avoid DirectShow device contention, then restore it after the run.
+        self._resume_camera_index = None
+        if self._cam is not None:
+            self._resume_camera_index = self._cam.source_index
+            self._cam.stop()
+            self._cam = None
+            self._btn_cam.setText("连接相机")
+            self._cam_lbl.setText("动作执行中 — 相机预览已临时释放")
+
+        self._action_task = task
+        self._action_worker = ActionWorker(
             self._ctrl,
-            camera,
-            self._trajectory_steps,
+            task,
             output_dir,
+            camera_position_calculator=self._action_camera_calculator,
+            source_position_calculators=self._action_source_position_calculators,
             parent=self,
         )
-        self._photo_worker.progress.connect(
-            lambda message: self._append("轨迹拍照", message, _D["accent"])
+        self._action_worker.progress.connect(
+            lambda message: self._append("动作", message, _D["accent"])
         )
-        self._photo_worker.photo_saved.connect(
+        self._action_worker.photo_saved.connect(
             lambda path: self._append("照片", f"已保存 {path}", _D["success"])
         )
-        self._photo_worker.run_finished.connect(self._on_photo_trajectory_finished)
+        self._action_worker.point_recorded.connect(
+            lambda name: self._append("采点", f"已记录 {name}", _D["success"])
+        )
+        self._action_worker.run_finished.connect(self._on_action_finished)
 
-        self._left_panel.setEnabled(False)
+        self._set_action_controls_locked(True)
         self._btn_cam.setEnabled(False)
         self._btn_snap.setEnabled(False)
         self._cam_idx.setEnabled(False)
-        self._btn_photo_trajectory.setText("停止轨迹拍照")
-        self._btn_photo_trajectory.setEnabled(True)
-        self._append("轨迹拍照", f"开始，输出文件夹 {output_dir}", _D["warning"])
-        self._photo_worker.start()
+        self._btn_run_action.setText("停止动作")
+        self._btn_run_action.setEnabled(True)
+        self._append("动作", f"开始，输出文件夹 {output_dir}", _D["warning"])
+        self._action_worker.start()
 
-    def _on_photo_trajectory_finished(
+    def _on_action_finished(
         self,
         ok: bool,
         message: str,
         output_dir: str,
     ) -> None:
-        self._left_panel.setEnabled(True)
+        self._set_action_controls_locked(False)
         self._btn_cam.setEnabled(True)
         self._btn_snap.setEnabled(True)
         self._cam_idx.setEnabled(True)
-        self._btn_photo_trajectory.setText("沿轨迹拍照")
-        self._btn_photo_trajectory.setEnabled(bool(self._trajectory_steps))
+        self._btn_run_action.setText("执行动作")
+        self._btn_run_action.setEnabled(self._action_builder is not None)
         self._append(
-            "轨迹拍照完成" if ok else "轨迹拍照停止",
+            "动作完成" if ok else "动作停止",
             f"{message}；文件夹：{output_dir}",
             _D["success"] if ok else _D["error"],
         )
-        self._photo_worker = None
+        self._action_worker = None
+
+        resume_index = self._resume_camera_index
+        self._resume_camera_index = None
+        if resume_index is not None:
+            self._cam_idx.setValue(resume_index)
+            self._toggle_camera()
 
     def _on_presets(self, names: list) -> None:
         cur = self._preset_combo.currentText()
@@ -681,8 +772,8 @@ class ScaraControlWidget(QWidget):
             self._preset_combo.setCurrentText(cur)
 
     def _toggle_camera(self) -> None:
-        if self._photo_worker is not None and self._photo_worker.isRunning():
-            self._append("相机", "轨迹拍照期间不能切换或断开相机", _D["warning"])
+        if self._action_worker is not None and self._action_worker.isRunning():
+            self._append("相机", "动作执行期间不能切换或断开相机", _D["warning"])
             return
         if self._cam is not None:
             self._cam.stop(); self._cam = None
@@ -697,8 +788,6 @@ class ScaraControlWidget(QWidget):
         self._append("相机", message, _D["error"])
         self._cam = None
         self._btn_cam.setText("连接相机")
-        if self._photo_worker is not None and self._photo_worker.isRunning():
-            self._photo_worker.request_stop()
 
     def _on_frame(self, img: QImage) -> None:
         self._cam_lbl.setPixmap(QPixmap.fromImage(img).scaled(
@@ -1014,9 +1103,9 @@ class ScaraControlWidget(QWidget):
 
     def cleanup(self) -> None:
         try:
-            if self._photo_worker is not None and self._photo_worker.isRunning():
-                self._photo_worker.request_stop()
-                self._photo_worker.wait(3000)
+            if self._action_worker is not None and self._action_worker.isRunning():
+                self._action_worker.request_stop()
+                self._action_worker.wait(3000)
             # 主界面退出：先断 snrobot，再清零 DO，避免抢连接导致关泵失败。
             if self._owns:
                 if self._ctrl.is_connected():
