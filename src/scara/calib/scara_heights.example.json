@@ -1,0 +1,6 @@
+{
+  "z_above_waffle": 30.0,
+  "z_place_waffle": 0.0,
+  "_note": "占位默认(mm, SCARA World Z / J3)。仅剩放片侧两个值；实机标定(作业单第5项)填入华夫盒上方/放片高度。",
+  "_removed_20260727": "z_pick_right / z_safe_right 已移除：右盘取片的 Z 改走 TrayCells.z_pick_for()/z_safe_for()（含 z_offset_mm）。留着这两个占位 0.0/30.0 会让 Heights 继续供出一个看似有效的 Z——而实测取片 Z 是 -62.3，按 0.0 下刀就是把吸盘怼进盘里。删掉后 loaders.Heights 的这两个字段解析为 None，任何误用都会立刻暴露成 None 而不是静默走 0.0。"
+}

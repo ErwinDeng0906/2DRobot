@@ -1,0 +1,9 @@
+.vscode/
+logs/
+__pycache__/
+*.pyc
+.env
+scara_config.toml
+Trajectory Photos/
+scara_snap_*.jpg
+_smoke/*.png

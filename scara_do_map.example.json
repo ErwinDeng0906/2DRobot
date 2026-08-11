@@ -1,0 +1,7 @@
+[
+  {
+    "_note": "格式示例。复制为 scara_do_map.json 或由界面「新建」自动生成。kind=pump|valve，ch=1..16。不存电平；启动/连接/断开/急停/退出会把这些通道写成 0。"
+  },
+  {"kind": "pump", "name": "主真空泵", "ch": 1},
+  {"kind": "valve", "name": "破真空阀", "ch": 2}
+]

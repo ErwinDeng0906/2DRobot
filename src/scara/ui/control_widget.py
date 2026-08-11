@@ -1,0 +1,1030 @@
+"""
+SCARA 机械臂控制界面
+
+对齐机械臂(robot_arm)页设计：卡片内联表头(▍标题, 不用 QGroupBox 边框标题)、
+关节角度=标签+渐变条+数值、cssClass 分级按钮、等宽玻璃输入、紧凑工业控制台密度。
+三栏：左=控制，中=相机实时画面，右=状态/数据反馈；对接 ScaraController，支持镜像。
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import math
+import sys
+from datetime import datetime
+import json
+from pathlib import Path
+from typing import Optional
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtWidgets import (
+    QWidget, QHBoxLayout, QVBoxLayout, QGridLayout, QLabel, QPushButton,
+    QLineEdit, QDoubleSpinBox, QSpinBox, QFrame, QSizePolicy, QPlainTextEdit,
+    QProgressBar, QButtonGroup, QCheckBox, QComboBox, QScrollArea, QMessageBox,
+    QDialog, QFileDialog,
+)
+
+from utils import get_logger
+from scara.config.scara_config import ScaraConfig, load_scara_config
+from scara.controller.scara_controller import ScaraController
+from scara.ui.camera_view import ScaraCameraThread
+from scara.ui.photo_trajectory_worker import PhotoTrajectoryWorker
+from robot_arm.ui import theme as T
+
+logger = get_logger("scara.ui")
+
+# 泵/阀 DO 映射文件（进程工作目录；与 scara_presets.json 同级）。只存 kind/name/ch，不存电平。
+DO_MAP_FILE = "scara_do_map.json"
+
+JOINT_NAME = ["J1", "J2", "J3", "J4"]
+JOINT_UNIT = ["°", "°", "mm", "°"]
+JOINT_RANGE = [(-132, 132), (-141, 141), (-150, 10), (-360, 360)]
+POSE_LABELS = ["X", "Y", "Z", "Rx", "Ry", "Rz"]
+POSE_UNIT = ["mm", "mm", "mm", "°", "°", "°"]
+
+_CHK = Path(__file__).parent.joinpath("check.svg").as_posix()
+
+# SCARA 页局部深色色板（不改全局 design_system，DUCO 页保持浅色）
+_D = {
+    "bg": "#0F172A",
+    "bg2": "#1E293B",
+    "card": "#1E293B",
+    "glass": "#334155",
+    "border": "#334155",
+    "border_soft": "#475569",
+    "text": "#E2E8F0",
+    "text2": "#94A3B8",
+    "muted": "#64748B",
+    "primary": "#3B82F6",
+    "primary_soft": "#1E3A5F",
+    "accent": "#22D3EE",
+    "accent_soft": "#164E63",
+    "success": "#34D399",
+    "error": "#F87171",
+    "warning": "#FBBF24",
+    "io_off": "#475569",
+    "chip_off_bg": "#334155",
+    "chip_on_bg": "#064E3B",
+    "bar_bg": "#334155",
+    "log_bg": "#0B1220",
+    "input_bg": "#0F172A",
+    "seg_bg": "#1E293B",
+}
+
+SUPPLEMENT = f"""
+QWidget#scaraRoot {{ background-color:{_D['bg']}; color:{_D['text']}; }}
+QWidget {{ font-size:12px; color:{_D['text']}; }}
+QLabel {{ color:{_D['text']}; }}
+QCheckBox {{ color:{_D['text2']}; }}
+QCheckBox::indicator {{ width:15px; height:15px; border-radius:4px;
+    border:1px solid {_D['border']}; background:{_D['glass']}; }}
+QCheckBox::indicator:checked {{ background:{_D['accent']}; border-color:{_D['accent']};
+    image:url({_CHK}); }}
+#card {{ background:{_D['card']}; border:1px solid {_D['border']}; border-radius:14px; }}
+#cardBar {{ background:{_D['accent']}; border-radius:2px; }}
+#cardTitle {{ color:{_D['accent']}; font-weight:900; font-size:12px; letter-spacing:0.7px; }}
+#colScroll, #colScroll > QWidget > QWidget {{ background:transparent; border:none; }}
+#kv {{ color:{_D['text2']}; font-size:12px; }}
+#val {{ font-family:{T.MONO}; font-weight:700; font-size:13px; color:{_D['text']}; }}
+#jname {{ font-family:{T.MONO}; font-weight:700; color:{_D['primary']}; font-size:12px; }}
+#muted {{ color:{_D['muted']}; font-size:11px; }}
+#pill {{ border-radius:9px; padding:1px 9px; font-size:11px; font-weight:700; }}
+#light {{ background:{_D['glass']}; border:1px solid {_D['border_soft']}; border-radius:7px; }}
+#lightK {{ color:{_D['text2']}; font-size:11px; }}
+#io {{ background:{_D['io_off']}; border:1px solid {_D['border_soft']}; border-radius:2px; min-width:11px; min-height:11px; }}
+#ioOn {{ background:{_D['success']}; border:1px solid {_D['success']}; border-radius:2px; min-width:11px; min-height:11px; }}
+#cam {{ background:#0b1220; border-radius:8px; color:{_D['muted']}; font-size:13px; }}
+QPushButton {{ padding:4px 9px; min-height:22px; outline:none;
+    background:{_D['glass']}; color:{_D['text']}; border:1px solid {_D['border']}; border-radius:7px; }}
+QPushButton:hover {{ background:{_D['border_soft']}; }}
+QPushButton:focus {{ outline:none; }}
+QPushButton:pressed {{ background:{_D['primary_soft']}; }}
+QPushButton:disabled {{ color:{_D['muted']}; background:#1a2332; border-color:#243044; }}
+QPushButton[cssClass="primary"] {{ background:{_D['primary']}; color:#fff; border:none; }}
+QPushButton[cssClass="primary"]:hover {{ background:#2563EB; }}
+QPushButton[cssClass="primary"]:pressed {{ background:#1D54CC; }}
+QPushButton[cssClass="success"] {{ background:{_D['success']}; color:#0F172A; border:none; }}
+QPushButton[cssClass="success"]:pressed {{ background:#1A8A5E; color:#fff; }}
+QPushButton[cssClass="jog"] {{ background:{_D['bg2']}; color:{_D['text']}; border:1px solid {_D['border']}; }}
+QPushButton[cssClass="jog"]:pressed {{ background:{_D['accent_soft']}; border-color:{_D['accent']}; }}
+QPushButton#estop:pressed {{ background:#B23244; }}
+QPushButton#estop {{ background:{_D['error']}; color:#fff; border:none; border-radius:7px;
+    font-size:13px; font-weight:800; letter-spacing:2px; min-height:0; padding:2px 16px; }}
+QPushButton#estop:hover {{ background:#C53B4C; }}
+QPushButton#estop:disabled {{ background:#7F1D1D; color:#FECACA; }}
+QPushButton#cambtn {{ background:#1e293b; color:#e2e8f0; border:1px solid #334155; }}
+QPushButton#cambtn:hover {{ background:#273449; }}
+QPushButton[cssClass="jog"] {{ min-height:34px; padding:4px 8px; border-radius:9px;
+    font-size:15px; font-weight:700; letter-spacing:1px; }}
+QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {{
+    min-height:20px; padding:2px 6px;
+    background:{_D['input_bg']}; color:{_D['text']};
+    border:1px solid {_D['border']}; border-radius:6px; }}
+QLineEdit:disabled, QDoubleSpinBox:disabled, QSpinBox:disabled, QComboBox:disabled {{
+    color:{_D['muted']}; background:#1a2332; border-color:#243044; }}
+QComboBox::drop-down {{ border:none; }}
+QComboBox QAbstractItemView {{
+    background:{_D['card']}; color:{_D['text']}; selection-background-color:{_D['primary']}; }}
+QPushButton#seg {{ border-radius:0; background:{_D['seg_bg']}; color:{_D['text2']};
+    padding:5px 3px; border:1px solid {_D['border']}; font-weight:600; }}
+QPushButton#seg:checked {{ background:{_D['primary']}; color:#fff; border-color:{_D['primary']}; }}
+QProgressBar#posbar {{ border:none; background:{_D['bar_bg']}; border-radius:4px; max-height:8px; min-height:8px; }}
+QProgressBar#posbar::chunk {{ background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+    stop:0 #7CC1EE, stop:1 {_D['primary']}); border-radius:4px; }}
+QPlainTextEdit#logbox {{ background:{_D['log_bg']}; border:1px solid {_D['border_soft']}; border-radius:8px;
+    font-family:{T.MONO}; font-size:11px; color:{_D['text2']}; }}
+QLabel#chip {{ border-radius:11px; padding:2px 9px; font-size:11px; font-weight:700; }}
+QScrollArea#colScroll QScrollBar:vertical {{
+    background:transparent; width:8px; margin:0; }}
+QScrollArea#colScroll QScrollBar::handle:vertical {{
+    background:{_D['border_soft']}; border-radius:4px; min-height:24px; }}
+QScrollArea#colScroll QScrollBar::add-line:vertical,
+QScrollArea#colScroll QScrollBar::sub-line:vertical {{ height:0; }}
+"""
+
+
+def _card(title: str) -> tuple[QFrame, QVBoxLayout]:
+    """一个栏目 = 一张卡。卡头**只放标题**，不带说明行（2026-07-28 全仓统一）。"""
+    f = QFrame(); f.setObjectName("card")
+    v = QVBoxLayout(f); v.setContentsMargins(11, 9, 11, 10); v.setSpacing(7)
+    head = QHBoxLayout(); head.setSpacing(7)
+    bar = QFrame(); bar.setObjectName("cardBar"); bar.setFixedSize(3, 13)
+    t = QLabel(title); t.setObjectName("cardTitle")
+    head.addWidget(bar); head.addWidget(t); head.addStretch(1)
+    v.addLayout(head)
+    return f, v
+
+
+def _btn(text: str, css: str = "") -> QPushButton:
+    b = QPushButton(text)
+    b.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # 点击后不留焦点虚线框
+    if css:
+        b.setProperty("cssClass", css)
+    return b
+
+
+def _pill(text: str, color: str, bg: str) -> QLabel:
+    p = QLabel(text); p.setObjectName("pill")
+    p.setStyleSheet(f"color:{color}; background:{bg};")
+    p.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    return p
+
+
+def _light(key: str) -> tuple[QFrame, QLabel]:
+    f = QFrame(); f.setObjectName("light")
+    g = QVBoxLayout(f); g.setContentsMargins(4, 4, 4, 4); g.setSpacing(1)
+    k = QLabel(key); k.setObjectName("lightK"); k.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    v = QLabel("—"); v.setAlignment(Qt.AlignmentFlag.AlignCenter); v.setStyleSheet("font-weight:700; font-size:12px;")
+    g.addWidget(k); g.addWidget(v)
+    return f, v
+
+
+def _scroll(inner: QWidget, width: int) -> QScrollArea:
+    """把一列内容包进竖向滚动区，避免加了命令头后底部卡片在小窗口被裁切。"""
+    sa = QScrollArea(); sa.setObjectName("colScroll")
+    sa.setWidget(inner); sa.setWidgetResizable(True); sa.setFixedWidth(width)
+    sa.setFrameShape(QFrame.Shape.NoFrame)
+    sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    sa.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    return sa
+
+
+class ScaraControlWidget(QWidget):
+    """SCARA 主控制界面。"""
+
+    def __init__(self, parent: Optional[QWidget] = None,
+                 config: Optional[ScaraConfig] = None,
+                 controller: Optional[ScaraController] = None,
+                 owns_controller: bool = True):
+        super().__init__(parent)
+        self.setObjectName("scaraRoot")
+        # 仅用本页深色 SUPPLEMENT，避免全局浅色 APP_STYLESHEET 盖住深色卡片/输入框
+        self.setStyleSheet(SUPPLEMENT)
+        self._cfg = config or load_scara_config()
+        self._owns = owns_controller
+        self._ctrl = controller or ScaraController(self._cfg)
+        self._cam: Optional[ScaraCameraThread] = None
+        self._trajectory_file: Optional[Path] = None
+        self._trajectory_steps: list[dict[str, object]] = []
+        self._photo_worker: Optional[PhotoTrajectoryWorker] = None
+
+        self._joint_v: list[QLabel] = []
+        self._joint_bar: list[QProgressBar] = []
+        self._pose_v: list[QLabel] = []
+        self._light: dict[str, QLabel] = {}
+        self._io_cells: list[QFrame] = []
+        # DO 行：{kind, name, ch, widget, lvl, applied}；applied=已真正下发的电平
+        self._do_entries: list[dict] = []
+
+        self._build()
+        self._load_do_map()
+        # 主界面启动时向硬件写一遍 0（镜像窗 owns=False，避免重复抢连接）
+        if self._owns:
+            self._zero_all_dos("启动")
+        self._bind()
+        for b in self.findChildren(QPushButton):   # 所有按钮去掉点击后的焦点虚线框
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._on_conn(False)                        # 初始未连接：按钮按实际状态置灰
+
+    @property
+    def controller(self) -> ScaraController:
+        return self._ctrl
+
+    def is_device_connected(self) -> bool:
+        return self._ctrl.is_connected()
+
+    # ------------------------------------------------------------------ #
+    def _build(self) -> None:
+        outer = QVBoxLayout(self); outer.setContentsMargins(12, 12, 12, 12); outer.setSpacing(10)
+        row = QHBoxLayout(); row.setSpacing(10)
+        self._left_panel = self._left()
+        row.addWidget(self._left_panel, 0)
+        row.addWidget(self._center(), 1)
+        row.addWidget(self._right(), 0)
+        outer.addLayout(row, 1)
+        # 急停：页面底部右下角（顶部不好够到，用户要求移到下面 + 缩小），永远醒目红。
+        estop_row = QHBoxLayout(); estop_row.setContentsMargins(0, 0, 0, 0); estop_row.addStretch(1)
+        self._btn_estop = QPushButton("■ 急 停"); self._btn_estop.setObjectName("estop")
+        self._btn_estop.setFixedHeight(30); self._btn_estop.setMinimumWidth(120)
+        estop_row.addWidget(self._btn_estop)
+        outer.addLayout(estop_row)
+
+    def _jog_grid(self, g: QVBoxLayout, axes) -> None:
+        """每轴一行两颗按钮：「name −」「name +」，大字号清晰可辨。"""
+        grid = QGridLayout(); grid.setSpacing(6); grid.setContentsMargins(0, 2, 0, 0)
+        grid.setColumnStretch(0, 1); grid.setColumnStretch(1, 1)
+        for i, (name, axis) in enumerate(axes):
+            bm = _btn(f"{name}  −", "jog"); bp = _btn(f"{name}  +", "jog")
+            bm.setMinimumWidth(92); bp.setMinimumWidth(92)
+            bp.pressed.connect(lambda a=axis: self._jog_press(a, "+"))
+            bp.released.connect(lambda a=axis: self._jog_release(a))
+            bp.clicked.connect(lambda _, a=axis: self._step(a, +1))
+            bm.pressed.connect(lambda a=axis: self._jog_press(a, "-"))
+            bm.released.connect(lambda a=axis: self._jog_release(a))
+            bm.clicked.connect(lambda _, a=axis: self._step(a, -1))
+            grid.addWidget(bm, i, 0); grid.addWidget(bp, i, 1)
+        g.addLayout(grid)
+
+    def _left(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w); v.setContentsMargins(0, 0, 4, 0); v.setSpacing(9)
+
+        f, g = _card("连接")
+        row = QHBoxLayout(); row.addWidget(QLabel("控制器"))
+        self._ip = QLineEdit(f"{self._cfg.controller_ip}:{self._cfg.controller_port}"); self._ip.setReadOnly(True)
+        row.addWidget(self._ip, 1); g.addLayout(row)
+        row = QHBoxLayout()
+        self._btn_conn = _btn("连接", "primary"); self._btn_disc = _btn("断开")
+        self._conn_chip = QLabel("● 未连接"); self._conn_chip.setObjectName("chip")
+        self._conn_chip.setStyleSheet(f"color:{_D['muted']}; background:{_D['chip_off_bg']};")
+        row.addWidget(self._btn_conn); row.addWidget(self._btn_disc); row.addStretch(1); row.addWidget(self._conn_chip)
+        g.addLayout(row); v.addWidget(f)
+
+        f, g = _card("伺服 / 安全")
+        row = QHBoxLayout()
+        self._btn_en = _btn("使能")  # 不默认 success，避免未读状态就显绿「已使能」
+        self._btn_dis = _btn("去使能")
+        self._btn_clr = _btn("清报警"); self._btn_home = _btn("回零")
+        for b in (self._btn_en, self._btn_dis, self._btn_clr, self._btn_home):
+            row.addWidget(b)
+        g.addLayout(row)
+        v.addWidget(f)
+
+        f, g = _card("模式 / 速度")
+        seg = QHBoxLayout(); seg.setSpacing(0); self._mode_grp = QButtonGroup(self)
+        for i, name in enumerate(["示教 T1", "示教 T2", "执行"]):
+            b = QPushButton(name); b.setObjectName("seg"); b.setCheckable(True)
+            if i == 0: b.setChecked(True)
+            if i == 1 and not self._cfg.allow_t2_mode: b.setEnabled(False)
+            self._mode_grp.addButton(b, i); seg.addWidget(b)
+        g.addLayout(seg)
+        row = QHBoxLayout(); row.addWidget(QLabel("速度"))
+        self._speed = QSpinBox(); self._speed.setRange(1, 100); self._speed.setSuffix(" %")
+        self._speed.setValue(self._cfg.default_speed_percent)
+        self._speed_bar = QProgressBar(); self._speed_bar.setObjectName("posbar")
+        self._speed_bar.setRange(0, 100); self._speed_bar.setValue(self._cfg.default_speed_percent); self._speed_bar.setTextVisible(False)
+        row.addWidget(self._speed_bar, 1); row.addWidget(self._speed)
+        g.addLayout(row); v.addWidget(f)
+
+        f, g = _card("关节点动")
+        self._jog_grid(g, list(zip(["J1", "J2", "J3/Z", "J4"], [1, 2, 3, 4])))
+        row = QHBoxLayout(); row.addWidget(QLabel("步长"))
+        self._jstep = QDoubleSpinBox(); self._jstep.setRange(0.1, 90.0)
+        self._jstep.setValue(self._cfg.default_joint_step_deg); self._jstep.setSingleStep(0.5)
+        self._cont = QCheckBox("连续(按住)")
+        u = QLabel("度/mm"); u.setObjectName("muted")
+        row.addWidget(self._jstep); row.addWidget(u); row.addStretch(1); row.addWidget(self._cont)
+        g.addLayout(row); v.addWidget(f)
+
+        f, g = _card("笛卡尔点动 (World)")
+        self._jog_grid(g, list(zip(["X", "Y", "Z"], ["X", "Y", "Z"])))
+        row = QHBoxLayout(); row.addWidget(QLabel("步长"))
+        self._cstep = QDoubleSpinBox(); self._cstep.setRange(0.1, 100.0)
+        self._cstep.setValue(self._cfg.default_cart_step_mm); self._cstep.setSingleStep(1.0)
+        u = QLabel("mm"); u.setObjectName("muted")
+        row.addWidget(self._cstep); row.addWidget(u); row.addStretch(1)
+        g.addLayout(row); v.addWidget(f)
+
+        f, g = _card("预设点")
+        row = QHBoxLayout()
+        self._preset_name = QLineEdit(); self._preset_name.setPlaceholderText("名称")
+        self._btn_save_preset = _btn("保存当前")
+        row.addWidget(self._preset_name, 1); row.addWidget(self._btn_save_preset)
+        g.addLayout(row)
+        row = QHBoxLayout()
+        self._preset_combo = QComboBox()
+        self._btn_goto = _btn("前往", "primary"); self._btn_del_preset = _btn("删除")
+        row.addWidget(self._preset_combo, 1); row.addWidget(self._btn_goto); row.addWidget(self._btn_del_preset)
+        g.addLayout(row); v.addWidget(f)
+
+        f, g = _card("轨迹拍照")
+        row = QHBoxLayout()
+        self._btn_import_trajectory = _btn("导入轨迹")
+        self._trajectory_label = QLabel("未导入")
+        self._trajectory_label.setObjectName("muted")
+        row.addWidget(self._btn_import_trajectory)
+        row.addWidget(self._trajectory_label, 1)
+        g.addLayout(row)
+        note = QLabel("导入轨迹后，可用源#1相机在每个到位点自动保存照片。")
+        note.setObjectName("muted"); note.setWordWrap(True)
+        g.addWidget(note)
+        v.addWidget(f)
+
+        # DO接口：泵/阀两列；映射持久化到 scara_do_map.json；电平改后须回车才下发
+        f, g = _card("DO接口")
+        row = QHBoxLayout()
+        self._btn_add_do = _btn("新建", "primary")
+        self._btn_add_do.clicked.connect(self._show_add_do_dialog)
+        row.addWidget(self._btn_add_do); row.addStretch(1)
+        g.addLayout(row)
+        cols = QHBoxLayout(); cols.setSpacing(8)
+        for title, attr in [("泵", "_do_pump_col"), ("阀", "_do_valve_col")]:
+            box = QWidget()
+            vcol = QVBoxLayout(box); vcol.setSpacing(4); vcol.setContentsMargins(0, 0, 0, 0)
+            hdr = QLabel(title); hdr.setObjectName("kv")
+            vcol.addWidget(hdr)
+            inner = QWidget()
+            col = QVBoxLayout(inner); col.setSpacing(4); col.setContentsMargins(0, 0, 0, 0)
+            setattr(self, attr, col)
+            vcol.addWidget(inner)
+            cols.addWidget(box, 1)
+        g.addLayout(cols)
+        tip = QLabel(
+            "须连接机械臂后才能新建/改电平/删除。"
+            " 1/0 = 高/低电平；改后按回车才写入。"
+            " 启动/连接前/断开后/急停/退出会自动把全部 DO 写成 0。"
+            " 写 DO 会另连控制器，已连接时写入可能失败（界面仍要求先连接，安全优先）。"
+        )
+        tip.setObjectName("muted"); tip.setWordWrap(True)
+        self._do_tip = tip
+        g.addWidget(tip)
+        v.addWidget(f)
+
+        v.addStretch(1)
+        return _scroll(w, 318)
+
+    def _center(self) -> QWidget:
+        f, g = _card("相机画面（SCARA 工位）")
+        self._cam_lbl = QLabel("相机未连接 — 点击「连接相机」打开 SCARA 工位相机")
+        self._cam_lbl.setObjectName("cam"); self._cam_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._cam_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._cam_lbl.setMinimumHeight(300)
+        g.addWidget(self._cam_lbl, 1)
+        bar = QHBoxLayout()
+        self._btn_cam = QPushButton("连接相机"); self._btn_cam.setObjectName("cambtn")
+        self._btn_snap = QPushButton("快照"); self._btn_snap.setObjectName("cambtn")
+        self._cam_idx = QSpinBox(); self._cam_idx.setRange(0, 8); self._cam_idx.setValue(self._default_cam_index()); self._cam_idx.setPrefix("源#")
+        self._btn_photo_trajectory = QPushButton("沿轨迹拍照")
+        self._btn_photo_trajectory.setObjectName("cambtn")
+        self._btn_photo_trajectory.setEnabled(False)
+        bar.addWidget(self._btn_cam); bar.addWidget(self._btn_snap); bar.addWidget(self._cam_idx)
+        bar.addWidget(self._btn_photo_trajectory); bar.addStretch(1)
+        g.addLayout(bar)
+        lights = QGridLayout(); lights.setSpacing(6)
+        for i, key in enumerate(["使能", "运行状态", "急停", "模式", "循环", "机械锁"]):
+            box, lbl = _light(key); self._light[key] = lbl
+            lights.addWidget(box, i // 6, i % 6)
+        g.addLayout(lights)
+        return f
+
+    @staticmethod
+    def _default_cam_index() -> int:
+        """相机源默认值按 station_map.json 角色解析（交接 §9：index 不写死，权威源唯一）：
+        优先 `scara_j3`（J3 下移相机，装上登记后自动跟随），未登记退 `right_tray`，再退 0。
+        刻意不抛异常：映射错了顶多画面串一串，不该让整个 SCARA 页起不来。"""
+        try:
+            from orchestrator.ui.peel_camera_view import cam_index_of
+            for role in ("scara_j3", "right_tray"):
+                idx = cam_index_of(role)
+                if idx is not None:
+                    return int(idx)
+        except Exception:  # noqa: BLE001
+            pass
+        return 0
+
+    def _kv_row(self, g: QVBoxLayout, key: str) -> QLabel:
+        row = QHBoxLayout(); row.setSpacing(6)
+        k = QLabel(key); k.setObjectName("kv")
+        val = QLabel("—"); val.setObjectName("val"); val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(k); row.addStretch(1); row.addWidget(val)
+        g.addLayout(row)
+        return val
+
+    def _right(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w); v.setContentsMargins(0, 0, 4, 0); v.setSpacing(9)
+
+        # 关节角度：标签 + 渐变条 + 数值
+        f, g = _card("关节角度（实时）")
+        for i in range(4):
+            row = QHBoxLayout(); row.setSpacing(7)
+            lab = QLabel(JOINT_NAME[i]); lab.setObjectName("jname"); lab.setFixedWidth(28)
+            bar = QProgressBar(); bar.setObjectName("posbar"); bar.setRange(0, 100); bar.setValue(50); bar.setTextVisible(False)
+            self._joint_bar.append(bar)
+            val = QLabel("—"); val.setObjectName("val"); val.setFixedWidth(72)
+            val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._joint_v.append(val)
+            row.addWidget(lab); row.addWidget(bar, 1); row.addWidget(val)
+            g.addLayout(row)
+        v.addWidget(f)
+
+        # 末端位姿
+        f, g = _card("末端位姿 (TCP)")
+        for i in range(6):
+            self._pose_v.append(self._kv_row(g, f"{POSE_LABELS[i]} ({POSE_UNIT[i]})"))
+        v.addWidget(f)
+
+        # IO 状态
+        f, g = _card("IO 状态  (DI 1500 · DO 4096)")
+        self._io_lbl = QLabel("DI ON: —    DO ON: —"); self._io_lbl.setObjectName("kv"); g.addWidget(self._io_lbl)
+        grid = QGridLayout(); grid.setSpacing(4)
+        for i in range(32):
+            cell = QFrame(); cell.setObjectName("io"); self._io_cells.append(cell)
+            grid.addWidget(cell, i // 16, i % 16)
+        g.addLayout(grid); v.addWidget(f)
+
+        # 报警日志
+        f, g = _card("报警 / 日志")
+        self._log = QPlainTextEdit(); self._log.setObjectName("logbox"); self._log.setReadOnly(True)
+        self._log.setMaximumBlockCount(200); self._log.setMinimumHeight(110)
+        g.addWidget(self._log); v.addWidget(f, 1)
+        return w
+
+    # ------------------------------------------------------------------ #
+    def _bind(self) -> None:
+        self._btn_conn.clicked.connect(self._on_connect_clicked)
+        self._btn_disc.clicked.connect(self._on_disconnect_clicked)
+        self._btn_en.clicked.connect(self._ctrl.cmd_enable)
+        self._btn_dis.clicked.connect(self._ctrl.cmd_disable)
+        self._btn_clr.clicked.connect(self._ctrl.cmd_clear_alarm)
+        self._btn_home.clicked.connect(self._on_home_clicked)
+        self._btn_estop.clicked.connect(self._on_estop_clicked)
+        self._mode_grp.idClicked.connect(lambda i: self._ctrl.cmd_set_mode(["T1", "T2", "Execute"][i]))
+        self._speed.valueChanged.connect(lambda val: self._ctrl.cmd_set_speed(val))
+        self._btn_save_preset.clicked.connect(self._on_save_preset)
+        self._btn_goto.clicked.connect(lambda: self._ctrl.cmd_goto_preset(self._preset_combo.currentText()))
+        self._btn_del_preset.clicked.connect(lambda: self._ctrl.delete_preset(self._preset_combo.currentText()))
+        self._btn_import_trajectory.clicked.connect(self._choose_trajectory_file)
+        self._btn_cam.clicked.connect(self._toggle_camera)
+        self._btn_snap.clicked.connect(self._snapshot)
+        self._btn_photo_trajectory.clicked.connect(self._on_photo_trajectory)
+        self._ctrl.connection_changed.connect(self._on_conn)
+        self._ctrl.status_updated.connect(self._on_status)
+        self._ctrl.presets_changed.connect(self._on_presets)
+        self._ctrl.error_occurred.connect(lambda m: self._append("错误", m, _D["error"]))
+        self._ctrl.warning_occurred.connect(lambda m: self._append("警告", m, _D["warning"]))
+        self._ctrl.info_occurred.connect(lambda m: self._append("信息", m, _D["text2"]))
+        self._ctrl.command_finished.connect(
+            lambda name, ok, msg: self._append("OK" if ok else "失败", name, _D["success"] if ok else _D["error"]))
+
+    def _jog_press(self, axis, direction: str) -> None:
+        if self._cont.isChecked():
+            self._ctrl.jog_start(axis, direction, world=isinstance(axis, str))
+
+    def _jog_release(self, axis) -> None:
+        if self._cont.isChecked():
+            self._ctrl.jog_stop(axis)
+
+    def _step(self, axis, sign: int) -> None:
+        if self._cont.isChecked():
+            return
+        if isinstance(axis, str):
+            self._ctrl.cmd_cart_step(axis, sign * self._cstep.value())
+        else:
+            self._ctrl.cmd_move_joint(axis, sign * self._jstep.value())
+
+    def _on_save_preset(self) -> None:
+        name = self._preset_name.text().strip()
+        if name:
+            self._ctrl.save_preset(name); self._preset_name.clear()
+
+    def _choose_trajectory_file(self) -> None:
+        """选择并校验只描述目标点、不在导入时连接硬件的轨迹插件。"""
+        project_root = Path(__file__).resolve().parents[3]
+        initial_dir = project_root / "Preset Trajectories"
+        if not initial_dir.is_dir():
+            initial_dir = project_root
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择拍照轨迹文件",
+            str(initial_dir),
+            "Python trajectory files (*.py);;All files (*.*)",
+        )
+        if not selected:
+            return
+
+        path = Path(selected).resolve()
+        self._btn_photo_trajectory.setEnabled(False)
+        self._trajectory_steps = []
+        try:
+            module_name = f"_scara_trajectory_{abs(hash(str(path)))}"
+            spec = importlib.util.spec_from_file_location(module_name, path)
+            if spec is None or spec.loader is None:
+                raise ValueError("无法创建 Python 模块加载器")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+
+            if getattr(module, "TRAJECTORY_API_VERSION", None) != 1:
+                raise ValueError("不支持的轨迹 API 版本（需要 TRAJECTORY_API_VERSION = 1）")
+            build = getattr(module, "build_trajectory", None)
+            if not callable(build):
+                raise ValueError("轨迹文件必须定义 build_trajectory()")
+
+            steps = build()
+            if not isinstance(steps, list) or not steps:
+                raise ValueError("build_trajectory() 必须返回非空列表")
+            normalized: list[dict[str, object]] = []
+            for index, step in enumerate(steps, start=1):
+                if not isinstance(step, dict) or not isinstance(step.get("name"), str):
+                    raise ValueError(f"第 {index} 步缺少有效 name")
+                joints = step.get("joints")
+                if not isinstance(joints, (list, tuple)) or len(joints) != 4:
+                    raise ValueError(f"第 {index} 步必须包含 4 个关节值")
+                values = [float(value) for value in joints]
+                if not all(math.isfinite(value) for value in values):
+                    raise ValueError(f"第 {index} 步包含非有限关节值")
+                normalized.append({"name": step["name"], "joints": values})
+
+            self._trajectory_file = path
+            self._trajectory_steps = normalized
+            self._btn_import_trajectory.setToolTip(str(path))
+            self._btn_photo_trajectory.setEnabled(True)
+            self._trajectory_label.setText(f"{path.name} · {len(normalized)} 点")
+            route = " → ".join(str(step["name"]) for step in normalized)
+            self._append("轨迹", f"已载入 {path.name}: {route}", _D["success"])
+        except Exception as exc:
+            self._trajectory_file = None
+            self._btn_import_trajectory.setToolTip("")
+            self._trajectory_label.setText("导入失败")
+            self._append("轨迹错误", f"无法载入 {path.name}: {exc}", _D["error"])
+
+    def _on_photo_trajectory(self) -> None:
+        """开始或停止源#1逐点到位拍照任务。"""
+        worker = self._photo_worker
+        if worker is not None and worker.isRunning():
+            worker.request_stop()
+            self._btn_photo_trajectory.setText("正在停止…")
+            self._btn_photo_trajectory.setEnabled(False)
+            self._append("轨迹拍照", "已请求停止；请保持物理急停可用", _D["warning"])
+            return
+        if not self._trajectory_steps:
+            self._append("轨迹拍照错误", "请先导入有效轨迹", _D["error"])
+            return
+        if not self._ctrl.motion_ready():
+            return
+
+        camera = self._cam
+        if camera is None or not camera.isRunning():
+            self._append("轨迹拍照错误", "请将相机设为源#1并连接", _D["error"])
+            return
+        if camera.source_index != 1:
+            self._append(
+                "轨迹拍照错误",
+                f"当前为源#{camera.source_index}；请改为源#1后重新连接",
+                _D["error"],
+            )
+            return
+        if not camera.has_fresh_frame(max_age_s=1.0):
+            self._append("轨迹拍照错误", "源#1尚无新鲜画面，请稍后重试", _D["error"])
+            return
+
+        project_root = Path(__file__).resolve().parents[3]
+        output_dir = (
+            project_root
+            / "Trajectory Photos"
+            / datetime.now().strftime("%y%m%d%H%M%S")
+        )
+        route = " → ".join(str(step["name"]) for step in self._trajectory_steps)
+        answer = QMessageBox.warning(
+            self,
+            "确认轨迹拍照",
+            "相机：源#1\n"
+            f"轨迹：{route}\n\n"
+            "每个点到位后等待 2 秒拍照，再等待 2 秒继续。\n"
+            f"输出：{output_dir}\n\n"
+            "请确认工作区无障碍物、速度较低且物理急停可用。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._photo_worker = PhotoTrajectoryWorker(
+            self._ctrl,
+            camera,
+            self._trajectory_steps,
+            output_dir,
+            parent=self,
+        )
+        self._photo_worker.progress.connect(
+            lambda message: self._append("轨迹拍照", message, _D["accent"])
+        )
+        self._photo_worker.photo_saved.connect(
+            lambda path: self._append("照片", f"已保存 {path}", _D["success"])
+        )
+        self._photo_worker.run_finished.connect(self._on_photo_trajectory_finished)
+
+        self._left_panel.setEnabled(False)
+        self._btn_cam.setEnabled(False)
+        self._btn_snap.setEnabled(False)
+        self._cam_idx.setEnabled(False)
+        self._btn_photo_trajectory.setText("停止轨迹拍照")
+        self._btn_photo_trajectory.setEnabled(True)
+        self._append("轨迹拍照", f"开始，输出文件夹 {output_dir}", _D["warning"])
+        self._photo_worker.start()
+
+    def _on_photo_trajectory_finished(
+        self,
+        ok: bool,
+        message: str,
+        output_dir: str,
+    ) -> None:
+        self._left_panel.setEnabled(True)
+        self._btn_cam.setEnabled(True)
+        self._btn_snap.setEnabled(True)
+        self._cam_idx.setEnabled(True)
+        self._btn_photo_trajectory.setText("沿轨迹拍照")
+        self._btn_photo_trajectory.setEnabled(bool(self._trajectory_steps))
+        self._append(
+            "轨迹拍照完成" if ok else "轨迹拍照停止",
+            f"{message}；文件夹：{output_dir}",
+            _D["success"] if ok else _D["error"],
+        )
+        self._photo_worker = None
+
+    def _on_presets(self, names: list) -> None:
+        cur = self._preset_combo.currentText()
+        self._preset_combo.clear(); self._preset_combo.addItems(names)
+        if cur in names:
+            self._preset_combo.setCurrentText(cur)
+
+    def _toggle_camera(self) -> None:
+        if self._photo_worker is not None and self._photo_worker.isRunning():
+            self._append("相机", "轨迹拍照期间不能切换或断开相机", _D["warning"])
+            return
+        if self._cam is not None:
+            self._cam.stop(); self._cam = None
+            self._btn_cam.setText("连接相机"); self._cam_lbl.setText("相机已断开")
+            return
+        self._cam = ScaraCameraThread(index=self._cam_idx.value())
+        self._cam.frame_ready.connect(self._on_frame)
+        self._cam.error.connect(self._on_camera_error)
+        self._cam.start(); self._btn_cam.setText("断开相机")
+
+    def _on_camera_error(self, message: str) -> None:
+        self._append("相机", message, _D["error"])
+        self._cam = None
+        self._btn_cam.setText("连接相机")
+        if self._photo_worker is not None and self._photo_worker.isRunning():
+            self._photo_worker.request_stop()
+
+    def _on_frame(self, img: QImage) -> None:
+        self._cam_lbl.setPixmap(QPixmap.fromImage(img).scaled(
+            self._cam_lbl.width(), self._cam_lbl.height(),
+            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def _snapshot(self) -> None:
+        if self._cam is not None:
+            path = datetime.now().strftime("scara_snap_%Y%m%d_%H%M%S.jpg")
+            if self._cam.snapshot(path):
+                self._append("相机", f"快照已保存 {path}", _D["success"])
+            else:
+                self._append("相机", "快照失败：当前没有新鲜画面", _D["error"])
+
+    def _set_css(self, btn: QPushButton, css: str) -> None:
+        """运行时改按钮 cssClass 并重新应用样式。"""
+        if (btn.property("cssClass") or "") == css:
+            return
+        btn.setProperty("cssClass", css)
+        btn.style().unpolish(btn); btn.style().polish(btn)
+
+    def _reset_do_ui_to_zero(self) -> None:
+        """只改界面显示与 applied，不写硬件。"""
+        for e in self._do_entries:
+            e["applied"] = 0
+            lvl = e["lvl"]
+            lvl.blockSignals(True)
+            lvl.setValue(0)
+            lvl.blockSignals(False)
+
+    def _zero_all_dos(self, reason: str = "") -> None:
+        """安全清零：界面归零 + 同步把已配置通道写成 0（真关泵/阀）。"""
+        self._reset_do_ui_to_zero()
+        chs = [e["ch"] for e in self._do_entries]
+        if not chs:
+            return
+        tag = f"清零DO({reason})" if reason else "清零DO"
+        ok, msg = self._ctrl.zero_do_channels_sync(chs)
+        if ok:
+            self._append("信息", f"{tag} 完成", _D["text2"])
+        else:
+            self._append("错误", f"{tag} 失败: {(msg or '').strip()[:160]}", _D["error"])
+
+    def _load_do_map(self) -> None:
+        """从 scara_do_map.json 恢复泵/阀列表；电平不恢复（一律按 0 显示）。
+        无 kind/name/ch 的条目（如 example 里的 _note）会跳过。"""
+        p = Path(DO_MAP_FILE)
+        if not p.is_file():
+            return
+        try:
+            rows = json.loads(p.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("scara_do_map.json 读取失败: %s", exc)
+            return
+        if not isinstance(rows, list):
+            logger.warning("scara_do_map.json 格式错误：应为数组")
+            return
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            kind = row.get("kind")
+            name = row.get("name")
+            if kind not in ("pump", "valve") or not isinstance(name, str) or not name.strip():
+                continue
+            try:
+                ch = int(row.get("ch"))
+            except (TypeError, ValueError):
+                continue
+            if ch < 1 or ch > 16:
+                continue
+            if any(e["ch"] == ch for e in self._do_entries):
+                continue
+            if any(e["kind"] == kind and e["name"] == name.strip() for e in self._do_entries):
+                continue
+            self._add_do_row(kind, name.strip(), ch)
+
+    def _save_do_map(self) -> None:
+        """新建/删除后写入 scara_do_map.json（只存映射，不存 0/1）。"""
+        data = [{"kind": e["kind"], "name": e["name"], "ch": e["ch"]} for e in self._do_entries]
+        try:
+            Path(DO_MAP_FILE).write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning("写入 scara_do_map.json 失败: %s", exc)
+
+    def _apply_do_level(self, entry: dict) -> None:
+        """回车确认：才把当前 0/1 下发到控制器。"""
+        lvl = entry["lvl"]
+        v = lvl.value()
+        if v not in (0, 1):
+            lvl.blockSignals(True)
+            lvl.setValue(entry["applied"])
+            lvl.blockSignals(False)
+            return
+        entry["applied"] = v
+        self._ctrl.cmd_set_do(entry["ch"], v)
+
+    def _revert_do_level_if_needed(self, entry: dict) -> None:
+        """失焦但未按回车：还原为上次已下发电平，避免误触写入。"""
+        lvl = entry["lvl"]
+        if lvl.value() == entry["applied"]:
+            return
+        lvl.blockSignals(True)
+        lvl.setValue(entry["applied"])
+        lvl.blockSignals(False)
+
+    def _delete_do_row(self, entry: dict) -> None:
+        """删除一行映射并更新 JSON；不自动写 DO。"""
+        ans = QMessageBox.question(
+            self, "删除 DO 接口",
+            f"确认删除「{entry['name']}」（DO{entry['ch']}）？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._do_entries.remove(entry)
+        entry["widget"].deleteLater()
+        self._save_do_map()
+
+    def _set_do_ui_enabled(self, enabled: bool) -> None:
+        """未连接时整块 DO 界面锁定（不能新建/改电平/删除）；安全清零仍可写硬件。"""
+        self._btn_add_do.setEnabled(enabled)
+        for e in self._do_entries:
+            e["lvl"].setEnabled(enabled)
+            e["del_btn"].setEnabled(enabled)
+        if hasattr(self, "_do_tip"):
+            self._do_tip.setStyleSheet(
+                f"color:{_D['text2']};" if enabled else f"color:{_D['warning']};"
+            )
+
+    def _add_do_row(self, kind: str, name: str, ch: int) -> None:
+        """在泵/阀列追加一行：名称、DO 号、0/1（回车写入）、删除。"""
+        row_w = QWidget()
+        row = QHBoxLayout(row_w); row.setContentsMargins(0, 0, 0, 0); row.setSpacing(4)
+        name_lbl = QLabel(name); name_lbl.setObjectName("kv")
+        do_lbl = QLabel(f"DO{ch}"); do_lbl.setObjectName("muted")
+        lvl = QSpinBox(); lvl.setRange(0, 1); lvl.setFixedWidth(44)
+        lvl.setKeyboardTracking(False)
+        lvl.setValue(0)
+        lvl.setToolTip("0=低电平  1=高电平；按回车写入（须已连接）")
+        del_btn = _btn("删")
+        entry: dict = {
+            "kind": kind, "name": name, "ch": ch,
+            "widget": row_w, "lvl": lvl, "del_btn": del_btn, "applied": 0,
+        }
+        lvl.lineEdit().returnPressed.connect(lambda: self._apply_do_level(entry))
+        lvl.lineEdit().editingFinished.connect(lambda: self._revert_do_level_if_needed(entry))
+        del_btn.clicked.connect(lambda _, e=entry: self._delete_do_row(e))
+        # 跟随当前连接状态：未连接时新建按钮本就禁用，这里仍按状态设，避免误开
+        can_edit = self._ctrl.is_connected()
+        lvl.setEnabled(can_edit)
+        del_btn.setEnabled(can_edit)
+        row.addWidget(name_lbl); row.addWidget(do_lbl); row.addStretch(1)
+        row.addWidget(lvl); row.addWidget(del_btn)
+        col = self._do_pump_col if kind == "pump" else self._do_valve_col
+        col.addWidget(row_w)
+        self._do_entries.append(entry)
+
+    def _show_add_do_dialog(self) -> None:
+        """新建对话框。校验通过时先记下 kind/name/ch，再关窗——避免关窗后下拉框回到默认「泵」。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("新建 DO 接口")
+        v = QVBoxLayout(dlg)
+        form = QGridLayout(); form.setHorizontalSpacing(8); form.setVerticalSpacing(6)
+        type_cb = QComboBox(); type_cb.addItems(["泵", "阀"])
+        name_edit = QLineEdit(); name_edit.setPlaceholderText("自定义名称")
+        do_spin = QSpinBox(); do_spin.setRange(1, 16)
+        # 加宽以便显示两位数 DO10–16；关键盘跟踪避免输入中间态
+        do_spin.setMinimumWidth(56); do_spin.setKeyboardTracking(False)
+        form.addWidget(QLabel("类型"), 0, 0); form.addWidget(type_cb, 0, 1)
+        form.addWidget(QLabel("名称"), 1, 0); form.addWidget(name_edit, 1, 1)
+        form.addWidget(QLabel("DO号"), 2, 0); form.addWidget(do_spin, 2, 1)
+        v.addLayout(form)
+        btns = QHBoxLayout(); btns.addStretch(1)
+        cancel = _btn("取消"); ok = _btn("确定", "primary")
+        cancel.clicked.connect(dlg.reject)
+        btns.addWidget(cancel); btns.addWidget(ok)
+        v.addLayout(btns)
+        accepted_row: Optional[tuple[str, str, int]] = None
+
+        def _try_accept() -> None:
+            nonlocal accepted_row
+            kind = "pump" if type_cb.currentIndex() == 0 else "valve"
+            name = name_edit.text().strip()
+            if not name:
+                QMessageBox.warning(dlg, "新建 DO 接口", "请填写名称。")
+                return
+            ch = do_spin.value()
+            for e in self._do_entries:
+                if e["ch"] == ch:
+                    QMessageBox.warning(dlg, "新建 DO 接口", f"DO{ch} 已绑定到「{e['name']}」。")
+                    return
+                if e["kind"] == kind and e["name"] == name:
+                    QMessageBox.warning(dlg, "新建 DO 接口", f"「{name}」已存在。")
+                    return
+            accepted_row = (kind, name, ch)
+            dlg.accept()
+
+        ok.clicked.connect(_try_accept)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted or accepted_row is None:
+            return
+        kind, name, ch = accepted_row
+        self._add_do_row(kind, name, ch)
+        self._save_do_map()
+
+    def _on_home_clicked(self) -> None:
+        ans = QMessageBox.question(
+            self, "回零确认",
+            "回零会让机械臂自动运动到原点，确认继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self._ctrl.cmd_home()
+
+    def _on_connect_clicked(self) -> None:
+        # 连接握手（启动 snrobot.exe + 读状态）是阻塞 I/O：若在 GUI 线程直接跑，
+        # exe 卡住（如控制器上电未就绪/网络挂起）会冻结整个界面，连急停都点不动。
+        # 改用 connect_async 放后台线程；结果经 connection_changed 信号回 UI。
+        # 连接前先清零 DO（此时 snrobot 未占连接，scara_do 更容易成功）。
+        self._btn_conn.setEnabled(False)
+        self._zero_all_dos("连接前")
+        self._ctrl.connect_async()
+
+    def _on_disconnect_clicked(self) -> None:
+        # 先断 snrobot，再清零 DO（此时不再抢连接）
+        self._ctrl.disconnect()
+        self._zero_all_dos("断开后")
+
+    def _on_estop_clicked(self) -> None:
+        # 界面立刻归零；硬件清零放在急停线程里（断 serve → estop → 写 DO=0 → 再拉起）。
+        self._reset_do_ui_to_zero()
+        self._ctrl.emergency_stop([e["ch"] for e in self._do_entries])
+
+    def _on_conn(self, ok: bool) -> None:
+        self._conn_chip.setText("● 已连接" if ok else "● 未连接")
+        self._conn_chip.setStyleSheet(
+            f"color:{_D['success']}; background:{_D['chip_on_bg']};"
+            if ok else f"color:{_D['muted']}; background:{_D['chip_off_bg']};"
+        )
+        # 连接/断开 按实际连接状态互斥
+        self._btn_conn.setEnabled(not ok)
+        self._btn_disc.setEnabled(ok)
+        # 未连接时控制类按钮全部置灰；已连接时去使能保持可点（不因灯显示 OFF 而灰掉）
+        for b in (self._btn_en, self._btn_dis, self._btn_clr, self._btn_home, self._btn_estop):
+            b.setEnabled(ok)
+        # DO：未连接时整块锁定，避免不经 snrobot 就能改泵/阀；清零路径不受影响
+        self._set_do_ui_enabled(ok)
+        if not ok:
+            self._set_css(self._btn_en, "")
+            self._set_css(self._btn_clr, "")
+            for k in self._light:
+                self._set_light(k, "—", True)
+
+    def _on_status(self, st: dict) -> None:
+        connected = self._ctrl.is_connected()
+        en_eff = bool(st.get("effectively_enabled"))
+        need_clear = bool(st.get("need_clear"))
+        estop = bool(st.get("estop") or st.get("soft_estop"))
+        warn = int(st.get("warn", 0))
+        en_raw = int(st.get("enable", 0)) == 1
+
+        # 使能：仅「有效使能」时亮绿；急停/报警时不可点（引导去清报警）
+        self._set_css(self._btn_en, "success" if en_eff else "")
+        # 清报警：急停或报警时亮绿，提示下一步该点它
+        self._set_css(self._btn_clr, "success" if (connected and need_clear) else "")
+        if connected:
+            self._btn_en.setEnabled(not need_clear and not en_eff)
+            self._btn_dis.setEnabled(en_raw and not need_clear)
+            self._btn_clr.setEnabled(True)
+        # 模式段跟随实际模式
+        idx = {"T1": 0, "T2": 1, "Execute": 2}.get(st.get("mode", ""), None)
+        if idx is not None:
+            b = self._mode_grp.button(idx)
+            if b is not None and not b.isChecked():
+                self._mode_grp.blockSignals(True); b.setChecked(True); self._mode_grp.blockSignals(False)
+
+        for i in range(4):
+            self._joint_v[i].setText(f"{st['joints'][i]:.2f}")
+            lo, hi = JOINT_RANGE[i]
+            self._joint_bar[i].setValue(int(max(0, min(100, (st['joints'][i] - lo) / (hi - lo) * 100))))
+        for i in range(6):
+            self._pose_v[i].setText(f"{st['pose'][i]:.2f}")
+        self._speed_bar.setValue(int(round(st.get("speed", 0))))
+        self._set_light("使能", "ENABLE_ON" if en_eff else "ENABLE_OFF", en_eff)
+        self._set_light("运行状态", "ALARM_ON" if warn else "ALARM_OFF", warn == 0)
+        self._set_light("急停", "ESTOP_ON" if estop else "ESTOP_OFF", not estop)
+        self._set_light("模式", st.get("mode", "—"), True, info=True)
+        self._set_light("循环", "单循环", True, info=True)
+        self._set_light("机械锁", "ON" if st.get("mechlock") else "OFF", st.get("mechlock") == 0)
+        self._io_lbl.setText(f"DI ON: {st.get('di_on',0)}    DO ON: {st.get('do_on',0)}")
+        do_list = set(st.get("do_list", []))
+        for i, cell in enumerate(self._io_cells):
+            name = "ioOn" if (i + 1) in do_list else "io"
+            if cell.objectName() != name:
+                cell.setObjectName(name); cell.style().unpolish(cell); cell.style().polish(cell)
+
+    def _set_light(self, key: str, text: str, good: bool, info: bool = False) -> None:
+        lbl = self._light.get(key)
+        if not lbl:
+            return
+        lbl.setText(text)
+        color = _D["primary"] if info else (_D["success"] if good else _D["error"])
+        lbl.setStyleSheet(f"font-weight:700; font-size:12px; color:{color};")
+
+    def _append(self, tag: str, msg: str, color: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log.appendHtml(f'<span style="color:{_D["muted"]}">{ts}</span> '
+                             f'<span style="color:{color}">[{tag}]</span> {msg}')
+
+    def cleanup(self) -> None:
+        try:
+            if self._photo_worker is not None and self._photo_worker.isRunning():
+                self._photo_worker.request_stop()
+                self._photo_worker.wait(3000)
+            # 主界面退出：先断 snrobot，再清零 DO，避免抢连接导致关泵失败。
+            if self._owns:
+                if self._ctrl.is_connected():
+                    self._ctrl.disconnect()
+                self._zero_all_dos("退出")
+            if self._cam is not None:
+                self._cam.stop(); self._cam = None
+            if self._owns:
+                self._ctrl.cleanup()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("SCARA 控制界面清理失败: %s", exc)

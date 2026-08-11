@@ -1,0 +1,62 @@
+{
+  "_schema": "micro_scan_recipe.v1",
+  "_note": "华夫盒槽内硅片的显微镜自动扫描配方。area 两个角是 XY 位移台的【绝对】坐标(mm)，与 micro_load_pos 同一 Zaber home 基准。★这是 .example 占位：corner_*_mm 为 null = 未标定，加载后 validate() 会返回 scan_area_uncalibrated，扫描步骤一步都不生成。用 `python tools/scara_teach.py scanarea 1 --from-rpc` / `scanarea 2 --from-rpc` 现场示教后会写出同名 .json 覆盖本文件。",
+
+  "stage_frame": null,
+  "_stage_frame_note": "台坐标帧标注。取自 scara_waypoints.json 顶层 current_stage_frame。Zaber 绝对坐标以 home 原点为基准，一旦重新 home，本配方的两个角就全部失效——届时把 current_stage_frame 改名，本配方会被自动拒绝而不是安静地对着错地方扫。",
+
+  "area": {
+    "corner_1_mm": null,
+    "corner_2_mm": null,
+    "_corner_note": "corner_1 = 扫描起点（台子会先移到这里并回读校验），corner_2 = 对角。顺序只影响蛇形起始方向，不影响覆盖范围。",
+    "taught_at": null,
+    "source": null,
+    "objective_at_teach": null,
+    "focus_mm_at_teach": null,
+    "focus_limits_mm_at_teach": null
+  },
+
+  "scan": {
+    "mode": "tile",
+    "preset_name": "10x",
+    "_preset_note": "物镜序号与 FOV 从 presets/<preset_name>.json 读，不在这里重复写——重复=早晚对不上。开扫前会拿 preset 的 objective 和 get_objective() 对一次：物镜错→FOV错→步距错，而每张图看着都正常。",
+    "overlap_percent": 10.0,
+    "scanning_order": "Snake by Rows",
+    "autofocus_each_xy": true,
+    "focus_surface_enabled": false,
+    "settle_time_ms": 20
+  },
+
+  "focus": {
+    "start_mm": null,
+    "_start_note": "★开扫前先把焦点送到的 Z(mm)，由 `python tools/scara_teach.py scanfocus --from-rpc` 在操作员手动对清晰后记录。null = 未标定，validate() 返回 scan_focus_uncalibrated、一步都不生成。为什么非有不可：装样位焦点停在 5.000mm（离样品最远的一侧），而逐点自动对焦只在当前 Z 附近开 ±1mm 搜索窗，不先送过去整轮都会失焦——且失焦的图照样存盘、照样返回成功。",
+    "wdi_refine": true,
+    "_wdi_note": "移到 start_mm 之后再跑一次 WDI autofocus_once 精修（2026-07-29 用户拍板：存Z兜底 + WDI微调两道都要）。WDI 失败或 in_focus/in_range 不过 → 拒绝开扫，不降级。",
+    "max_drift_mm": 0.5,
+    "_drift_note": "WDI 精修后的 Z 与 start_mm 的最大容许偏差。超了说明 WDI 对到了别的面（盒盖/台面/反射面）上，此时开扫会得到一整轮对错面的图，所以宁可停手。",
+    "taught_at": null,
+    "objective_at_teach": null,
+    "_objective_note": "记录 start_mm 是在哪个物镜下对的焦。与 preset 的 objective 不符即拒绝——工作距离不同，Z 不能跨物镜复用。",
+    "limits_mm_at_teach": null
+  },
+
+  "save": {
+    "subdir_pattern": "inspect_{ts}_r{row}c{col}",
+    "_save_note": "根目录走 microscope.logic.data_pipeline.resolve_data_root()。★存盘不只是留数据：ScanWorker._raise_if_save_failed 在设了 save_directory 却 0 张成功时会抛错，这是'这轮扫描真的发生了'的唯一硬证据。不设 save_directory 的扫描会静默返回成功。"
+  },
+
+  "recognition": {
+    "enabled": false,
+    "model_name": "graphene"
+  },
+
+  "limits": {
+    "stage_x_mm": null,
+    "stage_y_mm": null,
+    "_limits_note": "XY 台行程(mm)。null = 未实读，此时区域越界检查会被跳过并告警。实读办法：app 重启后 RPC 调 get_stage_limits（2026-07-28 新增的只读方法）。全仓沿用的 130x100 只是标称/UI 值，从没读过设备自己的 limit.min|max。",
+    "max_tiles": 1200,
+    "_max_tiles_note": "单次扫描 tile 数上限。防手滑框错区域——projects/10x.json 里那份旧配置是 32x77=2464 格，全是无效图。超限即拒绝生成扫描步骤。2026-07-29 由 600 调到 1200：用户定的 20x20mm @10x 实算是 920 格（23 列 x 40 行），600 会把正常任务卡死。上限保留、不改成无限。",
+    "focus_margin_mm": 1.0,
+    "_focus_margin_note": "开扫前要求焦点位置距 limit.min / limit.max 双边都 >= 该值。1.0 = src/microscope/controller/scan_controller.py 的 _AF_SCAN_HALF_RANGE_MM，即最大的软件对焦搜索半窗；小于它，逐点自动对焦会一路撞限位告警。"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "j_mm_to_px": [[10.0, 0.0], [0.0, 10.0]],
+  "px_origin": [0.0, 0.0],
+  "world_origin_mm": [0.0, 0.0],
+  "resid_px": 0.0,
+  "_note": "占位默认(10px/mm各向同性、无旋转、锚点在原点)。实机标定(作业单第2项)后覆盖：j_mm_to_px 满足 Δpx=J·Δmm；px_origin 是 world_origin_mm 处采到的像素锚点(供 world_to_px 正向投影吸盘)。"
+}

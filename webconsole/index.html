@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>机械臂控制 · DUCO GCR3-618</title>
+<style>
+  :root {
+    --bg: #F5F5F5;
+    --card: #FFFFFF;
+    --border: #E0E0E0;
+    --primary: #1976D2;
+    --primary-h: #1565C0;
+    --success: #388E3C;
+    --success-h: #2E7D32;
+    --danger: #D32F2F;
+    --danger-h: #B71C1C;
+    --warning: #F9A825;
+    --warning-h: #F57F17;
+    --text: #212121;
+    --text2: #757575;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+  }
+  body { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+  /* ---------- Toolbar ---------- */
+  .toolbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .toolbar .title {
+    font-size: 16px; font-weight: 600; color: var(--primary);
+    margin-right: 8px; white-space: nowrap;
+  }
+  .toolbar .spacer { flex: 1 1 auto; }
+  .field { display: flex; align-items: center; gap: 4px; }
+  .field label { color: var(--text2); white-space: nowrap; }
+  input[type="text"], input[type="number"], select {
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 6px; font: inherit; color: var(--text);
+    background: #fff; outline: none;
+  }
+  input[type="text"]:focus, input[type="number"]:focus, select:focus {
+    border-color: var(--primary);
+  }
+  .ip-input { width: 110px; }
+  .port-input { width: 64px; }
+
+  /* ---------- Buttons ---------- */
+  button {
+    font: inherit; border: none; border-radius: 4px;
+    padding: 6px 12px; cursor: pointer; color: #fff;
+    background: var(--primary); transition: background .12s, opacity .12s;
+    white-space: nowrap;
+  }
+  button:hover:not(:disabled) { background: var(--primary-h); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.success { background: var(--success); }
+  button.success:hover:not(:disabled) { background: var(--success-h); }
+  button.danger { background: var(--danger); }
+  button.danger:hover:not(:disabled) { background: var(--danger-h); }
+  button.warning { background: var(--warning); color: #212121; }
+  button.warning:hover:not(:disabled) { background: var(--warning-h); }
+  button.ghost { background: #ECEFF1; color: var(--text); }
+  button.ghost:hover:not(:disabled) { background: #CFD8DC; }
+
+  .estop {
+    background: var(--danger); color: #fff; font-weight: 700;
+    font-size: 15px; padding: 10px 18px; border-radius: 8px;
+    box-shadow: 0 2px 6px rgba(211,47,47,.4);
+    border: 2px solid #fff; outline: 2px solid var(--danger);
+  }
+  .estop:hover:not(:disabled) { background: var(--danger-h); }
+
+  /* ---------- Badges ---------- */
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 4px 8px; border-radius: 12px; background: #ECEFF1;
+    color: var(--text2); font-size: 12px; white-space: nowrap;
+  }
+  .badge .dot {
+    width: 8px; height: 8px; border-radius: 50%; background: #9E9E9E;
+  }
+  .badge.ok { background: #E8F5E9; color: var(--success); }
+  .badge.ok .dot { background: var(--success); }
+  .badge.warn { background: #FFF8E1; color: var(--warning-h); }
+  .badge.warn .dot { background: var(--warning); }
+  .badge.err { background: #FFEBEE; color: var(--danger); }
+  .badge.err .dot { background: var(--danger); }
+
+  /* ---------- Main layout ---------- */
+  .main {
+    flex: 1 1 auto; display: grid;
+    grid-template-columns: 320px 1fr 300px;
+    gap: 10px; padding: 10px; overflow: hidden;
+  }
+  .col { display: flex; flex-direction: column; gap: 10px; overflow: hidden; min-height: 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px; overflow: auto;
+  }
+  .card.fill { flex: 1 1 auto; min-height: 0; }
+  .card h3 { margin: 0 0 8px; font-size: 13px; color: var(--text2); font-weight: 600; }
+
+  /* ---------- Tabs ---------- */
+  .tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+  .tab {
+    flex: 1; text-align: center; padding: 6px; cursor: pointer;
+    border-radius: 4px; background: #ECEFF1; color: var(--text2);
+    font-size: 12px; user-select: none;
+  }
+  .tab.active { background: var(--primary); color: #fff; }
+  .tabpane { display: none; }
+  .tabpane.active { display: block; }
+
+  /* ---------- Status grid ---------- */
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; }
+  .kv .k { color: var(--text2); }
+  .kv .v { font-variant-numeric: tabular-nums; text-align: right; }
+  .grid6 {
+    display: grid; grid-template-columns: repeat(2, 1fr);
+    gap: 6px; margin-bottom: 10px;
+  }
+  .cell {
+    border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px;
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  .cell .lbl { color: var(--text2); font-size: 12px; }
+  .cell .val { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .section-title { font-size: 12px; color: var(--text2); margin: 8px 0 4px; }
+
+  /* ---------- JOG ---------- */
+  .jog-row {
+    display: grid; grid-template-columns: 40px 1fr 36px 36px;
+    align-items: center; gap: 6px; margin-bottom: 6px;
+  }
+  .jog-row .jname { color: var(--text2); font-weight: 600; }
+  .jog-row .jval { font-variant-numeric: tabular-nums; text-align: right; }
+
+  /* ---------- Waypoints / sequence list ---------- */
+  .list {
+    border: 1px solid var(--border); border-radius: 4px;
+    max-height: 240px; overflow: auto; margin-bottom: 8px;
+  }
+  .list .item {
+    padding: 6px 8px; cursor: pointer; border-bottom: 1px solid #F0F0F0;
+  }
+  .list .item:last-child { border-bottom: none; }
+  .list .item:hover { background: #F5F7FA; }
+  .list .item.sel { background: #E3F2FD; color: var(--primary); }
+  .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+
+  /* ---------- Sequence ---------- */
+  .progress-wrap {
+    height: 14px; background: #ECEFF1; border-radius: 7px;
+    overflow: hidden; margin: 8px 0;
+  }
+  .progress-bar {
+    height: 100%; width: 0%; background: var(--primary);
+    transition: width .2s;
+  }
+  input[type="range"] { width: 100%; }
+  .seqstatus { color: var(--text2); font-size: 12px; min-height: 16px; }
+
+  /* ---------- 3D ---------- */
+  #view3d { width: 100%; height: 100%; min-height: 300px; background: #fff; }
+  .center-card { padding: 0; overflow: hidden; }
+
+  /* ---------- Camera ---------- */
+  .cam-stage {
+    position: relative; flex: 1 1 auto; min-height: 200px;
+    background: #000; border-radius: 4px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #camFeed {
+    max-width: 100%; max-height: 100%; width: auto; height: auto;
+    object-fit: contain; display: none;
+  }
+  #camFeed.live { display: block; }
+  .cam-placeholder {
+    position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center;
+    color: #BDBDBD; font-size: 13px; text-align: center; padding: 8px;
+    pointer-events: none;
+  }
+  .cam-stage.live .cam-placeholder { display: none; }
+  .cam-info { color: var(--text2); font-size: 12px; min-height: 16px; margin-top: 6px; }
+
+  /* ---------- Status bar ---------- */
+  .statusbar {
+    border-top: 1px solid var(--border); background: var(--card);
+    padding: 6px 12px; color: var(--text2); font-size: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .statusbar.error { color: var(--danger); }
+  .statusbar .sb-dot { width: 8px; height: 8px; border-radius: 50%; background: #9E9E9E; }
+  .statusbar.ok .sb-dot { background: var(--success); }
+  .statusbar.error .sb-dot { background: var(--danger); }
+</style>
+</head>
+<body>
+
+  <!-- ============ TOOLBAR ============ -->
+  <div class="toolbar">
+    <div class="title">机械臂控制 · DUCO GCR3-618</div>
+
+    <div class="field"><label>IP</label>
+      <input id="ip" class="ip-input" type="text" value="192.168.1.10" />
+    </div>
+    <div class="field"><label>端口</label>
+      <input id="port" class="port-input" type="number" value="7003" />
+    </div>
+
+    <button id="btnConnect" class="primary">连接</button>
+    <button id="btnDisconnect" class="ghost">断开</button>
+    <button id="btnPower" class="warning">上电</button>
+    <button id="btnEnable" class="success">使能</button>
+    <button id="btnDisable" class="ghost">下使能</button>
+
+    <label class="field" style="user-select:none;">
+      <input id="chkSim" type="checkbox" checked /> 仿真模式
+    </label>
+
+    <span id="badgeConn" class="badge"><span class="dot"></span>连接: --</span>
+    <span id="badgeRobot" class="badge"><span class="dot"></span>机器人态: --</span>
+    <span id="badgeSafety" class="badge"><span class="dot"></span>安全态: --</span>
+
+    <div class="spacer"></div>
+    <button id="btnEstop" class="estop">急停 E-STOP</button>
+  </div>
+
+  <!-- ============ MAIN ============ -->
+  <div class="main">
+
+    <!-- LEFT -->
+    <div class="col">
+      <div class="card fill">
+        <div class="tabs">
+          <div class="tab active" data-tab="status">状态</div>
+          <div class="tab" data-tab="jog">JOG</div>
+          <div class="tab" data-tab="points">点位</div>
+        </div>
+
+        <!-- 状态 -->
+        <div id="pane-status" class="tabpane active">
+          <div class="section-title">关节角度 (°)</div>
+          <div class="grid6" id="jointGrid"></div>
+          <div class="section-title">TCP 位姿</div>
+          <div class="grid6" id="tcpGrid"></div>
+          <div class="section-title">系统状态</div>
+          <div class="kv" id="sysKv"></div>
+        </div>
+
+        <!-- JOG -->
+        <div id="pane-jog" class="tabpane">
+          <div class="field" style="margin-bottom:10px;">
+            <label>步长</label>
+            <select id="jogStep">
+              <option value="0.1" selected>0.1°</option>
+              <option value="0.5">0.5°</option>
+              <option value="1.0">1.0°</option>
+              <option value="2.0">2.0°</option>
+              <option value="5.0">5.0°</option>
+            </select>
+          </div>
+          <div id="jogRows"></div>
+        </div>
+
+        <!-- 点位 -->
+        <div id="pane-points" class="tabpane">
+          <div class="row" style="margin-bottom:8px;">
+            <button id="btnGoto" class="primary">前往</button>
+            <button id="btnRefreshWp" class="ghost">刷新</button>
+          </div>
+          <div class="list" id="wpList"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- CENTER -->
+    <div class="col">
+      <div class="card center-card fill">
+        <div id="view3d"></div>
+      </div>
+    </div>
+
+    <!-- RIGHT -->
+    <div class="col">
+      <div class="card">
+        <h3>序列</h3>
+        <div class="field" style="margin-bottom:8px;">
+          <label>序列</label>
+          <select id="seqSelect" style="flex:1;"></select>
+        </div>
+        <div class="row" style="margin-bottom:8px;">
+          <button id="btnSeqRun" class="success">运行</button>
+          <button id="btnSeqPause" class="warning">暂停</button>
+          <button id="btnSeqStop" class="danger">停止</button>
+        </div>
+        <div class="field">
+          <label>速度</label>
+          <input id="seqSpeed" type="range" min="1" max="100" value="20" />
+          <span id="seqSpeedVal" style="width:34px;text-align:right;">20</span>
+        </div>
+        <div class="progress-wrap"><div id="seqProgress" class="progress-bar"></div></div>
+        <div id="seqStatus" class="seqstatus">就绪</div>
+      </div>
+
+      <div class="card fill" style="display:flex;flex-direction:column;">
+        <h3>末端相机</h3>
+        <div class="row" style="margin-bottom:8px;">
+          <button id="btnCamStart" class="primary">开启画面</button>
+          <button id="btnCamStop" class="ghost">关闭画面</button>
+        </div>
+        <div id="camStage" class="cam-stage">
+          <img id="camFeed" alt="末端相机画面" />
+          <div class="cam-placeholder" id="camPlaceholder">无画面 / 相机未就绪</div>
+        </div>
+        <div id="camInfo" class="cam-info">未启动</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ STATUS BAR ============ -->
+  <div id="statusbar" class="statusbar"><span class="sb-dot"></span><span id="sbMsg">初始化…</span></div>
+
+  <!-- ============ Three.js via importmap ============ -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+  // =====================================================================
+  //  Robot DH model (DUCO GCR3-618), meters
+  //  params: a, alpha, d, theta_offset
+  // =====================================================================
+  const DH = [
+    { a:  0.000, alpha:  Math.PI/2, d: 0.152, off: 0 },
+    { a: -0.340, alpha:  0.0,       d: 0.000, off: 0 },
+    { a: -0.300, alpha:  0.0,       d: 0.000, off: 0 },
+    { a:  0.000, alpha:  Math.PI/2, d: 0.090, off: 0 },
+    { a:  0.000, alpha: -Math.PI/2, d: 0.082, off: 0 },
+    { a:  0.000, alpha:  0.0,       d: 0.075, off: 0 }
+  ];
+
+  // Build a standard-DH 4x4 (row-major arrays) and return THREE.Matrix4
+  function dhMatrix(a, alpha, d, theta) {
+    const ct = Math.cos(theta), st = Math.sin(theta);
+    const ca = Math.cos(alpha), sa = Math.sin(alpha);
+    const m = new THREE.Matrix4();
+    m.set(
+      ct, -st*ca,  st*sa, a*ct,
+      st,  ct*ca, -ct*sa, a*st,
+       0,     sa,     ca,    d,
+       0,      0,      0,    1
+    );
+    return m;
+  }
+
+  // Compute cumulative joint origins (in meters) from 6 joint angles (rad)
+  function forwardJointOrigins(jointsRad) {
+    const origins = [];
+    let T = new THREE.Matrix4(); // identity
+    const base = new THREE.Vector3(0, 0, 0).applyMatrix4(T);
+    origins.push(base.clone());
+    for (let i = 0; i < 6; i++) {
+      const theta = (jointsRad[i] || 0) + DH[i].off;
+      const Ti = dhMatrix(DH[i].a, DH[i].alpha, DH[i].d, theta);
+      T = T.multiply(Ti);
+      origins.push(new THREE.Vector3(0, 0, 0).applyMatrix4(T));
+    }
+    return origins; // 7 points: base + 6 joint frames
+  }
+
+  // =====================================================================
+  //  Three.js scene
+  // =====================================================================
+  const container = document.getElementById('view3d');
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xffffff);
+
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
+  camera.position.set(1.2, 1.0, 1.2);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  container.appendChild(renderer.domElement);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.target.set(0, 0.3, 0);
+
+  // Lights
+  scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.7);
+  dir.position.set(2, 4, 2);
+  scene.add(dir);
+  const dir2 = new THREE.DirectionalLight(0xffffff, 0.3);
+  dir2.position.set(-2, 2, -1);
+  scene.add(dir2);
+
+  // Ground grid (X-Z plane)
+  const grid = new THREE.GridHelper(2, 20, 0xBDBDBD, 0xE0E0E0);
+  scene.add(grid);
+
+  // Axes helper (small)
+  const axes = new THREE.AxesHelper(0.2);
+  scene.add(axes);
+
+  // Convert robot coords (Z-up) to Three.js scene (Y-up):
+  //   robotX -> sceneX, robotY -> sceneZ, robotZ -> sceneY
+  function toScene(v) {
+    return new THREE.Vector3(v.x, v.z, v.y);
+  }
+
+  // Materials
+  const linkMatA = new THREE.MeshStandardMaterial({ color: 0x1E76D2, metalness: 0.2, roughness: 0.6 });
+  const linkMatB = new THREE.MeshStandardMaterial({ color: 0x43A5F5, metalness: 0.2, roughness: 0.6 });
+  const jointMat = new THREE.MeshStandardMaterial({ color: 0xCFD8DC, metalness: 0.3, roughness: 0.5 });
+  const baseMat  = new THREE.MeshStandardMaterial({ color: 0x9E9E9E, metalness: 0.3, roughness: 0.6 });
+
+  // Robot group (rebuilt each pose update)
+  const robotGroup = new THREE.Group();
+  scene.add(robotGroup);
+
+  // Base cylinder (static)
+  const baseGeo = new THREE.CylinderGeometry(0.08, 0.1, 0.05, 24);
+  const baseMesh = new THREE.Mesh(baseGeo, baseMat);
+  baseMesh.position.set(0, 0.025, 0);
+  scene.add(baseMesh);
+
+  // Reusable unit cylinder for links (height 1 along Y), scaled/oriented per segment
+  function makeLinkMesh(p0, p1, mat) {
+    const start = toScene(p0);
+    const end = toScene(p1);
+    const len = start.distanceTo(end);
+    if (len < 1e-5) return null;
+    const geo = new THREE.CylinderGeometry(0.028, 0.028, len, 18);
+    const mesh = new THREE.Mesh(geo, mat);
+    // position at midpoint
+    const mid = start.clone().add(end).multiplyScalar(0.5);
+    mesh.position.copy(mid);
+    // orient: default cylinder axis is +Y, rotate to align with (end-start)
+    const axis = new THREE.Vector3().subVectors(end, start).normalize();
+    const up = new THREE.Vector3(0, 1, 0);
+    const quat = new THREE.Quaternion().setFromUnitVectors(up, axis);
+    mesh.quaternion.copy(quat);
+    return mesh;
+  }
+
+  function makeJointMesh(p, r) {
+    const geo = new THREE.SphereGeometry(r, 18, 14);
+    const mesh = new THREE.Mesh(geo, jointMat);
+    mesh.position.copy(toScene(p));
+    return mesh;
+  }
+
+  let currentJoints = [0, 0, 0, 0, 0, 0];
+  let framed = false;
+
+  // Public: update arm pose from joint angles (radians)
+  function setJointAngles(jointsRad) {
+    if (!jointsRad || jointsRad.length < 6) return;
+    currentJoints = jointsRad.slice(0, 6);
+    rebuildRobot(currentJoints);
+  }
+  window.setJointAngles = setJointAngles;
+
+  function rebuildRobot(jointsRad) {
+    // clear previous
+    while (robotGroup.children.length) {
+      const c = robotGroup.children.pop();
+      if (c.geometry) c.geometry.dispose();
+    }
+    const origins = forwardJointOrigins(jointsRad); // 7 points (robot coords)
+
+    // links between consecutive origins
+    for (let i = 0; i < origins.length - 1; i++) {
+      const mat = (i % 2 === 0) ? linkMatA : linkMatB;
+      const link = makeLinkMesh(origins[i], origins[i + 1], mat);
+      if (link) robotGroup.add(link);
+    }
+    // joint spheres (skip base point 0, draw at the 6 joint frames)
+    for (let i = 1; i < origins.length; i++) {
+      robotGroup.add(makeJointMesh(origins[i], 0.038));
+    }
+
+    if (!framed) { autoFrame(origins); framed = true; }
+  }
+
+  function autoFrame(origins) {
+    const box = new THREE.Box3();
+    origins.forEach(o => box.expandByPoint(toScene(o)));
+    box.expandByPoint(new THREE.Vector3(0, 0, 0));
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3()).length();
+    controls.target.copy(center);
+    const dist = Math.max(size * 1.4, 1.0);
+    camera.position.copy(center.clone().add(new THREE.Vector3(dist, dist * 0.8, dist)));
+    camera.near = 0.01; camera.far = dist * 20;
+    camera.updateProjectionMatrix();
+    controls.update();
+  }
+
+  function resize() {
+    const w = container.clientWidth || 1;
+    const h = container.clientHeight || 1;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  window.addEventListener('resize', resize);
+  new ResizeObserver(resize).observe(container);
+
+  function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+  }
+  resize();
+  rebuildRobot(currentJoints);
+  animate();
+
+  // =====================================================================
+  //  Backend API helpers
+  // =====================================================================
+  async function apiGet(path) {
+    const r = await fetch(path, { method: 'GET' });
+    return await r.json();
+  }
+  async function apiPost(path, body) {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined
+    });
+    return await r.json();
+  }
+
+  // =====================================================================
+  //  DOM refs
+  // =====================================================================
+  const el = (id) => document.getElementById(id);
+  const ipInput = el('ip'), portInput = el('port'), chkSim = el('chkSim');
+  const btnConnect = el('btnConnect'), btnDisconnect = el('btnDisconnect');
+  const btnPower = el('btnPower'), btnEnable = el('btnEnable'), btnDisable = el('btnDisable');
+  const btnEstop = el('btnEstop');
+  const badgeConn = el('badgeConn'), badgeRobot = el('badgeRobot'), badgeSafety = el('badgeSafety');
+  const jointGrid = el('jointGrid'), tcpGrid = el('tcpGrid'), sysKv = el('sysKv');
+  const jogStep = el('jogStep'), jogRows = el('jogRows');
+  const wpList = el('wpList'), btnGoto = el('btnGoto'), btnRefreshWp = el('btnRefreshWp');
+  const seqSelect = el('seqSelect'), btnSeqRun = el('btnSeqRun'), btnSeqPause = el('btnSeqPause'), btnSeqStop = el('btnSeqStop');
+  const seqSpeed = el('seqSpeed'), seqSpeedVal = el('seqSpeedVal'), seqProgress = el('seqProgress'), seqStatus = el('seqStatus');
+  const statusbar = el('statusbar'), sbMsg = el('sbMsg');
+  const btnCamStart = el('btnCamStart'), btnCamStop = el('btnCamStop');
+  const camFeed = el('camFeed'), camStage = el('camStage'), camPlaceholder = el('camPlaceholder'), camInfo = el('camInfo');
+
+  let selectedWp = null;
+  let lastSeqList = [];
+  let lastWpList = [];
+
+  // ---- Build static grids ----
+  const TCP_LABELS = ['X (mm)', 'Y (mm)', 'Z (mm)', 'Rx (°)', 'Ry (°)', 'Rz (°)'];
+  function buildGrids() {
+    jointGrid.innerHTML = '';
+    for (let i = 1; i <= 6; i++) {
+      const c = document.createElement('div');
+      c.className = 'cell';
+      c.innerHTML = `<span class="lbl">J${i}</span><span class="val" id="jv${i}">--</span>`;
+      jointGrid.appendChild(c);
+    }
+    tcpGrid.innerHTML = '';
+    for (let i = 0; i < 6; i++) {
+      const c = document.createElement('div');
+      c.className = 'cell';
+      c.innerHTML = `<span class="lbl">${TCP_LABELS[i]}</span><span class="val" id="tv${i}">--</span>`;
+      tcpGrid.appendChild(c);
+    }
+    sysKv.innerHTML = `
+      <span class="k">模式</span><span class="v" id="sysMode">--</span>
+      <span class="k">机器人</span><span class="v" id="sysRobot">--</span>
+      <span class="k">程序</span><span class="v" id="sysProg">--</span>
+      <span class="k">安全</span><span class="v" id="sysSafety">--</span>
+      <span class="k">报警</span><span class="v" id="sysAlarm">--</span>`;
+  }
+  buildGrids();
+
+  // ---- Build JOG rows ----
+  function buildJog() {
+    jogRows.innerHTML = '';
+    for (let i = 0; i < 6; i++) {
+      const row = document.createElement('div');
+      row.className = 'jog-row';
+      row.innerHTML = `
+        <span class="jname">J${i + 1}</span>
+        <span class="jval" id="jogv${i}">--</span>
+        <button class="ghost jog-btn" data-joint="${i}" data-sign="-1">−</button>
+        <button class="ghost jog-btn" data-joint="${i}" data-sign="1">+</button>`;
+      jogRows.appendChild(row);
+    }
+    jogRows.querySelectorAll('.jog-btn').forEach(b => {
+      b.addEventListener('click', () => {
+        const joint = parseInt(b.dataset.joint, 10);
+        const sign = parseInt(b.dataset.sign, 10);
+        const step = parseFloat(jogStep.value);
+        doJog(joint, sign * step);
+      });
+    });
+  }
+  buildJog();
+
+  async function doJog(joint, delta_deg) {
+    try {
+      const r = await apiPost('/api/jog', { joint, delta_deg });
+      if (r && r.error) setMsg(r.error, true);
+    } catch (e) { /* poll loop reports */ }
+  }
+
+  // =====================================================================
+  //  Tabs
+  // =====================================================================
+  document.querySelectorAll('.tab').forEach(t => {
+    t.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+      document.querySelectorAll('.tabpane').forEach(x => x.classList.remove('active'));
+      t.classList.add('active');
+      el('pane-' + t.dataset.tab).classList.add('active');
+    });
+  });
+
+  // =====================================================================
+  //  Toolbar / control button handlers
+  // =====================================================================
+  btnConnect.addEventListener('click', async () => {
+    const mode = chkSim.checked ? 'sim' : 'thrift';
+    try {
+      const r = await apiPost('/api/connect', { mode, ip: ipInput.value, port: parseInt(portInput.value, 10) });
+      if (r && r.error) setMsg('连接失败: ' + r.error, true);
+      else setMsg('已发送连接请求');
+    } catch (e) { setMsg('后端未连接', true); }
+  });
+  btnDisconnect.addEventListener('click', () => safePost('/api/disconnect'));
+  btnPower.addEventListener('click', () => safePost('/api/power_on'));
+  btnEnable.addEventListener('click', () => safePost('/api/enable'));
+  btnDisable.addEventListener('click', () => safePost('/api/disable'));
+  btnEstop.addEventListener('click', () => safePost('/api/estop'));
+
+  chkSim.addEventListener('change', async () => {
+    try { await apiPost('/api/set_mode', { mode: chkSim.checked ? 'sim' : 'thrift' }); }
+    catch (e) { /* ignore */ }
+  });
+
+  async function safePost(path, body) {
+    try {
+      const r = await apiPost(path, body);
+      if (r && r.error) setMsg(r.error, true);
+    } catch (e) { setMsg('后端未连接', true); }
+  }
+
+  // ---- Waypoints ----
+  btnRefreshWp.addEventListener('click', () => { /* status poll refreshes list */ setMsg('已刷新点位'); });
+  btnGoto.addEventListener('click', () => {
+    if (!selectedWp) { setMsg('请先选择点位', true); return; }
+    safePost('/api/goto', { name: selectedWp });
+  });
+
+  function renderWaypoints(list) {
+    if (JSON.stringify(list) === JSON.stringify(lastWpList)) return;
+    lastWpList = list.slice();
+    wpList.innerHTML = '';
+    list.forEach(name => {
+      const it = document.createElement('div');
+      it.className = 'item' + (name === selectedWp ? ' sel' : '');
+      it.textContent = name;
+      it.addEventListener('click', () => {
+        selectedWp = name;
+        wpList.querySelectorAll('.item').forEach(x => x.classList.remove('sel'));
+        it.classList.add('sel');
+      });
+      wpList.appendChild(it);
+    });
+    if (selectedWp && !list.includes(selectedWp)) selectedWp = null;
+  }
+
+  // ---- Sequence ----
+  seqSpeed.addEventListener('input', () => { seqSpeedVal.textContent = seqSpeed.value; });
+  btnSeqRun.addEventListener('click', () => {
+    const name = seqSelect.value;
+    if (!name) { setMsg('请选择序列', true); return; }
+    safePost('/api/sequence', { action: 'run', name, speed: parseFloat(seqSpeed.value) });
+  });
+  btnSeqPause.addEventListener('click', () => safePost('/api/sequence', { action: 'pause' }));
+  btnSeqStop.addEventListener('click', () => safePost('/api/sequence', { action: 'stop' }));
+
+  function renderSequences(list) {
+    if (JSON.stringify(list) === JSON.stringify(lastSeqList)) return;
+    lastSeqList = list.slice();
+    const prev = seqSelect.value;
+    seqSelect.innerHTML = '';
+    list.forEach(name => {
+      const o = document.createElement('option');
+      o.value = name; o.textContent = name;
+      seqSelect.appendChild(o);
+    });
+    if (list.includes(prev)) seqSelect.value = prev;
+  }
+
+  // =====================================================================
+  //  Camera
+  // =====================================================================
+  let camLive = false;
+
+  function showCam(live) {
+    camLive = live;
+    camFeed.classList.toggle('live', live);
+    camStage.classList.toggle('live', live);
+  }
+
+  // img load/error handling
+  camFeed.addEventListener('load', () => {
+    if (camFeed.getAttribute('src')) showCam(true);
+  });
+  camFeed.addEventListener('error', () => {
+    showCam(false);
+    if (camLive || camFeed.getAttribute('src')) camInfo.textContent = '无画面 / 相机未就绪';
+  });
+
+  btnCamStart.addEventListener('click', async () => {
+    btnCamStart.disabled = true;
+    camInfo.textContent = '正在启动相机…';
+    try {
+      const r = await apiPost('/api/camera/start', { device: 0 });
+      if (r && r.ok === false) {
+        camInfo.textContent = '启动失败: ' + (r.error || '未知错误');
+        showCam(false);
+      } else {
+        // (re)assign the MJPEG stream with a cache-busting timestamp
+        camFeed.src = '/api/camera/stream?t=' + Date.now();
+        camInfo.textContent = '画面已开启';
+      }
+    } catch (e) {
+      camInfo.textContent = '后端未连接';
+      showCam(false);
+    } finally {
+      btnCamStart.disabled = false;
+    }
+  });
+
+  btnCamStop.addEventListener('click', async () => {
+    try { await apiPost('/api/camera/stop'); } catch (e) { /* ignore */ }
+    camFeed.removeAttribute('src');
+    showCam(false);
+    camInfo.textContent = '已关闭';
+  });
+
+  function renderCamInfo(info) {
+    if (!info) return;
+    if (info.error) { camInfo.textContent = '相机错误: ' + info.error; return; }
+    if (info.running && camLive) {
+      camInfo.textContent = '运行中' + (info.device != null ? ' · 设备 ' + info.device : '');
+    } else if (!info.available) {
+      camInfo.textContent = '无可用相机';
+    } else if (info.opened && !info.running) {
+      camInfo.textContent = '已打开 · 未推流';
+    } else if (!camLive) {
+      camInfo.textContent = camInfo.textContent === '正在启动相机…' ? camInfo.textContent : '未启动';
+    }
+  }
+
+  // =====================================================================
+  //  Status bar
+  // =====================================================================
+  function setMsg(text, isError) {
+    sbMsg.textContent = text;
+    statusbar.classList.toggle('error', !!isError);
+    statusbar.classList.toggle('ok', !isError);
+  }
+
+  // =====================================================================
+  //  Badge helpers
+  // =====================================================================
+  function setBadge(node, text, cls) {
+    node.className = 'badge' + (cls ? ' ' + cls : '');
+    node.innerHTML = `<span class="dot"></span>${text}`;
+  }
+
+  const ROBOT_STATE = {
+    0: '掉电', 1: '断电', 2: '上电中', 3: '已上电', 4: '已使能', 5: '运行中', 6: '错误'
+  };
+  const SAFETY_STATE = {
+    0: '正常', 1: '减速', 2: '停止', 3: '保护停止', 4: '急停', 5: '故障'
+  };
+  const OP_MODE = { 0: '手动', 1: '自动', 2: '远程' };
+  const PROG_STATE = { 0: '停止', 1: '运行', 2: '暂停', 3: '完成' };
+
+  // =====================================================================
+  //  Apply status to UI
+  // =====================================================================
+  function applyStatus(s) {
+    // joints
+    const jd = s.joints_deg || [];
+    for (let i = 0; i < 6; i++) {
+      const v = el('jv' + (i + 1));
+      if (v) v.textContent = (jd[i] != null) ? jd[i].toFixed(2) : '--';
+      const jv = el('jogv' + i);
+      if (jv) jv.textContent = (jd[i] != null) ? jd[i].toFixed(2) + '°' : '--';
+    }
+    // tcp
+    const tcp = s.tcp || [];
+    for (let i = 0; i < 6; i++) {
+      const v = el('tv' + i);
+      if (v) v.textContent = (tcp[i] != null) ? tcp[i].toFixed(2) : '--';
+    }
+    // system
+    setText('sysMode', OP_MODE[s.op_mode] != null ? OP_MODE[s.op_mode] : s.op_mode);
+    setText('sysRobot', ROBOT_STATE[s.robot_state] != null ? ROBOT_STATE[s.robot_state] : s.robot_state);
+    setText('sysProg', PROG_STATE[s.prog_state] != null ? PROG_STATE[s.prog_state] : s.prog_state);
+    setText('sysSafety', SAFETY_STATE[s.safety] != null ? SAFETY_STATE[s.safety] : s.safety);
+    setText('sysAlarm', s.alarm ? ('报警(' + s.alarm + ')') : '无');
+
+    // badges
+    if (s.connected) {
+      setBadge(badgeConn, '连接: ' + (s.mode === 'sim' ? '仿真' : '已连接'), 'ok');
+    } else {
+      setBadge(badgeConn, '连接: 未连接', '');
+    }
+    const rs = ROBOT_STATE[s.robot_state] != null ? ROBOT_STATE[s.robot_state] : ('态' + s.robot_state);
+    setBadge(badgeRobot, '机器人态: ' + rs, s.enabled ? 'ok' : (s.connected ? 'warn' : ''));
+
+    const safeTxt = SAFETY_STATE[s.safety] != null ? SAFETY_STATE[s.safety] : ('态' + s.safety);
+    let safeCls = 'ok';
+    if (s.safety === 1) safeCls = 'warn';
+    else if (s.safety >= 2) safeCls = 'err';
+    setBadge(badgeSafety, '安全态: ' + safeTxt, s.connected ? safeCls : '');
+
+    // button enable logic
+    btnConnect.disabled = !!s.connected;
+    btnDisconnect.disabled = !s.connected;
+    btnPower.disabled = !(s.connected && !s.powered);
+    btnEnable.disabled = !(s.connected && s.powered && !s.enabled);
+    btnDisable.disabled = !(s.connected && s.enabled);
+
+    // lists
+    renderWaypoints(s.waypoints || []);
+    renderSequences(s.sequences || []);
+
+    // sequence progress
+    const step = s.seq_step || [0, 0, ''];
+    const cur = step[0] || 0, total = step[1] || 0, name = step[2] || '';
+    const pct = total > 0 ? Math.round((cur / total) * 100) : 0;
+    seqProgress.style.width = pct + '%';
+    if (s.seq_running) {
+      seqProgress.style.background = 'var(--success)';
+      seqStatus.textContent = `运行中: ${name || ''}  ${cur}/${total} (${pct}%)`;
+    } else {
+      seqProgress.style.background = 'var(--primary)';
+      seqStatus.textContent = total > 0 ? `就绪  ${cur}/${total}` : '就绪';
+    }
+
+    // 3D pose
+    if (s.joints && s.joints.length >= 6) {
+      setJointAngles(s.joints);
+    } else if (jd.length >= 6) {
+      setJointAngles(jd.map(d => d * Math.PI / 180));
+    }
+
+    // message bar
+    if (s.error) setMsg(s.error, true);
+    else if (s.message) setMsg(s.message, false);
+    else setMsg(s.connected ? ('运行中 · ' + (s.mode === 'sim' ? '仿真模式' : '实机模式')) : '未连接', false);
+  }
+
+  function setText(id, val) {
+    const n = el(id);
+    if (n) n.textContent = (val == null || val === '') ? '--' : val;
+  }
+
+  // =====================================================================
+  //  Poll loop (every 300ms, never crashes)
+  // =====================================================================
+  async function poll() {
+    try {
+      const s = await apiGet('/api/status');
+      applyStatus(s);
+    } catch (e) {
+      setMsg('后端未连接', true);
+      // keep badges in disconnected-ish state but don't throw
+      btnConnect.disabled = false;
+    } finally {
+      setTimeout(poll, 300);
+    }
+  }
+  setMsg('就绪 · 等待后端', false);
+  poll();
+
+  // ---- Camera info poll (slower, independent, never crashes) ----
+  async function pollCam() {
+    try {
+      const info = await apiGet('/api/camera/info');
+      renderCamInfo(info);
+    } catch (e) {
+      // backend down: main poll already reports it; just leave cam info as-is
+    } finally {
+      setTimeout(pollCam, 1000);
+    }
+  }
+  pollCam();
+  </script>
+</body>
+</html>

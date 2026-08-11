@@ -1,0 +1,69 @@
+# GCR3-618 机械臂配置。单位: 角度rad, 长度m, 速度rad/s 或 m/s。
+# 调试期数值偏保守, 实测后再放宽。
+
+connection:
+  ip: "192.168.1.10"
+  rpc_port: 7003        # Thrift 控制
+  state_port: 2001      # 状态推送
+  timeout_ms: 2000       # 控制 RPC 超时；运动监督不能被单次调用卡住 10 秒
+
+# armweb 服务器地址（主软件经它控泵/相机/机械臂代理）。主软件泵按钮直接调它，
+# 不依赖机械臂是否已连接。生产=服务器 IP:端口；本机调试可改 127.0.0.1。
+armweb_base_url: "http://127.0.0.1:8080"   # 单机迁移: armweb 本机运行(2026-07-16)
+
+speed:
+  global_scale: 0.2     # 调试期全局速度倍率 (0~1)。0.1太慢, 0.2约12°/s仍安全
+  v_max_joint: 1.05     # 关节运动速度上限 rad/s (~60deg/s), 远低于物理上限1.25pi
+  a_joint: 0.5          # 关节加速度 rad/s^2
+  v_max_cart: 0.10      # 笛卡尔直线速度上限 m/s
+  a_cart: 0.5           # 笛卡尔加速度 m/s^2
+
+# 关节软限位 (rad)。DUCO 物理限位 ±2π, 这里留余量。6 关节。
+joint_limits:
+  lower: [-3.10, -3.10, -3.10, -3.10, -3.10, -3.10]
+  upper: [ 3.10,  3.10,  3.10,  3.10,  3.10,  3.10]
+
+# 工作空间限位 (base 系, m)。越界拒绝运动。先设保守桌面 box, 实测后调。
+workspace:
+  x: [-0.50, 0.50]
+  y: [-0.60, 0.60]
+  z: [ 0.02, 0.70]    # z 下限 2cm 防撞桌面
+
+safety:
+  allow_remote_enable: false  # 兼容旧配置；代码永久忽略 true，必须由示教器上电/使能
+  collision_level: 3        # 调试期碰撞检测灵敏度 1-5 (0关闭)
+  heartbeat_period_s: 0.5   # 心跳读 state 周期
+  heartbeat_max_fail: 3     # 连续失败次数 -> ABORT
+  start_deviation_tol_deg: 3.0  # 回放前起点关节偏差容差
+  preflight_sample_interval_s: 0.1   # 下发前连续读取两帧，确认机械臂静止
+  preflight_max_joint_speed_deg_s: 2.5
+  state_frame_max_joint_speed_deg_s: 28.0  # 超过命令上限余量即判状态帧不连续
+  status_rpc_joint_tolerance_deg: 0.10     # 2001 q 与独立控制 RPC actual-q 交叉门
+  path_fk_sample_step_deg: 0.25            # 每条 movej 下发前 active-TCP FK 密采
+  post_audit_start_tolerance_deg: 0.10     # 路径审计结束到即时下发门的起点漂移
+  completion_settle_timeout_s: 2.0         # task Finished 后等待 prog 1 -> 0
+  verify_fk_tcp: true               # 状态帧关节必须与控制器 FK/TCP 一致
+  fk_tcp_position_tol_mm: 2.0
+  fk_tcp_orientation_tol_deg: 1.0
+
+# 末端负载 (进牵引示教前设置)。当前: 相机, 无吸盘。实测调。
+load:
+  # ⚠ 2026-07-31 复盘发现两个问题，本节目前【未被任何代码使用】：
+  #   1. 全仓库没有任何地方调用 rpc.set_load_data()/set_tool_data()，
+  #      也就是说控制器里根本没有负载数据 —— 碰撞检测的力矩阈值是按空载算的。
+  #   2. cog 写成 [0,0,0.03]（沿工具轴 30mm），但实测吸盘在法兰系
+  #      p_FT=[-10.75,-114.56,28.81]mm、相机在 [60.51,-81.60,-43.16]mm，
+  #      真实质心横向偏出约 100mm，不在工具轴上。这个静力矩长年压在 J2/J3/J4 上，
+  #      会把碰撞阈值调偏（真碰撞报得晚、误报更容易）。
+  #      07-31 那次 "Joint 4 检测到碰撞" 无法区分"真撞"还是"阈值失真误报"，就是它造成的。
+  # ★ 要修必须先【实测】：拆下吸盘+支架+相机整组称重，或用控制器的负载辨识功能。
+  #   在拿到真值之前不要往下面填猜的数 —— 错的负载数据比没有更危险。
+  mass: 0.3      # kg ⚠ 未实测，仅历史占位
+  cog: [0.0, 0.0, 0.03]   # m ⚠ 已知错误：真实质心横向偏出约 0.10m
+
+# 吸盘 (末端工具数字输出)
+gripper:
+  do_num: 0           # tool DO 端口号, 脱机万用表实测后改
+  active_high: true   # 高电平=吸
+  settle_on_ms: 400   # 吸: 建立负压等待
+  settle_off_ms: 300  # 放: 泄压等待

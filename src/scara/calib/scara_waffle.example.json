@@ -1,0 +1,7 @@
+{
+  "target_angle_deg": 0.0,
+  "angle_offset_const": 0.0,
+  "place_preset": "place_waffle",
+  "above_preset": "above_waffle",
+  "_note": "占位默认。实机标定(作业单第5/6项)：华夫盒凹槽目标角(度) + 角度补偿常数；place/above_preset 为 scara_presets.json 里对应的示教预设点名。"
+}
