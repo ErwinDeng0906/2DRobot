@@ -355,7 +355,7 @@ class ScaraControlWidget(QWidget):
         row.addWidget(self._action_label, 1)
         row.addWidget(self._btn_run_action)
         g.addLayout(row)
-        note = QLabel("动作可组合 XYZ/R 运动、源#0/#1/#2 拍照和 JSON 途径点记录。")
+        note = QLabel("动作可组合 XYZ/R 运动、相机拍照/录像和 JSON 途径点记录。")
         note.setObjectName("muted"); note.setWordWrap(True)
         g.addWidget(note)
         v.addWidget(f)
@@ -589,6 +589,7 @@ class ScaraControlWidget(QWidget):
                 source_position_calculators[1] = camera1_calculator
             point_count = sum(step["type"] == "record_point" for step in task["actions"])
             photo_count = sum(step["type"] == "capture" for step in task["actions"])
+            video_count = sum(step["type"] == "start_video" for step in task["actions"])
             self._action_file = path
             self._action_builder = build
             self._action_camera_calculator = camera_calculator
@@ -596,7 +597,9 @@ class ScaraControlWidget(QWidget):
             self._action_task = task
             self._btn_import_action.setToolTip(str(path))
             self._btn_run_action.setEnabled(True)
-            self._action_label.setText(f"{path.name} · {point_count} 点/{photo_count} 照片")
+            self._action_label.setText(
+                f"{path.name} · {point_count} 点/{photo_count} 照片/{video_count} 录像"
+            )
             self._append(
                 "动作",
                 f"已载入 {path.name}: {task['name']}（{len(task['actions'])} 步）",
@@ -661,17 +664,22 @@ class ScaraControlWidget(QWidget):
             / datetime.now().strftime("%y%m%d%H%M%S")
         )
         sources = sorted(
-            {step["source"] for step in task["actions"] if step["type"] == "capture"}
+            {
+                step["source"]
+                for step in task["actions"]
+                if step["type"] in {"capture", "start_video", "stop_video"}
+            }
         )
         point_count = sum(step["type"] == "record_point" for step in task["actions"])
         photo_count = sum(step["type"] == "capture" for step in task["actions"])
+        video_count = sum(step["type"] == "start_video" for step in task["actions"])
         confirmation = QMessageBox(self)
         confirmation.setIcon(QMessageBox.Icon.Warning)
         confirmation.setWindowTitle("确认执行动作")
         confirmation.setText(
             f"动作：{task['name']}\n"
             f"相机源：{', '.join(f'#{source}' for source in sources) or '无'}\n"
-            f"记录点：{point_count}；照片：{photo_count}\n"
+            f"记录点：{point_count}；照片：{photo_count}；录像：{video_count}\n"
             "相机坐标：旋转相机按 Rz 计算；源1按 J1+J2 计算\n\n"
             "动作会按脚本自动运动并直接打开所需相机源。\n"
             f"输出：{output_dir}\n\n"
@@ -725,6 +733,9 @@ class ScaraControlWidget(QWidget):
         )
         self._action_worker.photo_saved.connect(
             lambda path: self._append("照片", f"已保存 {path}", _D["success"])
+        )
+        self._action_worker.video_saved.connect(
+            lambda path: self._append("录像", f"已保存 {path}", _D["success"])
         )
         self._action_worker.point_recorded.connect(
             lambda name: self._append("采点", f"已记录 {name}", _D["success"])

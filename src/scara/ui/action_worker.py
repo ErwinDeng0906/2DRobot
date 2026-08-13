@@ -1,8 +1,8 @@
 """Execute imported SCARA action files without blocking the Qt UI.
 
-The action format deliberately separates movement, dwell, camera capture, and
-state recording.  An imported Python file only *describes* those operations;
-hardware access happens here after the operator confirms the run in the UI.
+The action format deliberately separates movement, dwell, still capture, video
+recording, and state recording.  An imported Python file only *describes* those
+operations; hardware access happens here after the operator confirms the run.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ SUPPORTED_ACTION_TYPES = {
     "move_xyzr",
     "wait",
     "capture",
+    "start_video",
+    "stop_video",
     "record_point",
 }
 
@@ -83,6 +85,8 @@ def normalize_action_task(raw_task: object) -> dict:
         raise ValueError("actions 必须是非空列表")
 
     actions: list[dict] = []
+    active_video_sources: set[int] = set()
+    video_filenames: set[str] = set()
     for index, raw in enumerate(raw_actions, start=1):
         if not isinstance(raw, dict):
             raise ValueError(f"第 {index} 步必须是字典")
@@ -123,13 +127,43 @@ def normalize_action_task(raw_task: object) -> dict:
             step["seconds"] = _finite(raw.get("seconds"), f"第 {index} 步 seconds")
             if step["seconds"] < 0:
                 raise ValueError(f"第 {index} 步 seconds 不能为负数")
-        elif kind == "capture":
+        elif kind in {"capture", "start_video", "stop_video"}:
             source = raw.get("source")
             if isinstance(source, bool) or not isinstance(source, int) or not 0 <= source <= 8:
                 raise ValueError(f"第 {index} 步 source 必须是 0 到 8 的整数")
             step["source"] = source
+            if kind == "start_video":
+                if source in active_video_sources:
+                    raise ValueError(f"第 {index} 步 相机源#{source}已在录像")
+                filename = str(raw.get("filename") or f"{source}_video.avi").strip()
+                suffix = Path(filename).suffix.lower()
+                if (
+                    not filename
+                    or Path(filename).name != filename
+                    or suffix not in {".avi", ".mp4"}
+                ):
+                    raise ValueError(
+                        f"第 {index} 步 filename 必须是当前实验文件夹内的 .avi 或 .mp4 文件名"
+                    )
+                if filename in video_filenames:
+                    raise ValueError(f"第 {index} 步 录像文件名重复：{filename}")
+                fps = _finite(raw.get("fps", 20.0), f"第 {index} 步 fps")
+                if not 0.0 < fps <= 120.0:
+                    raise ValueError(f"第 {index} 步 fps 必须在 (0, 120] 范围内")
+                step["filename"] = filename
+                step["fps"] = fps
+                active_video_sources.add(source)
+                video_filenames.add(filename)
+            elif kind == "stop_video":
+                if source not in active_video_sources:
+                    raise ValueError(f"第 {index} 步 相机源#{source}尚未开始录像")
+                active_video_sources.remove(source)
 
         actions.append(step)
+
+    if active_video_sources:
+        sources = ", ".join(f"#{source}" for source in sorted(active_video_sources))
+        raise ValueError(f"录像步骤缺少 stop_video：相机源 {sources}")
 
     return {
         "api_version": ACTION_API_VERSION,
@@ -182,6 +216,9 @@ class CameraSourcePool:
         self._height = int(height)
         self._captures: dict[int, object] = {}
         self._cv2 = None
+        self._video_sessions: dict[int, dict] = {}
+        self._video_error_lock = threading.Lock()
+        self._video_error: Optional[str] = None
 
     def open_sources(self, sources: Sequence[int]) -> tuple[bool, str]:
         try:
@@ -237,7 +274,116 @@ class CameraSourcePool:
         path.parent.mkdir(parents=True, exist_ok=True)
         return bool(self._cv2.imwrite(str(path), frame))
 
+    def start_video(self, source: int, path: Path, fps: float) -> None:
+        """Start a background AVI/MJPG or MP4/mp4v recording."""
+        source = int(source)
+        if self._cv2 is None or source not in self._captures:
+            raise RuntimeError(f"相机源#{source}尚未打开")
+        if source in self._video_sessions:
+            raise RuntimeError(f"相机源#{source}已在录像")
+        frame = self._read_fresh_frame(source)
+        if frame is None:
+            raise RuntimeError(f"相机源#{source}录像前无法取帧")
+        height, width = frame.shape[:2]
+        if width <= 0 or height <= 0:
+            raise RuntimeError(f"相机源#{source}录像画面尺寸无效")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        suffix = path.suffix.lower()
+        codecs = {".avi": "MJPG", ".mp4": "mp4v"}
+        codec = codecs.get(suffix)
+        if codec is None:
+            raise RuntimeError(f"不支持的录像格式：{suffix or '无扩展名'}")
+        writer = self._cv2.VideoWriter(
+            str(path),
+            self._cv2.VideoWriter_fourcc(*codec),
+            float(fps),
+            (int(width), int(height)),
+        )
+        if not writer.isOpened():
+            writer.release()
+            raise RuntimeError(f"无法创建相机源#{source}录像文件：{path.name}")
+
+        stop_event = threading.Event()
+        session = {
+            "source": source,
+            "path": Path(path),
+            "fps": float(fps),
+            "writer": writer,
+            "stop_event": stop_event,
+            "frame_count": 0,
+            "started_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        }
+
+        def record_loop() -> None:
+            period_s = 1.0 / float(fps)
+            deadline = time.monotonic()
+            try:
+                while not stop_event.is_set():
+                    ok, next_frame = self._captures[source].read()
+                    if not ok or next_frame is None or getattr(next_frame, "size", 1) == 0:
+                        raise RuntimeError(f"相机源#{source}录像期间取帧失败")
+                    writer.write(next_frame)
+                    session["frame_count"] += 1
+                    deadline += period_s
+                    stop_event.wait(max(0.0, deadline - time.monotonic()))
+            except Exception as exc:  # noqa: BLE001 - reported on worker thread
+                with self._video_error_lock:
+                    self._video_error = str(exc) or exc.__class__.__name__
+
+        thread = threading.Thread(
+            target=record_loop,
+            name=f"scara-video-source-{source}",
+            daemon=True,
+        )
+        session["thread"] = thread
+        self._video_sessions[source] = session
+        thread.start()
+
+    def check_video_error(self) -> None:
+        """Raise a background recorder error on the action worker thread."""
+        with self._video_error_lock:
+            message = self._video_error
+            self._video_error = None
+        if message:
+            raise RuntimeError(message)
+
+    def stop_video(self, source: int) -> dict:
+        """Stop one recording and return JSON-serializable session metadata."""
+        source = int(source)
+        session = self._video_sessions.get(source)
+        if session is None:
+            raise RuntimeError(f"相机源#{source}尚未开始录像")
+        session["stop_event"].set()
+        session["thread"].join(timeout=3.0)
+        if session["thread"].is_alive():
+            raise RuntimeError(f"相机源#{source}录像线程无法停止")
+        session["writer"].release()
+        self._video_sessions.pop(source, None)
+        self.check_video_error()
+        frame_count = int(session["frame_count"])
+        if frame_count < 1:
+            raise RuntimeError(f"相机源#{source}录像没有写入任何画面")
+        return {
+            "source": source,
+            "filename": session["path"].name,
+            "fps": float(session["fps"]),
+            "frame_count": frame_count,
+            "started_at": session["started_at"],
+            "finished_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+        }
+
     def close(self) -> None:
+        for source in list(self._video_sessions):
+            try:
+                self.stop_video(source)
+            except Exception:
+                session = self._video_sessions.pop(source, None)
+                if session is not None:
+                    try:
+                        session["stop_event"].set()
+                        session["writer"].release()
+                    except Exception:
+                        pass
         for cap in self._captures.values():
             try:
                 cap.release()
@@ -247,10 +393,11 @@ class CameraSourcePool:
 
 
 class ActionWorker(QThread):
-    """Execute one validated action, capture photos, and persist point JSON."""
+    """Execute one validated action and persist photos/videos/point JSON."""
 
     progress = pyqtSignal(str)
     photo_saved = pyqtSignal(str)
+    video_saved = pyqtSignal(str)
     point_recorded = pyqtSignal(str)
     run_finished = pyqtSignal(bool, str, str)
 
@@ -277,6 +424,7 @@ class ActionWorker(QThread):
         self._camera_pool: Optional[CameraSourcePool] = None
         self._stop_requested = threading.Event()
         self._photo_counts: dict[int, int] = {}
+        self._active_video_sources: set[int] = set()
         self._manifest: dict = {}
 
     def request_stop(self) -> None:
@@ -430,6 +578,36 @@ class ActionWorker(QThread):
         self._save_manifest()
         self.photo_saved.emit(str(photo_path))
 
+    def _start_video(self, step: dict) -> None:
+        """Start one source recording inside the current timestamp folder."""
+        source = int(step["source"])
+        if self._camera_pool is None:
+            raise RuntimeError(f"相机源#{source}录像池未初始化")
+        video_path = self._output_dir / step["filename"]
+        if video_path.exists():
+            raise RuntimeError(f"录像文件已存在，拒绝覆盖：{video_path.name}")
+        self._camera_pool.start_video(source, video_path, step["fps"])
+        self._active_video_sources.add(source)
+        self._manifest["video_recording"] = {
+            "source": source,
+            "filename": video_path.name,
+            "fps": step["fps"],
+            "status": "recording",
+        }
+        self._save_manifest()
+
+    def _stop_video(self, source: int) -> None:
+        """Finish one recording, save its metadata, and emit its path."""
+        source = int(source)
+        if self._camera_pool is None:
+            raise RuntimeError(f"相机源#{source}录像池未初始化")
+        metadata = self._camera_pool.stop_video(source)
+        self._active_video_sources.discard(source)
+        self._manifest["videos"].append(metadata)
+        self._manifest.pop("video_recording", None)
+        self._save_manifest()
+        self.video_saved.emit(str(self._output_dir / metadata["filename"]))
+
     def _assert_joints(self, step: dict) -> None:
         state = self._read_state(step["name"])
         errors = [
@@ -478,6 +656,10 @@ class ActionWorker(QThread):
                 raise RuntimeError("动作已取消")
         elif kind == "capture":
             self._capture(step["source"])
+        elif kind == "start_video":
+            self._start_video(step)
+        elif kind == "stop_video":
+            self._stop_video(step["source"])
         elif kind == "record_point":
             self._record_point(step["name"])
 
@@ -502,15 +684,27 @@ class ActionWorker(QThread):
                 "camera_model": dict(self._task["camera_model"]),
                 "points": [],
                 "photos": [],
+                "videos": [],
             }
             self._save_manifest()
 
-            sources = sorted(
-                {step["source"] for step in self._task["actions"] if step["type"] == "capture"}
+            capture_sources = {
+                step["source"]
+                for step in self._task["actions"]
+                if step["type"] == "capture"
+            }
+            video_sources = {
+                step["source"]
+                for step in self._task["actions"]
+                if step["type"] in {"start_video", "stop_video"}
+            }
+            sources = sorted(capture_sources | video_sources)
+            pool_sources = sorted(
+                video_sources | (capture_sources if self._snapshot_source is None else set())
             )
-            if self._snapshot_source is None and sources:
+            if pool_sources:
                 self._camera_pool = CameraSourcePool()
-                opened, error = self._camera_pool.open_sources(sources)
+                opened, error = self._camera_pool.open_sources(pool_sources)
                 if not opened:
                     raise RuntimeError(error)
             self.progress.emit(
@@ -521,6 +715,8 @@ class ActionWorker(QThread):
             for index, step in enumerate(self._task["actions"], start=1):
                 if self._stop_requested.is_set():
                     raise RuntimeError("动作已取消")
+                if self._camera_pool is not None:
+                    self._camera_pool.check_video_error()
                 label = step.get("name") or step["type"]
                 self.progress.emit(f"{index}/{total} {label}")
                 self._execute_step(step)
@@ -529,13 +725,18 @@ class ActionWorker(QThread):
             photo_total = sum(self._photo_counts.values())
             message = (
                 f"动作完成，共记录 {len(self._manifest['points'])} 个点、"
-                f"保存 {photo_total} 张照片"
+                f"保存 {photo_total} 张照片、{len(self._manifest['videos'])} 段录像"
             )
         except FileExistsError:
             message = f"输出文件夹已存在：{self._output_dir}"
         except Exception as exc:  # noqa: BLE001 - displayed safely in the UI
             message = str(exc) or exc.__class__.__name__
         finally:
+            for source in list(self._active_video_sources):
+                try:
+                    self._stop_video(source)
+                except Exception:
+                    self._active_video_sources.discard(source)
             if self._camera_pool is not None:
                 self._camera_pool.close()
             if self._manifest:
