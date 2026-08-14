@@ -210,6 +210,8 @@ class ScaraControlWidget(QWidget):
         self._action_source_position_calculators: dict[
             int, Callable[[list[float], list[float]], dict]
         ] = {}
+        self._action_runtime_factory: Optional[Callable[..., object]] = None
+        self._action_runtime: Optional[object] = None
         self._action_task: Optional[dict] = None
         self._action_worker: Optional[ActionWorker] = None
         self._action_control_states: list[tuple[QWidget, bool]] = []
@@ -546,6 +548,8 @@ class ScaraControlWidget(QWidget):
         self._action_builder = None
         self._action_camera_calculator = None
         self._action_source_position_calculators = {}
+        self._action_runtime_factory = None
+        self._action_runtime = None
         try:
             module_name = f"_scara_action_{abs(hash(str(path)))}"
             spec = importlib.util.spec_from_file_location(module_name, path)
@@ -587,6 +591,9 @@ class ScaraControlWidget(QWidget):
                         "camera1_position_from_state 必须返回 x_mm/y_mm/z_mm"
                     )
                 source_position_calculators[1] = camera1_calculator
+            runtime_factory = getattr(module, "create_task_runtime", None)
+            if runtime_factory is not None and not callable(runtime_factory):
+                raise ValueError("create_task_runtime 必须是可调用函数")
             point_count = sum(step["type"] == "record_point" for step in task["actions"])
             photo_count = sum(step["type"] == "capture" for step in task["actions"])
             video_count = sum(step["type"] == "start_video" for step in task["actions"])
@@ -594,6 +601,7 @@ class ScaraControlWidget(QWidget):
             self._action_builder = build
             self._action_camera_calculator = camera_calculator
             self._action_source_position_calculators = source_position_calculators
+            self._action_runtime_factory = runtime_factory
             self._action_task = task
             self._btn_import_action.setToolTip(str(path))
             self._btn_run_action.setEnabled(True)
@@ -607,6 +615,8 @@ class ScaraControlWidget(QWidget):
             )
         except Exception as exc:
             self._action_file = None
+            self._action_runtime_factory = None
+            self._action_runtime = None
             self._btn_import_action.setToolTip("")
             self._action_label.setText("导入失败")
             self._append("动作错误", f"无法载入 {path.name}: {exc}", _D["error"])
@@ -709,6 +719,31 @@ class ScaraControlWidget(QWidget):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
+        self._action_runtime = None
+        if self._action_runtime_factory is not None:
+            try:
+                runtime = self._action_runtime_factory(output_dir, self)
+                if runtime is None:
+                    raise ValueError("create_task_runtime() 未返回运行时对象")
+                on_photo_saved = getattr(runtime, "on_photo_saved", None)
+                on_task_finished = getattr(runtime, "on_task_finished", None)
+                if not callable(on_photo_saved) or not callable(on_task_finished):
+                    raise ValueError(
+                        "任务运行时必须实现 on_photo_saved(path) 和 "
+                        "on_task_finished(ok, message, output_dir)"
+                    )
+                fatal_error = getattr(runtime, "fatal_error", None)
+                if fatal_error is not None:
+                    connect_fatal_error = getattr(fatal_error, "connect", None)
+                    if not callable(connect_fatal_error):
+                        raise ValueError("任务运行时 fatal_error 必须是Qt信号")
+                    connect_fatal_error(self._on_action_runtime_fatal_error)
+                self._action_runtime = runtime
+            except Exception as exc:
+                QMessageBox.critical(self, "任务准备失败", str(exc))
+                self._append("动作错误", f"任务运行时启动失败：{exc}", _D["error"])
+                return
+
         # The action opens sources 0/1/2 itself.  Release the preview capture to
         # avoid DirectShow device contention, then restore it after the run.
         self._resume_camera_index = None
@@ -734,6 +769,10 @@ class ScaraControlWidget(QWidget):
         self._action_worker.photo_saved.connect(
             lambda path: self._append("照片", f"已保存 {path}", _D["success"])
         )
+        if self._action_runtime is not None:
+            self._action_worker.photo_saved.connect(
+                self._action_runtime.on_photo_saved
+            )
         self._action_worker.video_saved.connect(
             lambda path: self._append("录像", f"已保存 {path}", _D["success"])
         )
@@ -751,12 +790,32 @@ class ScaraControlWidget(QWidget):
         self._append("动作", f"开始，输出文件夹 {output_dir}", _D["warning"])
         self._action_worker.start()
 
+    def _on_action_runtime_fatal_error(self, message: str) -> None:
+        """Stop motion after a task-specific GUI/runtime processing failure."""
+        worker = self._action_worker
+        if worker is None or not worker.isRunning():
+            return
+        self._append("动作错误", message, _D["error"])
+        worker.request_stop()
+        self._btn_run_action.setText("正在安全停止…")
+        self._btn_run_action.setEnabled(False)
+
     def _on_action_finished(
         self,
         ok: bool,
         message: str,
         output_dir: str,
     ) -> None:
+        runtime = self._action_runtime
+        self._action_runtime = None
+        runtime_error = ""
+        if runtime is not None:
+            try:
+                runtime.on_task_finished(ok, message, output_dir)
+            except Exception as exc:
+                runtime_error = str(exc) or exc.__class__.__name__
+                ok = False
+                message = f"{message}；采集后处理失败：{runtime_error}"
         self._set_action_controls_locked(False)
         self._btn_cam.setEnabled(True)
         self._btn_snap.setEnabled(True)
