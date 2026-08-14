@@ -9,7 +9,10 @@ SCARA 机械臂控制界面
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
+import threading
+import time
 from datetime import datetime
 import json
 from pathlib import Path
@@ -204,6 +207,10 @@ class ScaraControlWidget(QWidget):
         self._owns = owns_controller
         self._ctrl = controller or ScaraController(self._cfg)
         self._cam: Optional[ScaraCameraThread] = None
+        self._handeye_dialog: Optional[QDialog] = None
+        self._handeye_state_lock = threading.Lock()
+        self._handeye_controller_connected = False
+        self._latest_handeye_robot_state: Optional[dict[str, object]] = None
         self._action_file: Optional[Path] = None
         self._action_builder: Optional[Callable[[], dict]] = None
         self._action_camera_calculator: Optional[Callable[[list[float]], dict]] = None
@@ -346,11 +353,18 @@ class ScaraControlWidget(QWidget):
         row.addWidget(self._preset_combo, 1); row.addWidget(self._btn_goto); row.addWidget(self._btn_del_preset)
         g.addLayout(row); v.addWidget(f)
 
-        f, g = _card("轨迹拍照")
+        f, g = _card("任务执行")
         row = QHBoxLayout()
         self._btn_import_action = _btn("导入动作")
         self._action_label = QLabel("未导入")
         self._action_label.setObjectName("muted")
+        # 左栏宽度固定；长文件名/说明只能在按钮之间的区域内换行，不能撑宽布局。
+        self._action_label.setWordWrap(True)
+        self._action_label.setFixedWidth(96)
+        self._action_label.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Preferred,
+        )
         self._btn_run_action = _btn("执行动作", "primary")
         self._btn_run_action.setEnabled(False)
         row.addWidget(self._btn_import_action)
@@ -360,6 +374,21 @@ class ScaraControlWidget(QWidget):
         note = QLabel("动作可组合 XYZ/R 运动、相机拍照/录像和 JSON 途径点记录。")
         note.setObjectName("muted"); note.setWordWrap(True)
         g.addWidget(note)
+        v.addWidget(f)
+
+        f, g = _card("手眼交互")
+        self._btn_handeye_demo = _btn("动态演示", "primary")
+        self._btn_handeye_demo.setToolTip(
+            "打开相机1实时槽位/吸盘误差叠加；只计算，不移动机械臂"
+        )
+        g.addWidget(self._btn_handeye_demo)
+        handeye_note = QLabel(
+            "目标槽下拉选择、Stage3实时位姿、A–H重投影和Jacobian验证。"
+            "动态演示与验证按钮只计算，机械臂不会移动。"
+        )
+        handeye_note.setObjectName("muted")
+        handeye_note.setWordWrap(True)
+        g.addWidget(handeye_note)
         v.addWidget(f)
 
         # DO接口：泵/阀两列；映射持久化到 scara_do_map.json；电平改后须回车才下发
@@ -495,6 +524,7 @@ class ScaraControlWidget(QWidget):
         self._btn_del_preset.clicked.connect(lambda: self._ctrl.delete_preset(self._preset_combo.currentText()))
         self._btn_import_action.clicked.connect(self._choose_action_file)
         self._btn_run_action.clicked.connect(self._on_run_action)
+        self._btn_handeye_demo.clicked.connect(self._open_handeye_demo)
         self._btn_cam.clicked.connect(self._toggle_camera)
         self._btn_snap.clicked.connect(self._snapshot)
         self._ctrl.connection_changed.connect(self._on_conn)
@@ -661,6 +691,11 @@ class ScaraControlWidget(QWidget):
         if not self._ctrl.motion_ready():
             return
 
+        # Task capture needs exclusive camera access.  Refuse to proceed until
+        # the read-only Stage3 monitor has really exited.
+        if not self._close_handeye_dialog("开始任务前"):
+            return
+
         try:
             task = normalize_action_task(self._action_builder())
         except Exception as exc:
@@ -749,8 +784,10 @@ class ScaraControlWidget(QWidget):
         self._resume_camera_index = None
         if self._cam is not None:
             self._resume_camera_index = self._cam.source_index
-            self._cam.stop()
-            self._cam = None
+            if not self._stop_camera_thread("任务启动前释放相机"):
+                self._resume_camera_index = None
+                self._action_runtime = None
+                return
             self._btn_cam.setText("连接相机")
             self._cam_lbl.setText("动作执行中 — 相机预览已临时释放")
 
@@ -779,6 +816,9 @@ class ScaraControlWidget(QWidget):
         self._action_worker.point_recorded.connect(
             lambda name: self._append("采点", f"已记录 {name}", _D["success"])
         )
+        self._action_worker.operator_checkpoint_requested.connect(
+            self._on_action_operator_checkpoint
+        )
         self._action_worker.run_finished.connect(self._on_action_finished)
 
         self._set_action_controls_locked(True)
@@ -799,6 +839,60 @@ class ScaraControlWidget(QWidget):
         worker.request_stop()
         self._btn_run_action.setText("正在安全停止…")
         self._btn_run_action.setEnabled(False)
+
+    def _on_action_operator_checkpoint(
+        self,
+        title: str,
+        message: str,
+        continue_text: str,
+        finish_text: str,
+    ) -> None:
+        """Ask the operator whether a paused repeated scan should continue."""
+        worker = self._action_worker
+        if worker is None or not worker.isRunning():
+            return
+
+        prompt = QMessageBox(self)
+        prompt.setIcon(QMessageBox.Icon.Information)
+        prompt.setWindowTitle(title)
+        prompt.setText(message)
+        prompt.setInformativeText(
+            "只有此窗口出现且机械臂已经停止时，才可以调整标定板。\n"
+            "固定好新的姿态并确认工作区无人后，再点击“继续采集”。"
+        )
+        continue_button = prompt.addButton(
+            continue_text,
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        finish_button = prompt.addButton(
+            finish_text,
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        prompt.setDefaultButton(finish_button)
+        prompt.setEscapeButton(finish_button)
+        prompt.setStyleSheet(
+            "QMessageBox { background-color:#FFFFFF; color:#111827; }"
+            "QMessageBox QLabel { color:#111827; background:transparent; }"
+            "QMessageBox QPushButton {"
+            " color:#111827; background-color:#F3F4F6;"
+            " border:1px solid #9CA3AF; border-radius:4px;"
+            " padding:7px 18px; min-width:100px;"
+            "}"
+            "QMessageBox QPushButton:hover { background-color:#E5E7EB; }"
+            "QMessageBox QPushButton:default {"
+            " border:2px solid #2563EB; background-color:#DBEAFE;"
+            "}"
+        )
+        prompt.exec()
+        continue_collection = prompt.clickedButton() is continue_button
+        worker = self._action_worker
+        if worker is not None and worker.isRunning():
+            worker.respond_operator_checkpoint(continue_collection)
+            self._append(
+                "人工确认",
+                "继续采集下一姿态" if continue_collection else "结束采集并计算内参",
+                _D["warning"] if continue_collection else _D["success"],
+            )
 
     def _on_action_finished(
         self,
@@ -846,7 +940,10 @@ class ScaraControlWidget(QWidget):
             self._append("相机", "动作执行期间不能切换或断开相机", _D["warning"])
             return
         if self._cam is not None:
-            self._cam.stop(); self._cam = None
+            if not self._close_handeye_dialog("断开相机前"):
+                return
+            if not self._stop_camera_thread("断开相机"):
+                return
             self._btn_cam.setText("连接相机"); self._cam_lbl.setText("相机已断开")
             return
         self._cam = ScaraCameraThread(index=self._cam_idx.value())
@@ -854,9 +951,157 @@ class ScaraControlWidget(QWidget):
         self._cam.error.connect(self._on_camera_error)
         self._cam.start(); self._btn_cam.setText("断开相机")
 
+    def _open_handeye_demo(self) -> None:
+        """Open camera-1 computation only; no controller method is called."""
+
+        if self._action_worker is not None and self._action_worker.isRunning():
+            self._append(
+                "手眼交互",
+                "任务执行期间相机被任务独占，不能打开动态演示",
+                _D["warning"],
+            )
+            return
+        if self._handeye_dialog is not None:
+            self._handeye_dialog.raise_()
+            self._handeye_dialog.activateWindow()
+            return
+
+        required_source = 1
+        if self._cam is not None and self._cam.source_index != required_source:
+            if not self._stop_camera_thread("切换到相机1"):
+                return
+            self._btn_cam.setText("连接相机")
+            self._cam_lbl.setText("正在切换到手眼交互所需的相机1……")
+        if self._cam is None:
+            self._cam_idx.setValue(required_source)
+            self._toggle_camera()
+        if self._cam is None or self._cam.source_index != required_source:
+            self._append("手眼交互", "相机1启动失败", _D["error"])
+            return
+
+        try:
+            from scara.ui.handeye_demo_dialog import HandEyeDemoDialog
+
+            project_root = Path(__file__).resolve().parents[3]
+            dialog = HandEyeDemoDialog(
+                project_root,
+                self._cam,
+                self,
+                robot_state_provider=self._handeye_robot_state_snapshot,
+            )
+            self._handeye_dialog = dialog
+            dialog.destroyed.connect(self._on_handeye_dialog_destroyed)
+            dialog.show()
+            self._append(
+                "手眼交互",
+                "动态演示已打开：只计算，机械臂不会移动",
+                _D["success"],
+            )
+        except Exception as exc:
+            self._handeye_dialog = None
+            QMessageBox.critical(self, "动态演示启动失败", str(exc))
+            self._append("手眼交互", f"启动失败：{exc}", _D["error"])
+
+    def _on_handeye_dialog_destroyed(self, _object=None) -> None:
+        self._handeye_dialog = None
+
+    def _handeye_robot_state_snapshot(self) -> Optional[dict[str, object]]:
+        """Return a copy of the latest UI status; never poll the controller."""
+
+        with self._handeye_state_lock:
+            if not self._handeye_controller_connected:
+                return None
+            snapshot = self._latest_handeye_robot_state
+            if snapshot is None:
+                return None
+            return {
+                "joints": list(snapshot["joints"]),
+                "pose": list(snapshot["pose"]),
+                "captured_monotonic_s": float(snapshot["captured_monotonic_s"]),
+            }
+
+    def _cache_handeye_robot_state(self, st: dict) -> None:
+        """Atomically cache one connected-state sample for Stage6 read-only use."""
+
+        try:
+            cached_joints = [float(value) for value in st["joints"]]
+            cached_pose = [float(value) for value in st["pose"]]
+            if (
+                len(cached_joints) != 4
+                or len(cached_pose) != 6
+                or not all(
+                    math.isfinite(value) for value in (*cached_joints, *cached_pose)
+                )
+            ):
+                raise ValueError("invalid joints/pose shape or value")
+            candidate = {
+                "joints": tuple(cached_joints),
+                "pose": tuple(cached_pose),
+                "captured_monotonic_s": time.monotonic(),
+            }
+            with self._handeye_state_lock:
+                if not self._handeye_controller_connected:
+                    self._latest_handeye_robot_state = None
+                    return
+                self._latest_handeye_robot_state = candidate
+        except (KeyError, TypeError, ValueError, OverflowError):
+            with self._handeye_state_lock:
+                self._latest_handeye_robot_state = None
+
+    def _close_handeye_dialog(
+        self,
+        context: str,
+        final_wait_ms: int = 0,
+    ) -> bool:
+        """Close only after the read-only Stage3 thread has really exited."""
+
+        dialog = self._handeye_dialog
+        if dialog is None:
+            return True
+        try:
+            closed = bool(dialog.close())
+            if not closed and final_wait_ms > 0:
+                monitor = getattr(dialog, "monitor", None)
+                stop = getattr(monitor, "stop", None)
+                if callable(stop) and bool(stop(final_wait_ms)):
+                    closed = bool(dialog.close())
+        except RuntimeError:
+            self._handeye_dialog = None
+            return True
+        if closed:
+            self._handeye_dialog = None
+            return True
+        self._append(
+            "手眼交互",
+            f"{context}被暂停：后台Stage3仍在退出，请稍候重试",
+            _D["warning"],
+        )
+        return False
+
+    def _stop_camera_thread(self, context: str, timeout_ms: int = 1500) -> bool:
+        """Stop DirectShow acquisition and retain the object on timeout."""
+
+        camera = self._cam
+        if camera is None:
+            return True
+        if not camera.stop(timeout_ms):
+            self._append(
+                "相机",
+                f"{context}失败：采集线程尚未退出，已禁止切源或重连",
+                _D["warning"],
+            )
+            return False
+        self._cam = None
+        return True
+
     def _on_camera_error(self, message: str) -> None:
         self._append("相机", message, _D["error"])
-        self._cam = None
+        # Keep the dialog referenced if a Stage3 call has not exited yet.
+        dialog_closed = self._close_handeye_dialog("相机异常后的窗口关闭")
+        camera_stopped = self._stop_camera_thread("相机异常后的线程关闭")
+        if not dialog_closed or not camera_stopped:
+            self._btn_cam.setText("相机停止中")
+            return
         self._btn_cam.setText("连接相机")
 
     def _on_frame(self, img: QImage) -> None:
@@ -1096,6 +1341,11 @@ class ScaraControlWidget(QWidget):
         self._ctrl.emergency_stop([e["ch"] for e in self._do_entries])
 
     def _on_conn(self, ok: bool) -> None:
+        with self._handeye_state_lock:
+            was_connected = self._handeye_controller_connected
+            self._handeye_controller_connected = bool(ok)
+            if not ok or not was_connected:
+                self._latest_handeye_robot_state = None
         self._conn_chip.setText("● 已连接" if ok else "● 未连接")
         self._conn_chip.setStyleSheet(
             f"color:{_D['success']}; background:{_D['chip_on_bg']};"
@@ -1117,6 +1367,12 @@ class ScaraControlWidget(QWidget):
 
     def _on_status(self, st: dict) -> None:
         connected = self._ctrl.is_connected()
+        if connected:
+            self._cache_handeye_robot_state(st)
+        else:
+            with self._handeye_state_lock:
+                self._handeye_controller_connected = False
+                self._latest_handeye_robot_state = None
         en_eff = bool(st.get("effectively_enabled"))
         need_clear = bool(st.get("need_clear"))
         estop = bool(st.get("estop") or st.get("soft_estop"))
@@ -1173,6 +1429,10 @@ class ScaraControlWidget(QWidget):
 
     def cleanup(self) -> None:
         try:
+            # Give an in-flight Stage3 call one longer bounded chance to finish.
+            # A failed close retains the dialog reference instead of destroying
+            # a live QThread.
+            self._close_handeye_dialog("退出清理", final_wait_ms=15000)
             if self._action_worker is not None and self._action_worker.isRunning():
                 self._action_worker.request_stop()
                 self._action_worker.wait(3000)
@@ -1182,7 +1442,7 @@ class ScaraControlWidget(QWidget):
                     self._ctrl.disconnect()
                 self._zero_all_dos("退出")
             if self._cam is not None:
-                self._cam.stop(); self._cam = None
+                self._stop_camera_thread("退出清理相机", timeout_ms=5000)
             if self._owns:
                 self._ctrl.cleanup()
         except Exception as exc:  # pragma: no cover

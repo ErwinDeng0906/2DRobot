@@ -95,18 +95,32 @@ class TrayGeometryTests(unittest.TestCase):
         np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-10)
         self.assertAlmostEqual(float(np.linalg.det(rotation)), 1.0, places=10)
         self.assertEqual(len(self.geometry["slots"]), 36)
-        self.assertEqual(self.geometry["slots"]["P00"], [0.0, 0.0, 0.0])
-        self.assertEqual(self.geometry["slots"]["P55"], [-125.0, -125.0, 0.0])
+        self.assertEqual(self.geometry["schema_version"], 2)
+        self.assertEqual(self.geometry["slots"]["P00"], [0.0, 0.0, -2.0])
+        self.assertEqual(self.geometry["slots"]["P55"], [-125.0, -125.0, -2.0])
         self.assertEqual(
             {label: row["id"] for label, row in self.geometry["markers"].items()},
             MARKER_LABEL_TO_ID,
         )
-        for marker in self.geometry["markers"].values():
+        expected_heights = {
+            "A": 0.0,
+            "B": 1.3927,
+            "C": 0.0,
+            "D": 0.7927,
+            "E": 0.0,
+            "F": 0.0,
+            "G": 0.0,
+            "H": 0.0,
+        }
+        for label, marker in self.geometry["markers"].items():
             corners = np.asarray(marker["corners_T_mm"])
             edges = np.linalg.norm(np.roll(corners, -1, axis=0) - corners, axis=1)
             np.testing.assert_allclose(edges, MARKER_SIDE_MM, atol=1e-9)
             np.testing.assert_allclose(corners.mean(axis=0), marker["center_T_mm"])
-            self.assertGreater(marker["center_T_mm"][2], 0.0)
+            self.assertAlmostEqual(
+                marker["center_T_mm"][2], expected_heights[label], places=4
+            )
+            self.assertGreater(marker["center_T_mm"][2], -2.0)
 
     def test_transform_round_trip(self) -> None:
         rvec = np.array([[0.1], [-0.2], [0.3]])

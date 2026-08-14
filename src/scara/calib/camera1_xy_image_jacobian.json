@@ -1,0 +1,556 @@
+{
+  "schema_version": 2,
+  "status": "success",
+  "calibrated_at": "2026-08-14T20:02:27+08:00",
+  "message": "动作完成，共记录 108 个点、保存 108 张照片、0 段录像",
+  "anchor_target_name": "P22",
+  "valid_target_names": [
+    "P22"
+  ],
+  "camera": {
+    "logical_name": "camera1_forearm_fixed",
+    "source_index": 1,
+    "resolution": {
+      "width": 1280,
+      "height": 720
+    }
+  },
+  "locked_inputs": {
+    "camera_intrinsics_path": "C:\\Users\\Admin\\Desktop\\2D robot\\RobotArm_SCARA_Control 0812\\src\\scara\\calib\\camera1_intrinsics.json",
+    "camera_intrinsics_sha256": "797467D6E657F246FE95D8CD612489061D0FA791FD97E1F9EAD4001282A55DDF",
+    "tray_geometry_path": "C:\\Users\\Admin\\Desktop\\2D robot\\RobotArm_SCARA_Control 0812\\src\\scara\\calib\\tray_board_geometry.json",
+    "tray_geometry_sha256": "5B2E80D1BCCBBC00783A1B795F15BFE549CCDCC463C87135DC1DFF50872BC296",
+    "suction_target_path": "C:\\Users\\Admin\\Desktop\\2D robot\\RobotArm_SCARA_Control 0812\\Trajectory Photos\\260814171235\\camera1_suction_target.json",
+    "suction_target_sha256": "6B0B4DFCB8476A2BD219471C769B7D6C95D2F965E3CB330D230AB0781C2D75D9"
+  },
+  "coordinate_definition": {
+    "command_frame": "robot_controller_world_XY",
+    "image_error": "slot_pixel_distorted - suction_target_pixel_distorted",
+    "model_equation": "delta_image_error_px = J_error_px_per_command_mm @ delta_command_xy_mm",
+    "correction_equation": "delta_command_xy_mm = -inverse(J) @ image_error_px",
+    "anchor_point_T_mm": [
+      -50.0,
+      -50.0,
+      -2.0
+    ],
+    "anchor_robot_xy_mm": [
+      118.333,
+      272.783
+    ],
+    "suction_point_C_mm": [
+      -2.4193924827355944,
+      -33.039268309640406,
+      149.5097375382165
+    ],
+    "suction_target_pixel_distorted_px": [
+      625.47569626391,
+      218.4703044850268
+    ],
+    "imaging_j3_mm": -27.0046,
+    "rz_deg": 20.822299999999984,
+    "offset_extent_mm": 2.0
+  },
+  "safety_contract": {
+    "xy_calibration_extent_per_axis_mm": 2.0,
+    "cartesian_waypoint_step_maximum_mm": 1.0,
+    "controller_sequential_transient_test_limit_mm": 2.0001,
+    "z_motion": false,
+    "rotation_scan": false,
+    "vacuum_control": false,
+    "returns_to_anchor": true
+  },
+  "acquisition": {
+    "expected_frame_count": 108,
+    "processed_frame_count": 108,
+    "accepted_frame_count": 108,
+    "rejection_reason_counts": {},
+    "offsets": [
+      {
+        "command_offset_xy_mm": [
+          0.0,
+          0.0
+        ],
+        "frame_count": 12,
+        "accepted_frame_count": 12,
+        "maximum_command_tracking_error_mm": 0.0
+      },
+      {
+        "command_offset_xy_mm": [
+          -2.0,
+          0.0
+        ],
+        "frame_count": 12,
+        "accepted_frame_count": 12,
+        "maximum_command_tracking_error_mm": 0.012529964086162935
+      },
+      {
+        "command_offset_xy_mm": [
+          -2.0,
+          -2.0
+        ],
+        "frame_count": 12,
+        "accepted_frame_count": 12,
+        "maximum_command_tracking_error_mm": 0.012529964086162935
+      },
+      {
+        "command_offset_xy_mm": [
+          0.0,
+          -2.0
+        ],
+        "frame_count": 12,
+        "accepted_frame_count": 12,
+        "maximum_command_tracking_error_mm": 0.012529964086162935
+      },
+      {
+        "command_offset_xy_mm": [
+          2.0,
+          -2.0
+        ],
+        "frame_count": 12,
+        "accepted_frame_count": 12,
+        "maximum_command_tracking_error_mm": 0.01208304597361463
+      },
+      {
+        "command_offset_xy_mm": [
+          2.0,
+          0.0
+        ],
+        "frame_count": 12,
+        "accepted_frame_count": 12,
+        "maximum_command_tracking_error_mm": 0.012529964086162935
+      },
+      {
+        "command_offset_xy_mm": [
+          2.0,
+          2.0
+        ],
+        "frame_count": 12,
+        "accepted_frame_count": 12,
+        "maximum_command_tracking_error_mm": 0.012529964086162935
+      },
+      {
+        "command_offset_xy_mm": [
+          0.0,
+          2.0
+        ],
+        "frame_count": 12,
+        "accepted_frame_count": 12,
+        "maximum_command_tracking_error_mm": 0.01208304597361463
+      },
+      {
+        "command_offset_xy_mm": [
+          -2.0,
+          2.0
+        ],
+        "frame_count": 12,
+        "accepted_frame_count": 12,
+        "maximum_command_tracking_error_mm": 0.012529964086162935
+      }
+    ]
+  },
+  "runtime_processing": {
+    "failed": false,
+    "fatal_messages": []
+  },
+  "fit": {
+    "status": "success",
+    "failure_reasons": [],
+    "quality_configuration": {
+      "minimum_frames_per_offset": 5,
+      "minimum_distinct_offsets": 7,
+      "robust_sigma_multiplier": 3.0,
+      "residual_floor_px": 0.75,
+      "maximum_fit_rms_px": 1.5,
+      "maximum_cross_validation_rms_px": 2.5,
+      "maximum_condition_number": 25.0,
+      "minimum_singular_value_px_per_mm": 0.25
+    },
+    "offset_aggregates": [
+      {
+        "command_offset_xy_mm": [
+          -2.0,
+          -2.0
+        ],
+        "frame_count": 12,
+        "used_frame_count": 12,
+        "usable": true,
+        "median_image_error_px": [
+          -8.840345233765674,
+          3.1276490497236438
+        ],
+        "within_offset_residual_gate_px": 0.75,
+        "within_offset_rms_px": 0.19915364963619359,
+        "raw_frame_count": 12
+      },
+      {
+        "command_offset_xy_mm": [
+          -2.0,
+          0.0
+        ],
+        "frame_count": 12,
+        "used_frame_count": 12,
+        "usable": true,
+        "median_image_error_px": [
+          -5.017388115179131,
+          -4.210519053867287
+        ],
+        "within_offset_residual_gate_px": 0.75,
+        "within_offset_rms_px": 0.24073813236384758,
+        "raw_frame_count": 12
+      },
+      {
+        "command_offset_xy_mm": [
+          -2.0,
+          2.0
+        ],
+        "frame_count": 12,
+        "used_frame_count": 12,
+        "usable": true,
+        "median_image_error_px": [
+          -1.2806284712611955,
+          -11.85307626361525
+        ],
+        "within_offset_residual_gate_px": 0.8213695372976306,
+        "within_offset_rms_px": 0.2890651113538123,
+        "raw_frame_count": 12
+      },
+      {
+        "command_offset_xy_mm": [
+          0.0,
+          -2.0
+        ],
+        "frame_count": 12,
+        "used_frame_count": 12,
+        "usable": true,
+        "median_image_error_px": [
+          -1.5396064807708285,
+          6.988079175287211
+        ],
+        "within_offset_residual_gate_px": 0.75,
+        "within_offset_rms_px": 0.15154646839267416,
+        "raw_frame_count": 12
+      },
+      {
+        "command_offset_xy_mm": [
+          0.0,
+          0.0
+        ],
+        "frame_count": 12,
+        "used_frame_count": 12,
+        "usable": true,
+        "median_image_error_px": [
+          2.317333712225661,
+          -0.5195788203893841
+        ],
+        "within_offset_residual_gate_px": 0.75,
+        "within_offset_rms_px": 0.25435098017161667,
+        "raw_frame_count": 12
+      },
+      {
+        "command_offset_xy_mm": [
+          0.0,
+          2.0
+        ],
+        "frame_count": 12,
+        "used_frame_count": 11,
+        "usable": true,
+        "median_image_error_px": [
+          5.888537985070002,
+          -7.971656566383842
+        ],
+        "within_offset_residual_gate_px": 0.75,
+        "within_offset_rms_px": 0.2951366892209158,
+        "raw_frame_count": 12
+      },
+      {
+        "command_offset_xy_mm": [
+          2.0,
+          -2.0
+        ],
+        "frame_count": 12,
+        "used_frame_count": 11,
+        "usable": true,
+        "median_image_error_px": [
+          5.902265645337025,
+          10.799857751295605
+        ],
+        "within_offset_residual_gate_px": 0.75,
+        "within_offset_rms_px": 0.22304329148793142,
+        "raw_frame_count": 12
+      },
+      {
+        "command_offset_xy_mm": [
+          2.0,
+          0.0
+        ],
+        "frame_count": 12,
+        "used_frame_count": 12,
+        "usable": true,
+        "median_image_error_px": [
+          9.793396186959399,
+          2.971543813079478
+        ],
+        "within_offset_residual_gate_px": 0.75,
+        "within_offset_rms_px": 0.1928191302160604,
+        "raw_frame_count": 12
+      },
+      {
+        "command_offset_xy_mm": [
+          2.0,
+          2.0
+        ],
+        "frame_count": 12,
+        "used_frame_count": 12,
+        "usable": true,
+        "median_image_error_px": [
+          12.953406436906448,
+          -4.3759963181969255
+        ],
+        "within_offset_residual_gate_px": 1.1676267675307568,
+        "within_offset_rms_px": 0.3274910114570668,
+        "raw_frame_count": 12
+      }
+    ],
+    "used_offset_count": 9,
+    "rejected_offsets_xy_mm": [],
+    "j_error_px_per_command_mm": [
+      [
+        3.64895250745074,
+        1.8365835016595617
+      ],
+      [
+        1.860945959494755,
+        -3.7596929270418737
+      ]
+    ],
+    "j_command_mm_per_error_px": [
+      [
+        0.21939391794917398,
+        0.10717238292834036
+      ],
+      [
+        0.10859403495659259,
+        -0.21293174803240095
+      ]
+    ],
+    "intercept_error_px": [
+      2.2418857406135224,
+      -0.5604108036740839
+    ],
+    "fit_rms_px": 0.16994162176553942,
+    "fit_max_px": 0.3168467983722856,
+    "determinant_px2_per_mm2": -17.136723580062352,
+    "condition_number": 1.0277685420223313,
+    "singular_values_px_per_mm": [
+      4.196735089199744,
+      4.083346510043851
+    ],
+    "cross_validation": {
+      "rows": [
+        {
+          "held_out_offset_xy_mm": [
+            -2.0,
+            -2.0
+          ],
+          "observed_error_px": [
+            -8.840345233765674,
+            3.1276490497236438
+          ],
+          "predicted_error_px": [
+            -8.640259112680202,
+            3.3246303967773665
+          ],
+          "prediction_error_px": [
+            -0.20008612108547297,
+            -0.19698134705372272
+          ],
+          "prediction_error_norm_px": 0.28077768240750495
+        },
+        {
+          "held_out_offset_xy_mm": [
+            -2.0,
+            0.0
+          ],
+          "observed_error_px": [
+            -5.017388115179131,
+            -4.210519053867287
+          ],
+          "predicted_error_px": [
+            -5.070877412406734,
+            -4.309911826046781
+          ],
+          "prediction_error_px": [
+            0.053489297227603316,
+            0.0993927721794936
+          ],
+          "prediction_error_norm_px": 0.11287173286269513
+        },
+        {
+          "held_out_offset_xy_mm": [
+            -2.0,
+            2.0
+          ],
+          "observed_error_px": [
+            -1.2806284712611955,
+            -11.85307626361525
+          ],
+          "predicted_error_px": [
+            -1.4646313107349473,
+            -11.760578427253002
+          ],
+          "prediction_error_px": [
+            0.18400283947375184,
+            -0.09249783636224862
+          ],
+          "prediction_error_norm_px": 0.20594391145673768
+        },
+        {
+          "held_out_offset_xy_mm": [
+            0.0,
+            -2.0
+          ],
+          "observed_error_px": [
+            -1.5396064807708285,
+            6.988079175287211
+          ],
+          "predicted_error_px": [
+            -1.3896177172959003,
+            6.947781156225988
+          ],
+          "prediction_error_px": [
+            -0.14998876347492818,
+            0.040298019061223656
+          ],
+          "prediction_error_norm_px": 0.15530795056595362
+        },
+        {
+          "held_out_offset_xy_mm": [
+            0.0,
+            0.0
+          ],
+          "observed_error_px": [
+            2.317333712225661,
+            -0.5195788203893841
+          ],
+          "predicted_error_px": [
+            2.2324547441620046,
+            -0.5655148015846714
+          ],
+          "prediction_error_px": [
+            0.08487896806365658,
+            0.0459359811952873
+          ],
+          "prediction_error_norm_px": 0.0965119349506838
+        },
+        {
+          "held_out_offset_xy_mm": [
+            0.0,
+            2.0
+          ],
+          "observed_error_px": [
+            5.888537985070002,
+            -7.971656566383842
+          ],
+          "predicted_error_px": [
+            5.925250728110585,
+            -8.12138900059398
+          ],
+          "prediction_error_px": [
+            -0.03671274304058336,
+            0.14973243421013827
+          ],
+          "prediction_error_norm_px": 0.15416753016137116
+        },
+        {
+          "held_out_offset_xy_mm": [
+            2.0,
+            -2.0
+          ],
+          "observed_error_px": [
+            5.902265645337025,
+            10.799857751295605
+          ],
+          "predicted_error_px": [
+            5.838110237682965,
+            10.58567434388203
+          ],
+          "prediction_error_px": [
+            0.06415540765405936,
+            0.2141834074135751
+          ],
+          "prediction_error_norm_px": 0.22358543857449223
+        },
+        {
+          "held_out_offset_xy_mm": [
+            2.0,
+            0.0
+          ],
+          "observed_error_px": [
+            9.793396186959399,
+            2.971543813079478
+          ],
+          "predicted_error_px": [
+            9.442250204959464,
+            3.234533923867707
+          ],
+          "prediction_error_px": [
+            0.3511459819999345,
+            -0.2629901107882291
+          ],
+          "prediction_error_norm_px": 0.43871095159239343
+        },
+        {
+          "held_out_offset_xy_mm": [
+            2.0,
+            2.0
+          ],
+          "observed_error_px": [
+            12.953406436906448,
+            -4.3759963181969255
+          ],
+          "predicted_error_px": [
+            13.420598816376264,
+            -4.343431475225442
+          ],
+          "prediction_error_px": [
+            -0.4671923794698163,
+            -0.03256484297148354
+          ],
+          "prediction_error_norm_px": 0.4683259425148539
+        }
+      ],
+      "rms_px": 0.26935699276419073
+    },
+    "quality_gates": {
+      "minimum_offset_count": {
+        "value": 9,
+        "minimum": 7,
+        "passed": true
+      },
+      "fit_rms": {
+        "value_px": 0.16994162176553942,
+        "maximum_px": 1.5,
+        "passed": true
+      },
+      "cross_validation_rms": {
+        "value_px": 0.26935699276419073,
+        "maximum_px": 2.5,
+        "passed": true
+      },
+      "condition_number": {
+        "value": 1.0277685420223313,
+        "maximum": 25.0,
+        "passed": true
+      },
+      "minimum_singular_value": {
+        "value_px_per_mm": 4.083346510043851,
+        "minimum_px_per_mm": 0.25,
+        "passed": true
+      },
+      "invertible": {
+        "passed": true
+      }
+    }
+  },
+  "source_run_folder": "C:\\Users\\Admin\\Desktop\\2D robot\\RobotArm_SCARA_Control 0812\\Trajectory Photos\\260814195906"
+}

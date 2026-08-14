@@ -34,12 +34,13 @@ from PyQt6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QProgressBar,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
+
+from scara.ui.dialogs import ask_light_warning_confirmation
 
 from .charuco_calibration import (
     CalibrationQualityConfig,
@@ -58,7 +59,9 @@ class CameraCalibrationRuntimeConfig:
     logical_name: str = "camera1_forearm_fixed"
     mount: str = "fixed on SCARA forearm; follows J1/J2; independent of J3/J4"
     capture_backend: str = "OpenCV DirectShow"
-    planned_images: int = 49
+    planned_images: Optional[int] = 49
+    images_per_pose: Optional[int] = None
+    operator_reposition_between_passes: bool = False
     scan_size_mm: float = 105.0
     run_filename: str = "camera1_intrinsics.json"
     project_relative_path: Path = Path("src/scara/calib/camera1_intrinsics.json")
@@ -110,11 +113,19 @@ class CalibrationGuideDialog(QDialog):
         )
 
         layout = QVBoxLayout(self)
-        intro = QLabel(
-            "标定板应在运行前牢固固定为约15–30°倾斜；运行中严禁用手触碰"
-            "标定板或进入机械臂工作区。若最终姿态多样性不足，程序不会覆盖"
-            "正式相机参数。"
-        )
+        if runtime_config.operator_reposition_between_passes:
+            intro_text = (
+                "每个九点扫描期间，标定板必须牢固固定且严禁进入机械臂工作区。"
+                "只有机械臂返回X并出现人工确认窗口后，才可以改变标定板姿态。"
+                "结束采集时会使用本次任务的全部姿态统一计算内参。"
+            )
+        else:
+            intro_text = (
+                "标定板应在运行前牢固固定为约15–30°倾斜；运行中严禁用手触碰"
+                "标定板或进入机械臂工作区。若最终姿态多样性不足，程序不会覆盖"
+                "正式相机参数。"
+            )
+        intro = QLabel(intro_text)
         intro.setWordWrap(True)
         intro.setStyleSheet(
             "font-weight:700; color:#111111; background:#FFF7D6;"
@@ -194,9 +205,19 @@ class CalibrationGuideDialog(QDialog):
     ) -> None:
         """Refresh all quality fields from one core-session record."""
         captured = int(record["capture_sequence"])
-        self.values["captured"].setText(
-            f"{captured}/{self.runtime_config.planned_images} 张"
-        )
+        images_per_pose = self.runtime_config.images_per_pose
+        if images_per_pose is not None and images_per_pose > 0:
+            pose_number = (captured - 1) // images_per_pose + 1
+            within_pose = (captured - 1) % images_per_pose + 1
+            captured_text = (
+                f"累计 {captured} 张；姿态 {pose_number}："
+                f"{within_pose}/{images_per_pose}"
+            )
+        elif self.runtime_config.planned_images is not None:
+            captured_text = f"{captured}/{self.runtime_config.planned_images} 张"
+        else:
+            captured_text = f"累计 {captured} 张"
+        self.values["captured"].setText(captured_text)
         marker_total = (self.board_spec.squares_x * self.board_spec.squares_y) // 2
         self.values["detected"].setText(
             f"{record['charuco_corner_count']}/{self.board_spec.corner_count} 角点；"
@@ -259,21 +280,37 @@ class CharucoCalibrationRuntime(QObject):
         ),
     ) -> None:
         super().__init__(parent)
-        answer = QMessageBox.question(
+        if runtime_config.operator_reposition_between_passes:
+            safety_text = (
+                "开始前请确认：\n\n"
+                "1. 第一个ChArUco姿态已牢固固定；\n"
+                f"2. 相机{runtime_config.camera_source}在整个"
+                f"{runtime_config.scan_size_mm:.0f}×"
+                f"{runtime_config.scan_size_mm:.0f}mm范围内能看到足够的标定板；\n"
+                "3. 每轮九点扫描期间，人员不会触碰标定板或进入工作区；\n"
+                "4. 只有机械臂返回X且出现“继续采集/结束采集”窗口后，"
+                "才会改变板姿态；\n"
+                "5. 抬高或倾斜后的标定板与吸盘、转接头有足够间隙；\n"
+                "6. 物理急停可用。\n\n"
+                "是否继续？"
+            )
+        else:
+            safety_text = (
+                "开始前请确认：\n\n"
+                "1. ChArUco板已牢固固定，推荐相对托盘倾斜15–30°；\n"
+                f"2. 相机{runtime_config.camera_source}在整个"
+                f"{runtime_config.scan_size_mm:.0f}×"
+                f"{runtime_config.scan_size_mm:.0f}mm范围内能看到足够的标定板；\n"
+                "3. 运行中不会用手触碰标定板或进入机械臂工作区；\n"
+                "4. 物理急停可用。\n\n"
+                "是否继续？"
+            )
+        confirmed = ask_light_warning_confirmation(
             parent,
             "ChArUco 标定板安全确认",
-            "开始前请确认：\n\n"
-            "1. ChArUco板已牢固固定，推荐相对托盘倾斜15–30°；\n"
-            f"2. 相机{runtime_config.camera_source}在整个"
-            f"{runtime_config.scan_size_mm:.0f}×"
-            f"{runtime_config.scan_size_mm:.0f}mm范围内能看到足够的标定板；\n"
-            "3. 运行中不会用手触碰标定板或进入机械臂工作区；\n"
-            "4. 物理急停可用。\n\n"
-            "是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            safety_text,
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        if not confirmed:
             raise RuntimeError("用户取消：标定板安全准备尚未确认")
 
         self.output_dir = Path(output_dir)
@@ -328,6 +365,7 @@ class CharucoCalibrationRuntime(QObject):
                 return {
                     "point_sequence": photo.get("point_sequence"),
                     "captured_at": photo.get("captured_at"),
+                    "collection_round": photo.get("collection_round"),
                 }
         return {}
 
@@ -397,6 +435,7 @@ class CharucoCalibrationRuntime(QObject):
             "acquisition": {
                 "camera_source": self.runtime_config.camera_source,
                 "planned_images": self.runtime_config.planned_images,
+                "images_per_pose": self.runtime_config.images_per_pose,
                 "captured_images": len(self.session.records),
                 "recommended_images": self.session.recommended_image_count,
                 "coverage_grid": {
@@ -528,14 +567,20 @@ def create_camera1_charuco_runtime(
     project_root: Path,
     parent: Optional[QWidget] = None,
     *,
-    planned_images: int = 49,
+    planned_images: Optional[int] = 49,
     scan_size_mm: float = 105.0,
+    images_per_pose: Optional[int] = None,
+    operator_reposition_between_passes: bool = False,
     board_spec: CharucoBoardSpec = DEFAULT_BOARD_SPEC,
     quality: CalibrationQualityConfig = DEFAULT_QUALITY_CONFIG,
 ) -> CharucoCalibrationRuntime:
     """Build the standard camera-1 runtime used by an action task."""
     runtime_config = CameraCalibrationRuntimeConfig(
         planned_images=planned_images,
+        images_per_pose=images_per_pose,
+        operator_reposition_between_passes=(
+            operator_reposition_between_passes
+        ),
         scan_size_mm=scan_size_mm,
     )
     return CharucoCalibrationRuntime(

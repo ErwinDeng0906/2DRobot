@@ -12,4 +12,12 @@
 - scara.vision.tray_pose_estimator：阶段3，检测A–H并由RANSAC/重投影质量门
   求当前相机帧的 ^C T_T。
 - scara.vision.tray_pose_tracker：对合格的 ^C T_T 做跳变拒绝和时间滤波。
+- scara.vision.suction_target_calibration：阶段4固定工作平面吸盘target的
+  多帧SE(3)聚合、稳健拟合和按位置留一验证（纯数值模块）。
+- scara.vision.suction_target_calibration_runtime：Task8逐图调用阶段3、回写
+  points.json并保存camera1_suction_target.json及运行更新清单。
+- scara.vision.xy_image_jacobian：阶段5，稳健标定局部
+  Δimage_error = J·Δrobot_world_XY，并进行条件数与按offset留一验证。
+- scara.vision.handeye_interaction：阶段6，只读加载阶段3/4/5结果，投影指定
+  槽中心、A–H重投影角点和Tray坐标轴；不导入任何运动后端。
 """

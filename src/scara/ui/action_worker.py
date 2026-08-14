@@ -18,6 +18,7 @@ from typing import Callable, Optional, Sequence
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from scara.controller.scara_controller import ScaraController
+from scara.file_io import atomic_write_text
 
 
 ACTION_API_VERSION = 1
@@ -30,6 +31,7 @@ SUPPORTED_ACTION_TYPES = {
     "start_video",
     "stop_video",
     "record_point",
+    "operator_checkpoint",
 }
 
 
@@ -96,7 +98,13 @@ def normalize_action_task(raw_task: object) -> dict:
             raise ValueError(f"第 {index} 步 type={kind!r} 不受支持；允许：{allowed}")
 
         step: dict = {"type": kind}
-        if kind in {"assert_joints", "move_joints", "move_xyzr", "record_point"}:
+        if kind in {
+            "assert_joints",
+            "move_joints",
+            "move_xyzr",
+            "record_point",
+            "operator_checkpoint",
+        }:
             name = str(raw.get("name") or f"步骤 {index}").strip()
             if not name:
                 raise ValueError(f"第 {index} 步 name 不能为空")
@@ -127,6 +135,48 @@ def normalize_action_task(raw_task: object) -> dict:
             step["seconds"] = _finite(raw.get("seconds"), f"第 {index} 步 seconds")
             if step["seconds"] < 0:
                 raise ValueError(f"第 {index} 步 seconds 不能为负数")
+        elif kind == "operator_checkpoint":
+            if active_video_sources:
+                raise ValueError(
+                    f"第 {index} 步人工确认前必须先停止全部录像"
+                )
+            message = str(raw.get("message") or "").strip()
+            if not message:
+                raise ValueError(f"第 {index} 步 operator_checkpoint.message 不能为空")
+            continue_text = str(
+                raw.get("continue_text") or "继续采集"
+            ).strip()
+            finish_text = str(raw.get("finish_text") or "结束采集").strip()
+            if not continue_text or not finish_text:
+                raise ValueError(
+                    f"第 {index} 步人工确认的两个按钮文字都不能为空"
+                )
+            repeat_from_index = raw.get("repeat_from_index")
+            if (
+                isinstance(repeat_from_index, bool)
+                or not isinstance(repeat_from_index, int)
+            ):
+                raise ValueError(
+                    f"第 {index} 步 repeat_from_index 必须是从0开始的整数"
+                )
+            if repeat_from_index < 0 or repeat_from_index >= index - 1:
+                raise ValueError(
+                    f"第 {index} 步 repeat_from_index 必须指向此前的动作"
+                )
+            if str(raw_actions[repeat_from_index].get("type") or "").strip() == (
+                "operator_checkpoint"
+            ):
+                raise ValueError(
+                    f"第 {index} 步不能跳回另一个 operator_checkpoint"
+                )
+            step.update(
+                {
+                    "message": message,
+                    "continue_text": continue_text,
+                    "finish_text": finish_text,
+                    "repeat_from_index": repeat_from_index,
+                }
+            )
         elif kind in {"capture", "start_video", "stop_video"}:
             source = raw.get("source")
             if isinstance(source, bool) or not isinstance(source, int) or not 0 <= source <= 8:
@@ -399,6 +449,7 @@ class ActionWorker(QThread):
     photo_saved = pyqtSignal(str)
     video_saved = pyqtSignal(str)
     point_recorded = pyqtSignal(str)
+    operator_checkpoint_requested = pyqtSignal(str, str, str, str)
     run_finished = pyqtSignal(bool, str, str)
 
     def __init__(
@@ -426,10 +477,27 @@ class ActionWorker(QThread):
         self._photo_counts: dict[int, int] = {}
         self._active_video_sources: set[int] = set()
         self._manifest: dict = {}
+        self._operator_decision_event = threading.Event()
+        self._operator_decision: Optional[bool] = None
+        self._repeatable = any(
+            step["type"] == "operator_checkpoint"
+            for step in self._task["actions"]
+        )
+        self._collection_round = 1
 
     def request_stop(self) -> None:
         self._stop_requested.set()
         self._controller.emergency_stop()
+
+    def respond_operator_checkpoint(self, continue_collection: bool) -> None:
+        """Release a paused checkpoint from the Qt UI thread.
+
+        ``True`` repeats the configured acquisition block.  ``False`` ends the
+        acquisition normally, allowing the task runtime to calibrate all images
+        already accumulated in the current output folder.
+        """
+        self._operator_decision = bool(continue_collection)
+        self._operator_decision_event.set()
 
     def _interruptible_wait(self, seconds: float) -> bool:
         remaining = max(0.0, float(seconds))
@@ -446,12 +514,11 @@ class ActionWorker(QThread):
         return self._output_dir / "points.json"
 
     def _save_manifest(self) -> None:
-        temporary = self.manifest_path.with_suffix(".json.tmp")
-        temporary.write_text(
+        atomic_write_text(
+            self.manifest_path,
             json.dumps(self._manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        temporary.replace(self.manifest_path)
 
     def _read_state(self, context: str) -> dict:
         status = self._controller.read_all_sync()
@@ -501,6 +568,8 @@ class ActionWorker(QThread):
             },
             "camera_position": camera,
         }
+        if self._repeatable:
+            point["collection_round"] = self._collection_round
         self._manifest["points"].append(point)
         self._save_manifest()
         self.point_recorded.emit(name)
@@ -566,17 +635,63 @@ class ActionWorker(QThread):
             # the source-specific position annotation in points.json.
             self._manifest["points"][-1][f"camera{source}_position"] = source_position
         self._photo_counts[source] = number
-        self._manifest["photos"].append(
+        photo_record = {
+            "source": source,
+            "sequence_for_source": number,
+            "filename": photo_path.name,
+            "captured_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "point_sequence": point_sequence,
+        }
+        if self._repeatable:
+            photo_record["collection_round"] = self._collection_round
+        self._manifest["photos"].append(photo_record)
+        self._save_manifest()
+        self.photo_saved.emit(str(photo_path))
+
+    def _wait_for_operator_checkpoint(self, step: dict) -> bool:
+        """Pause after a complete scan and wait for Continue or Finish.
+
+        The robot has already returned to the taught centre before Task 7 emits
+        this action.  No motion command is issued while this method waits.
+        """
+        self._operator_decision = None
+        self._operator_decision_event.clear()
+        photo_total = sum(self._photo_counts.values())
+        message = (
+            f"已完成第 {self._collection_round} 个标定板姿态，"
+            f"本任务累计保存 {photo_total} 张照片。\n\n"
+            + step["message"]
+        )
+        self.progress.emit(
+            f"第 {self._collection_round} 个姿态采集完成；等待人员确认"
+        )
+        self.operator_checkpoint_requested.emit(
+            step["name"],
+            message,
+            step["continue_text"],
+            step["finish_text"],
+        )
+        while not self._operator_decision_event.wait(0.1):
+            if self._stop_requested.is_set():
+                raise RuntimeError("动作已取消")
+        if self._stop_requested.is_set():
+            raise RuntimeError("动作已取消")
+        if self._operator_decision is None:
+            raise RuntimeError("人工确认没有返回有效选择")
+        continue_collection = bool(self._operator_decision)
+        self._manifest.setdefault("operator_checkpoints", []).append(
             {
-                "source": source,
-                "sequence_for_source": number,
-                "filename": photo_path.name,
-                "captured_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
-                "point_sequence": point_sequence,
+                "collection_round": self._collection_round,
+                "decided_at": datetime.now().astimezone().isoformat(
+                    timespec="milliseconds"
+                ),
+                "decision": "continue" if continue_collection else "finish",
+                "point_count": len(self._manifest["points"]),
+                "photo_count": photo_total,
             }
         )
         self._save_manifest()
-        self.photo_saved.emit(str(photo_path))
+        return continue_collection
 
     def _start_video(self, step: dict) -> None:
         """Start one source recording inside the current timestamp folder."""
@@ -686,6 +801,9 @@ class ActionWorker(QThread):
                 "photos": [],
                 "videos": [],
             }
+            if self._repeatable:
+                self._manifest["collection_mode"] = "operator_repeated_scan"
+                self._manifest["operator_checkpoints"] = []
             self._save_manifest()
 
             capture_sources = {
@@ -712,14 +830,26 @@ class ActionWorker(QThread):
             )
 
             total = len(self._task["actions"])
-            for index, step in enumerate(self._task["actions"], start=1):
+            index = 0
+            while index < total:
+                step = self._task["actions"][index]
                 if self._stop_requested.is_set():
                     raise RuntimeError("动作已取消")
                 if self._camera_pool is not None:
                     self._camera_pool.check_video_error()
                 label = step.get("name") or step["type"]
-                self.progress.emit(f"{index}/{total} {label}")
+                round_prefix = (
+                    f"姿态{self._collection_round} " if self._repeatable else ""
+                )
+                self.progress.emit(f"{round_prefix}{index + 1}/{total} {label}")
+                if step["type"] == "operator_checkpoint":
+                    if self._wait_for_operator_checkpoint(step):
+                        self._collection_round += 1
+                        index = int(step["repeat_from_index"])
+                        continue
+                    break
                 self._execute_step(step)
+                index += 1
 
             ok = True
             photo_total = sum(self._photo_counts.values())

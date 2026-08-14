@@ -6,10 +6,11 @@ J1/J2 first pass through two-link forward kinematics.  Those mechanical-plane
 coordinates are then used only to establish the independently named Tray Frame
 ``T``:
 
-* origin: centre of slot P00;
+* XY origin: centre of slot P00;
 * ``+X_T``: direction from P50 to P00;
 * ``+Y_T``: direction from P05 to P00, orthogonalized against ``+X_T``;
-* ``+Z_T = +X_T x +Y_T``: from the slot-bottom target plane toward markers.
+* ``+Z_T = +X_T x +Y_T``: from the slot-bottom target plane toward markers;
+* ``Z_T = 0``: the declared common surface of rigid markers A/C/E/F/G/H.
 
 The 6 x 6 slot centres are exact design geometry with 25 mm pitch.  Each A-H
 marker is a measured 13.27 mm square.  Its measured centre and two labelled
@@ -35,7 +36,8 @@ import numpy as np
 
 SCARA_LINK1_MM = 225.0
 SCARA_LINK2_MM = 175.0
-SLOT_BOTTOM_J3_MM = -52.01
+REFERENCE_ZERO_MARKERS = ("A", "C", "E", "F", "G", "H")
+SLOT_TARGET_Z_T_MM = -2.0
 SLOT_GRID_SIZE = 6
 SLOT_PITCH_MM = 25.0
 MARKER_SIDE_MM = 13.27
@@ -231,7 +233,7 @@ def build_slot_centres() -> dict[str, list[float]]:
         f"P{row}{column}": [
             -row * SLOT_PITCH_MM,
             -column * SLOT_PITCH_MM,
-            0.0,
+            SLOT_TARGET_Z_T_MM,
         ]
         for row in range(SLOT_GRID_SIZE)
         for column in range(SLOT_GRID_SIZE)
@@ -287,10 +289,20 @@ def _marker_orientation_from_taught_points(
 def build_marker_geometry(
     presets: Mapping[str, np.ndarray], frame: TrayFrameDefinition
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Build exact marker squares in T while retaining individual heights."""
+    """Build exact marker squares in T using the declared marker-plane zero.
+
+    A/C/E/F/G/H define one common ``Z_T=0`` surface.  Their taught J3 spread
+    is treated as contact/teach noise, as requested for Stage 4.  B and D are
+    rigid but physically raised, so their measured offsets from the six-marker
+    mean are retained.  This is a pure Z-origin change from the former geometry:
+    the slot target plane is now ``Z_T=-2 mm`` instead of zero.
+    """
     markers: dict[str, Any] = {}
     diagnostics: dict[str, Any] = {}
     half = MARKER_SIDE_MM / 2.0
+    marker_plane_j3_mm = float(
+        np.mean([float(presets[label][2]) for label in REFERENCE_ZERO_MARKERS])
+    )
     for label, marker_id in MARKER_LABEL_TO_ID.items():
         centre_joint = presets[label]
         ul_joint = presets[f"{label}ul"]
@@ -301,8 +313,12 @@ def build_marker_geometry(
         u, v, fit = _marker_orientation_from_taught_points(
             centre_xy, taught_ul_xy, taught_dl_xy
         )
-        marker_z = float(centre_joint[2] - SLOT_BOTTOM_J3_MM)
-        if marker_z <= 0.0:
+        marker_z = (
+            0.0
+            if label in REFERENCE_ZERO_MARKERS
+            else float(centre_joint[2] - marker_plane_j3_mm)
+        )
+        if marker_z <= SLOT_TARGET_Z_T_MM:
             raise ValueError(f"Marker {label} 不在槽底目标平面上方")
         ul = centre_xy - half * u - half * v
         ur = centre_xy + half * u - half * v
@@ -330,7 +346,9 @@ def build_marker_geometry(
             "id": marker_id,
             "side_length_mm": MARKER_SIDE_MM,
             "center_T_mm": [float(centre_xy[0]), float(centre_xy[1]), marker_z],
-            "surface_height_above_slot_target_mm": marker_z,
+            "surface_height_above_slot_target_mm": (
+                marker_z - SLOT_TARGET_Z_T_MM
+            ),
             "corner_order": ["UL", "UR", "DR", "DL"],
             "corners_T_mm": corners_xyz.tolist(),
             "u_axis_T": [float(u[0]), float(u[1]), 0.0],
@@ -366,6 +384,16 @@ def validate_geometry(payload: Mapping[str, Any]) -> dict[str, Any]:
     slots = payload.get("slots", {})
     if len(slots) != SLOT_GRID_SIZE**2:
         errors.append(f"Expected 36 slots, got {len(slots)}")
+    declared_slot_z = float(frame.get("slot_target_plane_z_T_mm", math.nan))
+    if not math.isfinite(declared_slot_z):
+        errors.append("slot_target_plane_z_T_mm must be finite")
+    for label, point in slots.items():
+        candidate = np.asarray(point, dtype=np.float64).reshape(-1)
+        if candidate.size != 3 or not np.all(np.isfinite(candidate)):
+            errors.append(f"Slot {label} must be a finite XYZ point")
+            continue
+        if math.isfinite(declared_slot_z) and abs(candidate[2] - declared_slot_z) > 1e-9:
+            errors.append(f"Slot {label} Z does not match slot target plane")
     markers = payload.get("markers", {})
     ids: list[int] = []
     for label in MARKER_LABEL_TO_ID:
@@ -384,7 +412,7 @@ def validate_geometry(payload: Mapping[str, Any]) -> dict[str, Any]:
         centre = np.asarray(marker.get("center_T_mm"), dtype=np.float64)
         if float(np.linalg.norm(corners.mean(axis=0) - centre)) > 1e-9:
             errors.append(f"Marker {label} corners are not centered")
-        if centre[2] <= 0:
+        if math.isfinite(declared_slot_z) and centre[2] <= declared_slot_z:
             errors.append(f"Marker {label} is not above slot target plane")
     if len(ids) != len(set(ids)):
         errors.append("Marker IDs are not unique")
@@ -416,8 +444,12 @@ def build_tray_board_geometry(presets_path: Path) -> dict[str, Any]:
 
     frame, frame_diagnostics = build_tray_frame(presets)
     markers, marker_diagnostics = build_marker_geometry(presets, frame)
+    marker_plane_j3_mm = float(
+        np.mean([float(presets[label][2]) for label in REFERENCE_ZERO_MARKERS])
+    )
+    contact_j3_mm = marker_plane_j3_mm + SLOT_TARGET_Z_T_MM
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source_presets": str(presets_path),
         "units": {"length": "mm", "angle": "degree"},
@@ -427,7 +459,10 @@ def build_tray_board_geometry(presets_path: Path) -> dict[str, Any]:
         },
         "tray_frame": {
             "name": "T",
-            "origin": "slot P00 center on slot-bottom target plane",
+            "origin": (
+                "XY at slot P00 center; Z=0 is the declared common surface "
+                "of markers A,C,E,F,G,H"
+            ),
             "x_positive_definition": "P50 slot center toward P00 slot center",
             "y_positive_definition": "P05 slot center toward P00 slot center, orthogonalized",
             "z_positive_definition": "X_T cross Y_T; slot-bottom target plane toward markers",
@@ -435,8 +470,10 @@ def build_tray_board_geometry(presets_path: Path) -> dict[str, Any]:
             "rotation_mechanical_from_tray": (
                 frame.rotation_mechanical_from_tray.tolist()
             ),
-            "slot_target_plane_z_T_mm": 0.0,
-            "slot_bottom_j3_mm_used_for_height_difference": SLOT_BOTTOM_J3_MM,
+            "reference_zero_marker_labels": list(REFERENCE_ZERO_MARKERS),
+            "marker_plane_j3_mm": marker_plane_j3_mm,
+            "slot_target_plane_z_T_mm": SLOT_TARGET_Z_T_MM,
+            "slot_bottom_j3_mm_used_for_height_difference": contact_j3_mm,
             "warning": (
                 "Mechanical coordinates are retained only as traceable teach-data "
                 "diagnostics; all board and target geometry below is expressed in T."
@@ -494,7 +531,8 @@ __all__ = [
     "ARUCO_DICTIONARY_NAME",
     "MARKER_LABEL_TO_ID",
     "MARKER_SIDE_MM",
-    "SLOT_BOTTOM_J3_MM",
+    "REFERENCE_ZERO_MARKERS",
+    "SLOT_TARGET_Z_T_MM",
     "SLOT_PITCH_MM",
     "TrayFrameDefinition",
     "atomic_json_write",

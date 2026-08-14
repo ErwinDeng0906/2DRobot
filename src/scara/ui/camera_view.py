@@ -32,6 +32,7 @@ class ScaraCameraThread(QThread):
         self._running = False
         self._last_frame = None
         self._last_frame_at = 0.0
+        self._last_frame_sequence = 0
         self._frame_lock = threading.Lock()
 
     @property
@@ -51,13 +52,14 @@ class ScaraCameraThread(QThread):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._h)
         self._running = True
-        while self._running:
+        while self._running and not self.isInterruptionRequested():
             ok, frame = cap.read()
             if not ok:
                 self.msleep(30); continue
             with self._frame_lock:
                 self._last_frame = frame.copy()
                 self._last_frame_at = time.monotonic()
+                self._last_frame_sequence += 1
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
             img = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
@@ -66,9 +68,12 @@ class ScaraCameraThread(QThread):
         cap.release()
         self._running = False
 
-    def stop(self) -> None:
+    def stop(self, timeout_ms: int = 1500) -> bool:
+        """Request a bounded stop and report whether the thread really exited."""
+
         self._running = False
-        self.wait(1500)
+        self.requestInterruption()
+        return bool(self.wait(int(timeout_ms)))
 
     def has_fresh_frame(self, max_age_s: float = 1.0) -> bool:
         """最近 ``max_age_s`` 秒内是否成功采集过画面。"""
@@ -76,6 +81,36 @@ class ScaraCameraThread(QThread):
             return (
                 self._last_frame is not None
                 and time.monotonic() - self._last_frame_at <= float(max_age_s)
+            )
+
+    def latest_frame(self, max_age_s: float = 1.0):
+        """Return a thread-safe BGR copy of the newest frame, or ``None``.
+
+        The hand-eye monitor shares camera 1 with the main preview instead of
+        opening DirectShow twice.  A copy prevents either consumer mutating the
+        acquisition buffer.
+        """
+
+        packet = self.latest_frame_packet(max_age_s=max_age_s)
+        return None if packet is None else packet[0]
+
+    def latest_frame_packet(self, max_age_s: float = 1.0):
+        """Return ``(BGR copy, sequence, capture_monotonic_s)`` or ``None``.
+
+        Sequence changes only for a genuinely new camera frame, so Stage3 can
+        invalidate a stopped stream instead of repeatedly accepting one buffer.
+        """
+
+        with self._frame_lock:
+            if (
+                self._last_frame is None
+                or time.monotonic() - self._last_frame_at > float(max_age_s)
+            ):
+                return None
+            return (
+                self._last_frame.copy(),
+                int(self._last_frame_sequence),
+                float(self._last_frame_at),
             )
 
     def snapshot(self, path: str | Path, max_age_s: float = 1.0) -> bool:
