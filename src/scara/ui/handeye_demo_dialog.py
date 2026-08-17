@@ -771,12 +771,14 @@ class HandEyeDemoDialog(QDialog):
         confirmation.setText(
             "请再次确认：左侧选取的目标是 P22。\n\n"
             "全盘定位会实际移动机械臂XY，执行顺序为：\n"
-            "1. 由P00/托盘几何计算P22粗目标，并沿内部短航点执行一次IK粗定位阶段；\n"
-            "2. 取得5张新的Stage3图像，执行一次不超过3mm的毫米几何修正；\n"
-            "3. 只有进入Task9 P22每轴±1.8mm有效域后，才启动局部Jacobian有限精修。\n\n"
+            "1. 在当前静止姿态采集5张新鲜Stage3图像，重新登记本次Tray→World；\n"
+            "2. 用本次登记计算P22 world目标，沿不超过2mm的固定J3/Rz航点粗定位；\n"
+            "3. 重复Stage3+Stage4托盘毫米闭环，最后用独立5帧验收视觉误差。\n\n"
+            "支持范围：托盘平移模长≤10mm、平面旋转≤5°；异常结果会先请求人员确认"
+            "三姿态复核。移动托盘模式不使用旧P22 preset、Task9或Task11控制。\n\n"
             "全过程固定J3和绝对Rz，不执行Z下降，不操作DO/真空。"
             "请确认整个托盘上方及机械臂逐轴扫掠路径无障碍、低速模式有效、"
-            "急停可用。当前其他35个槽尚未取得各自局部Jacobian，因此不会授权。"
+            "急停可用。当前只授权P22。"
         )
         confirmation.setStandardButtons(
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
@@ -812,8 +814,8 @@ class HandEyeDemoDialog(QDialog):
     def prepare_full_tray_session(self, output_dir: Path) -> dict[str, Any]:
         """Create the P22 full-tray evidence session without a controller call."""
 
-        from scara.vision.full_tray_positioning_session import (
-            FullTrayPositioningSession,
+        from scara.vision.moved_tray_positioning_session import (
+            MovedTrayPositioningSession,
         )
 
         if self._stage7b_active:
@@ -826,11 +828,14 @@ class HandEyeDemoDialog(QDialog):
         initial_state = self.robot_state_provider()
         if not isinstance(initial_state, Mapping):
             raise RuntimeError("没有可用的新鲜机械臂状态")
-        session = FullTrayPositioningSession(
+        session = MovedTrayPositioningSession(
             self.project_root,
             output_dir,
             initial_state,
             target_name=target_name,
+            camera_reconnected=int(
+                getattr(self.camera, "connection_generation", 1)
+            ) > 1,
         )
         self._stage7b_session = session
         self._stage7b_active = True
@@ -841,13 +846,10 @@ class HandEyeDemoDialog(QDialog):
         self.target_combo.setEnabled(False)
         self.stage7b_button.setEnabled(False)
         self.full_tray_button.setText("停止全盘定位")
-        route = session.coarse_route
         self.stage7b_status.setPlainText(
-            "P22全盘定位已ARM："
-            f"几何粗定位距离{route['coarse_distance_mm']:.2f}mm，"
-            f"内部{route['waypoint_count']}个短航点。\n"
-            "粗定位后等待5张新鲜Stage3帧，再执行一次毫米几何修正；"
-            "只有进入Task9局部域才继续精修。"
+            "可移动托盘P22全盘定位已ARM：先等待5张新鲜Stage3帧完成本次"
+            "Tray→World登记。登记通过后才会生成≤2mm粗定位航点；随后使用"
+            "Stage3+Stage4毫米闭环和独立5帧hold验收。"
         )
         return session.action_task()
 
@@ -923,12 +925,66 @@ class HandEyeDemoDialog(QDialog):
                 "decision": "abort",
                 "reason": f"XY定位计算/证据保存失败：{exc}",
             }
+        if response.get("decision") == "probe_required":
+            evaluation = response.get("evaluation") or {}
+            delta = evaluation.get("relative_to_stage2") or {}
+            dispersion = evaluation.get("dispersion") or {}
+            prompt = QMessageBox(self)
+            prompt.setWindowTitle("全盘定位需要三姿态异常复核")
+            prompt.setIcon(QMessageBox.Icon.Warning)
+            prompt.setText(
+                "单姿态5帧登记未越过硬边界，但触发异常复核条件。\n\n"
+                f"估计平移模长：{float(delta.get('translation_norm_mm', float('nan'))):.3f} mm\n"
+                f"估计yaw变化：{float(delta.get('yaw_deg', float('nan'))):+.3f}°\n"
+                f"原点RMS：{float(dispersion.get('origin_rms_mm', float('nan'))):.3f} mm\n"
+                f"yaw RMS：{float(dispersion.get('yaw_rms_deg', float('nan'))):.3f}°\n"
+                f"P22不确定度：{float(dispersion.get('p22_position_uncertainty_mm', float('nan'))):.3f} mm\n\n"
+                "继续会由ActionWorker以固定J3/Rz前往标定文件中的3个预验证观察姿态，"
+                "每处采5帧并融合；仍不执行Z、DO或真空。是否继续？"
+            )
+            prompt.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            prompt.setDefaultButton(QMessageBox.StandardButton.No)
+            prompt.setStyleSheet(LIGHT_WARNING_DIALOG_STYLESHEET)
+            if prompt.exec() == QMessageBox.StandardButton.Yes:
+                try:
+                    self._stage7b_session.authorize_three_pose_probe()
+                    response = {
+                        "request_id": str(request.get("request_id") or ""),
+                        "decision": "observe",
+                        "calibration_sha256": str(
+                            getattr(self._stage7b_session, "calibration_hash", "")
+                        ),
+                        "reason": "人员已确认三姿态异常复核；下一窗口开始受限XY路线",
+                        "evaluation": evaluation,
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    response = {
+                        "request_id": str(request.get("request_id") or ""),
+                        "decision": "abort",
+                        "reason": f"无法启动三姿态复核：{exc}",
+                    }
+            else:
+                response = {
+                    "request_id": str(request.get("request_id") or ""),
+                    "decision": "abort",
+                    "reason": "人员拒绝三姿态异常复核；全盘定位未开始",
+                }
         if callable(responder):
             responder(response)
         decision = response.get("decision")
         if decision == "approve":
             proposal = response.get("proposal") or {}
-            if proposal.get("phase") == "stage3_metric_geometry_correction":
+            proposal_phase = str(proposal.get("phase") or "")
+            if proposal_phase.startswith("moved_tray_"):
+                self.stage7b_status.setPlainText(
+                    self._moved_tray_report_text(
+                        proposal,
+                        "候选已提交ActionWorker独立复核；尚未代表运动已下发。",
+                    )
+                )
+            elif proposal_phase == "stage3_metric_geometry_correction":
                 self.stage7b_status.setPlainText(
                     self._geometry_correction_report_text(
                         proposal,
@@ -942,6 +998,13 @@ class HandEyeDemoDialog(QDialog):
                         "候选已提交执行器复核；尚未代表运动已经下发。",
                     )
                 )
+        elif decision == "observe":
+            evaluation = response.get("evaluation") or {}
+            self.stage7b_status.setPlainText(
+                "全盘定位观察窗口完成；本窗口不运动。\n"
+                + str(response.get("reason") or "继续下一窗口")
+                + ("\n" + self._runtime_registration_text(evaluation) if evaluation else "")
+            )
         elif decision == "complete":
             evaluation = response.get("evaluation") or {}
             if evaluation:
@@ -954,7 +1017,7 @@ class HandEyeDemoDialog(QDialog):
                 ))
             else:
                 self.stage7b_status.setPlainText(
-                    "单点有限闭环已正常结束；停止XY闭环。\n"
+                    "XY定位已正常结束；停止XY闭环。\n"
                     + str(response.get("reason") or "")
                 )
         else:
@@ -975,6 +1038,45 @@ class HandEyeDemoDialog(QDialog):
             else:
                 label = "全盘定位" if self._positioning_mode == "full_tray" else "单点有限闭环"
                 self.stage7b_status.setPlainText(f"{label}已停止：{response.get('reason', '安全门拒绝')}")
+
+    @staticmethod
+    def _moved_tray_report_text(report: Mapping[str, Any], header: str) -> str:
+        command = report.get("commanded_correction_xy_mm") or [0.0, 0.0]
+        endpoint = report.get("predicted_endpoint_xy_mm") or [float("nan"), float("nan")]
+        metric = report.get("median_metric_error_T_mm") or [float("nan")] * 3
+        gates = [
+            f"{'PASS' if gate.get('passed') else 'FAIL'} {name}: "
+            f"actual={gate.get('actual')} limit={gate.get('limit')}"
+            for name, gate in (report.get("safety_gates") or {}).items()
+        ]
+        return "\n".join(
+            [
+                f"可移动托盘全盘定位；阶段={report.get('phase')}；{header}",
+                f"Tray毫米误差=({float(metric[0]):+.3f},{float(metric[1]):+.3f})mm；"
+                f"|e|={float(report.get('median_error_norm_mm', float('nan'))):.3f}mm",
+                f"世界系命令 ΔX={float(command[0]):+.3f}mm，ΔY={float(command[1]):+.3f}mm",
+                f"预计终点 world XY=({float(endpoint[0]):.3f},{float(endpoint[1]):.3f})mm",
+                "全部本轮安全门：",
+                *gates,
+            ]
+        )
+
+    @staticmethod
+    def _runtime_registration_text(report: Mapping[str, Any]) -> str:
+        if "origin_world_xy_mm" not in report:
+            return ""
+        origin = report.get("origin_world_xy_mm") or [float("nan"), float("nan")]
+        delta = report.get("relative_to_stage2") or {}
+        dispersion = report.get("dispersion") or {}
+        return (
+            "本次Tray→World登记："
+            f"origin=({float(origin[0]):.3f},{float(origin[1]):.3f})mm，"
+            f"yaw={float(report.get('yaw_world_from_tray_deg', float('nan'))):+.3f}°\n"
+            f"相对Stage2：ΔXY={delta.get('translation_xy_mm')}mm，"
+            f"|Δ|={float(delta.get('translation_norm_mm', float('nan'))):.3f}mm，"
+            f"Δyaw={float(delta.get('yaw_deg', float('nan'))):+.3f}°；"
+            f"P22不确定度={float(dispersion.get('p22_position_uncertainty_mm', float('nan'))):.3f}mm。"
+        )
 
     @staticmethod
     def _geometry_correction_report_text(
@@ -1068,7 +1170,7 @@ class HandEyeDemoDialog(QDialog):
             ):
                 ok = False
                 message = (
-                    "全盘定位动作序列结束，但Task9局部精修未达到终止阈值；"
+                    "全盘定位动作序列结束，但独立5帧视觉1mm验收未通过；"
                     "不得视为定位成功"
                 )
         self._stage7b_active = False

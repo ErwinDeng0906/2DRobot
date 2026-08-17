@@ -29,7 +29,7 @@ from scara.vision.full_tray_positioning import (
 )
 from scara.vision.full_tray_positioning_session import (
     FULL_TRAY_GEOMETRY_REQUEST_KEY,
-    FullTrayPositioningSession,
+    LegacyFixedTrayPositioningSession as FullTrayPositioningSession,
 )
 from scara.vision.handeye_interaction import sha256_file
 from tests.test_stage7b_session import ANCHOR, REFERENCE, RZ, write_calibrations

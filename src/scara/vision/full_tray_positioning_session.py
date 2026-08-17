@@ -49,8 +49,8 @@ def _finite_vector(value: Any, length: int, label: str) -> list[float]:
     return result
 
 
-class FullTrayPositioningSession:
-    """One geometry coarse phase, one metric correction, then Task9 fine loop."""
+class LegacyFixedTrayPositioningSession:
+    """Deprecated fixed-Tray implementation retained only for report replay."""
 
     def __init__(
         self,
@@ -392,8 +392,14 @@ class FullTrayPositioningSession:
         self._save()
 
 
+from .moved_tray_positioning_session import (  # noqa: E402
+    MovedTrayPositioningSession as FullTrayPositioningSession,
+)
+
+
 __all__ = [
     "FULL_TRAY_GEOMETRY_REQUEST_KEY",
     "FullTrayPositioningSession",
+    "LegacyFixedTrayPositioningSession",
     "RESULT_FILENAME",
 ]

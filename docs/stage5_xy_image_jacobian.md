@@ -226,7 +226,8 @@ src/scara/calib/camera1_xy_image_jacobian.json
 拟合器执行 leave-one-offset-out（留一偏移）验证：每次拿掉一个网格偏移，用其余偏移重新拟合，
 再预测被拿掉偏移的误差。这能够发现线性模型不一致或单个偏移异常，但它不是实际闭环放片测试。
 
-“手眼交互”弹窗中的“Jacobian验证”只执行以下只读检查：
+原“Jacobian验证”按钮已从“手眼交互”弹窗删除。固定托盘模式仍会在
+“单点有限闭环”启动时自动执行以下只读检查：
 
 1. 当前内参、Tray几何、Stage4吸盘target的 hash 与 Jacobian 文件一致；
 2. Jacobian 的状态、条件数、留一验证和当前目标名均通过；

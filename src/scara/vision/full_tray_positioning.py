@@ -79,9 +79,23 @@ def _gate(
 
 
 def slot_world_xy_mm(
-    geometry: Mapping[str, Any], target_name: str
+    geometry: Mapping[str, Any],
+    target_name: str,
+    runtime_registration: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
-    """Convert one Stage-2 slot centre from Tray coordinates to world XY."""
+    """Convert a slot centre to world XY.
+
+    Passing ``runtime_registration`` selects the movable-Tray path and never
+    consults Stage-2's historical world origin.  Omitting it is retained only
+    for fixed-Tray legacy reports and Task9 anchor generation.
+    """
+
+    if runtime_registration is not None:
+        from .moved_tray_servo import registered_slot_world_xy_mm
+
+        return registered_slot_world_xy_mm(
+            geometry, target_name, runtime_registration
+        )
 
     frame = geometry.get("tray_frame") or {}
     rotation = _matrix(
@@ -100,9 +114,18 @@ def slot_world_xy_mm(
 
 
 def tray_delta_to_world_xy_mm(
-    geometry: Mapping[str, Any], delta_T_xy_mm: Sequence[float]
+    geometry: Mapping[str, Any],
+    delta_T_xy_mm: Sequence[float],
+    runtime_registration: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
-    """Rotate a Tray-frame displacement into controller/world XY."""
+    """Rotate Tray displacement into world; runtime registration takes priority."""
+
+    if runtime_registration is not None:
+        from .moved_tray_servo import registered_tray_delta_to_world_xy_mm
+
+        return registered_tray_delta_to_world_xy_mm(
+            delta_T_xy_mm, runtime_registration
+        )
 
     rotation = _matrix(
         (geometry.get("tray_frame") or {}).get(

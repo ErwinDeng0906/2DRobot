@@ -207,6 +207,7 @@ class ScaraControlWidget(QWidget):
         self._owns = owns_controller
         self._ctrl = controller or ScaraController(self._cfg)
         self._cam: Optional[ScaraCameraThread] = None
+        self._camera_connection_counts: dict[int, int] = {}
         self._handeye_dialog: Optional[QDialog] = None
         self._handeye_motion_mode: Optional[str] = None
         self._handeye_state_lock = threading.Lock()
@@ -385,7 +386,7 @@ class ScaraControlWidget(QWidget):
         )
         g.addWidget(self._btn_handeye_demo)
         handeye_note = QLabel(
-            "目标槽下拉选择、Stage3实时位姿、A–H重投影和Jacobian验证。"
+            "目标槽下拉选择、Stage3实时位姿、A–H重投影、局部Jacobian标定和XY定位。"
             "动态演示与验证按钮只计算，机械臂不会移动。"
         )
         handeye_note.setObjectName("muted")
@@ -1030,7 +1031,13 @@ class ScaraControlWidget(QWidget):
                 return
             self._btn_cam.setText("连接相机"); self._cam_lbl.setText("相机已断开")
             return
-        self._cam = ScaraCameraThread(index=self._cam_idx.value())
+        camera_index = int(self._cam_idx.value())
+        generation = self._camera_connection_counts.get(camera_index, 0) + 1
+        self._camera_connection_counts[camera_index] = generation
+        self._cam = ScaraCameraThread(
+            index=camera_index,
+            connection_generation=generation,
+        )
         self._cam.frame_ready.connect(self._on_frame)
         self._cam.error.connect(self._on_camera_error)
         self._cam.start(); self._btn_cam.setText("断开相机")
@@ -1262,7 +1269,7 @@ class ScaraControlWidget(QWidget):
         worker.start()
 
     def _start_full_tray_positioning(self) -> None:
-        """Start geometry coarse move, one metric correction, then Task9 fine loop."""
+        """Start runtime Tray registration, dynamic coarse route and metric loop."""
 
         dialog = self._handeye_dialog
         if dialog is None:

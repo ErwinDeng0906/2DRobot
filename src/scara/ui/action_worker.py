@@ -66,6 +66,19 @@ FULL_TRAY_GEOMETRY_MAXIMUM_RZ_TOLERANCE_DEG = 0.30
 FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 1.0
 FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_XY_MM = 0.20
 FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_JOINT = 0.20
+MOVED_TRAY_RUNTIME_REQUEST_KEY = "moved_tray_p22_runtime_positioning"
+MOVED_TRAY_MAXIMUM_STEP_NORM_MM = 10.0
+MOVED_TRAY_MAXIMUM_AXIS_STEP_MM = 10.0
+MOVED_TRAY_MAXIMUM_LOCAL_EXTENT_MM = 130.0
+# In moved-tray coarse positioning, 10 mm constrains only the net endpoint.
+# J1/J2 retain the controller's sequential motion, so their intermediate TCP
+# sweep is recorded and bounded by broad anomaly ceilings rather than by the
+# endpoint limit.
+MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM = 130.0
+MOVED_TRAY_MAXIMUM_RZ_TOLERANCE_DEG = 0.30
+MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 15.0
+MOVED_TRAY_MAXIMUM_STATE_DRIFT_XY_MM = 0.20
+MOVED_TRAY_MAXIMUM_STATE_DRIFT_JOINT = 0.20
 
 
 def _finite(value: object, label: str) -> float:
@@ -227,6 +240,7 @@ def normalize_action_task(raw_task: object) -> dict:
             is_full_tray_geometry = (
                 request_key == FULL_TRAY_GEOMETRY_REQUEST_KEY
             )
+            is_moved_tray = request_key == MOVED_TRAY_RUNTIME_REQUEST_KEY
             calibration_sha256 = str(
                 raw.get("calibration_sha256") or ""
             ).strip().upper()
@@ -251,58 +265,82 @@ def normalize_action_task(raw_task: object) -> dict:
                 STAGE7B_MAXIMUM_LOCAL_EXTENT_MM
                 if is_stage7b
                 else (
+                    MOVED_TRAY_MAXIMUM_LOCAL_EXTENT_MM
+                    if is_moved_tray
+                    else (
                     FULL_TRAY_GEOMETRY_MAXIMUM_LOCAL_EXTENT_MM
                     if is_full_tray_geometry
                     else RUNTIME_MOVE_MAXIMUM_LOCAL_EXTENT_MM
+                    )
                 )
             )
             maximum_step_norm = (
                 STAGE7B_MAXIMUM_STEP_NORM_MM
                 if is_stage7b
                 else (
+                    MOVED_TRAY_MAXIMUM_STEP_NORM_MM
+                    if is_moved_tray
+                    else (
                     FULL_TRAY_GEOMETRY_MAXIMUM_STEP_NORM_MM
                     if is_full_tray_geometry
                     else RUNTIME_MOVE_MAXIMUM_STEP_NORM_MM
+                    )
                 )
             )
             maximum_axis_step = (
                 STAGE7B_MAXIMUM_AXIS_STEP_MM
                 if is_stage7b
                 else (
+                    MOVED_TRAY_MAXIMUM_AXIS_STEP_MM
+                    if is_moved_tray
+                    else (
                     FULL_TRAY_GEOMETRY_MAXIMUM_AXIS_STEP_MM
                     if is_full_tray_geometry
                     else RUNTIME_MOVE_MAXIMUM_AXIS_STEP_MM
+                    )
                 )
             )
             maximum_transient_xy = (
                 STAGE7B_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
                 if is_stage7b
                 else (
+                    MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
+                    if is_moved_tray
+                    else (
                     FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
                     if is_full_tray_geometry
                     else RUNTIME_MOVE_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
+                    )
                 )
             )
             maximum_rz_tolerance = (
-                FULL_TRAY_GEOMETRY_MAXIMUM_RZ_TOLERANCE_DEG
-                if is_full_tray_geometry
+                MOVED_TRAY_MAXIMUM_RZ_TOLERANCE_DEG
+                if is_moved_tray
                 else RUNTIME_MOVE_MAXIMUM_RZ_TOLERANCE_DEG
             )
+            if is_full_tray_geometry:
+                maximum_rz_tolerance = FULL_TRAY_GEOMETRY_MAXIMUM_RZ_TOLERANCE_DEG
             maximum_transient_rz = (
-                FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
-                if is_full_tray_geometry
+                MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
+                if is_moved_tray
                 else RUNTIME_MOVE_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
             )
+            if is_full_tray_geometry:
+                maximum_transient_rz = FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
             maximum_state_drift_xy = (
-                FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_XY_MM
-                if is_full_tray_geometry
+                MOVED_TRAY_MAXIMUM_STATE_DRIFT_XY_MM
+                if is_moved_tray
                 else RUNTIME_MOVE_MAXIMUM_STATE_DRIFT_XY_MM
             )
+            if is_full_tray_geometry:
+                maximum_state_drift_xy = FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_XY_MM
             maximum_state_drift_joint = (
-                FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_JOINT
-                if is_full_tray_geometry
+                MOVED_TRAY_MAXIMUM_STATE_DRIFT_JOINT
+                if is_moved_tray
                 else RUNTIME_MOVE_MAXIMUM_STATE_DRIFT_JOINT
             )
+            if is_full_tray_geometry:
+                maximum_state_drift_joint = FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_JOINT
             extent = _positive_at_most(
                 raw.get("local_extent_mm"),
                 f"第 {index} 步 local_extent_mm",
@@ -402,7 +440,7 @@ def normalize_action_task(raw_task: object) -> dict:
                     # derived from the recognized request key, not trusted
                     # from an imported task field.
                     "enforce_sequential_intermediate_domain": not (
-                        is_stage7b or is_full_tray_geometry
+                        is_stage7b or is_full_tray_geometry or is_moved_tray
                     ),
                     "max_state_drift_xy_mm": _positive_at_most(
                         raw.get(
@@ -1271,6 +1309,8 @@ class ActionWorker(QThread):
 
         if step["request_key"] == STAGE7B_RUNTIME_REQUEST_KEY:
             runtime_label = "单点有限闭环"
+        elif step["request_key"] == MOVED_TRAY_RUNTIME_REQUEST_KEY:
+            runtime_label = "可移动托盘P22全盘定位"
         elif step["request_key"] == FULL_TRAY_GEOMETRY_REQUEST_KEY:
             runtime_label = "全盘定位Stage3毫米几何修正"
         else:
@@ -1349,17 +1389,34 @@ class ActionWorker(QThread):
                 raise RuntimeError(f"{runtime_label}响应request_id不匹配，已拒绝运动")
             decision = str(response.get("decision") or "").strip().lower()
             allowed_decisions = {"approve", "decline", "abort"}
-            if step["request_key"] == STAGE7B_RUNTIME_REQUEST_KEY:
-                allowed_decisions.add("complete")
+            if step["request_key"] in {
+                STAGE7B_RUNTIME_REQUEST_KEY,
+                MOVED_TRAY_RUNTIME_REQUEST_KEY,
+            }:
+                allowed_decisions.update({"complete", "observe"})
             if decision not in allowed_decisions:
                 raise RuntimeError(
                     "运行时响应decision必须是" + "/".join(sorted(allowed_decisions))
                 )
             audit_entry["operator_decision"] = decision
+            if decision == "observe":
+                if step["request_key"] != MOVED_TRAY_RUNTIME_REQUEST_KEY:
+                    raise RuntimeError(f"{runtime_label}不允许observe响应")
+                if str(response.get("calibration_sha256") or "").upper() != step["calibration_sha256"]:
+                    raise RuntimeError(f"{runtime_label}观察响应的平面手眼hash不匹配")
+                audit_entry["status"] = "observation_completed_no_motion"
+                audit_entry["observation_reason"] = str(
+                    response.get("reason") or "完成观察窗口，继续下一窗口"
+                )
+                self._save_manifest()
+                self.progress.emit(f"{step['name']}：{audit_entry['observation_reason']}")
+                return
             if decision == "complete":
                 if str(response.get("calibration_sha256") or "").upper() != step["calibration_sha256"]:
-                    raise RuntimeError(f"{runtime_label}完成响应的宽域Jacobian hash不匹配")
-                if str(response.get("fine_calibration_sha256") or "").upper() != step["fine_calibration_sha256"]:
+                    raise RuntimeError(f"{runtime_label}完成响应的标定hash不匹配")
+                if step["request_key"] == STAGE7B_RUNTIME_REQUEST_KEY and str(
+                    response.get("fine_calibration_sha256") or ""
+                ).upper() != step["fine_calibration_sha256"]:
                     raise RuntimeError(f"{runtime_label}完成响应的精细Jacobian hash不匹配")
                 audit_entry["status"] = "session_completed_no_motion"
                 audit_entry["completion_reason"] = str(
@@ -1427,12 +1484,12 @@ class ActionWorker(QThread):
                 response.get("target_joints"),
                 f"{runtime_label} target_joints",
             )
-
             displayed_target_audit = self._audit_runtime_target(
                 displayed_state,
                 target_joints,
                 audit_step,
             )
+
             audit_entry["displayed_kinematic_audit"] = displayed_target_audit
             if displayed_target_audit.get("passed") is not True:
                 failed = [
@@ -1641,10 +1698,10 @@ class ActionWorker(QThread):
                 audit_entry["status"] = "motion_failed"
                 self._save_manifest()
                 raise RuntimeError(f"移动到 {step['name']} 失败")
-
             final_state = self._read_runtime_motion_state(
                 f"{step['name']} 到位后检查"
             )
+
             audit_entry["final_controller_state"] = final_state
             final_controller_gates = self._runtime_controller_gates(final_state)
             final_controller_gates["worker_not_stopped"] = (

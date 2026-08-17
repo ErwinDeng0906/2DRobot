@@ -24,7 +24,12 @@
   20×20mm宽域训练、独立验证与正式模型安装。
 - scara.vision.stage7b_servo / stage7b_session：阶段7B两级有限闭环的纯计算、
   响应门与证据保存；控制器仍只由UI的ActionWorker持有。
-- scara.vision.full_tray_positioning / full_tray_positioning_session：由P00/
-  Stage2几何生成全盘粗目标，结合Stage3/4计算托盘系毫米误差、执行一次几何
-  修正，并强制切换到Task9 P22局部精修；视觉会话仍不持有控制器。
+- scara.vision.planar_handeye / planar_handeye_runtime：相机1固定高度平面
+  前臂手眼拟合、整槽留出验证与Task13安装；明确不支持Z或完整6-DoF。
+- scara.vision.runtime_tray_registration：用5张新鲜Stage3帧计算当前会话
+  W←T，并在边界情形执行人员确认的三姿态复核。
+- scara.vision.moved_tray_servo / moved_tray_positioning_session：不依赖旧
+  preset或Task9/11的可移动托盘P22动态粗定位、毫米闭环和独立1mm hold。
+- scara.vision.full_tray_positioning / full_tray_positioning_session：保留
+  Stage2内部几何工具及历史固定托盘报告回放；公开全盘会话指向动态W←T流程。
 """
