@@ -32,6 +32,11 @@ from .tray_pose_estimator import (
     load_tray_board_geometry,
 )
 from .tray_pose_tracker import TrayPoseTracker
+from .local_jacobian_registry import (
+    local_jacobian_filename,
+    local_jacobian_relative_path,
+    validate_slot_name,
+)
 from .xy_image_jacobian import (
     DEFAULT_XY_IMAGE_JACOBIAN_QUALITY,
     XYImageJacobianQualityConfig,
@@ -232,6 +237,21 @@ class XYImageJacobianCalibrationRuntime(QObject):
 
     fatal_error = pyqtSignal(str)
 
+    def _ensure_target_paths(self) -> None:
+        """Populate target-specific paths for normal and legacy test instances."""
+
+        target = validate_slot_name(self.anchor_target_name)
+        if not hasattr(self, "result_filename"):
+            self.result_filename = local_jacobian_filename(target)
+        if not hasattr(self, "update_filename"):
+            self.update_filename = (
+                UPDATE_FILENAME
+                if target == "P22"
+                else f"task9_xy_image_jacobian_{target}_update.md"
+            )
+        if not hasattr(self, "calibration_relative_path"):
+            self.calibration_relative_path = local_jacobian_relative_path(target)
+
     def __init__(
         self,
         output_dir: Path,
@@ -246,11 +266,24 @@ class XYImageJacobianCalibrationRuntime(QObject):
         quality: XYImageJacobianQualityConfig = (
             DEFAULT_XY_IMAGE_JACOBIAN_QUALITY
         ),
+        expected_unique_offset_count: int = 9,
+        maximum_offset_extent_mm: float = 2.0,
+        confirmation_title: str = "Task9 XY Jacobian小幅运动确认",
+        confirmation_text: Optional[str] = None,
     ) -> None:
         super().__init__(parent)
         self.output_dir = Path(output_dir)
         self.project_root = Path(project_root)
-        self.anchor_target_name = str(anchor_target_name)
+        self.anchor_target_name = validate_slot_name(anchor_target_name)
+        self.result_filename = local_jacobian_filename(self.anchor_target_name)
+        self.update_filename = (
+            UPDATE_FILENAME
+            if self.anchor_target_name == "P22"
+            else f"task9_xy_image_jacobian_{self.anchor_target_name}_update.md"
+        )
+        self.calibration_relative_path = local_jacobian_relative_path(
+            self.anchor_target_name
+        )
         self.anchor_point_T_mm = _finite_vector(
             anchor_point_T_mm, 3, "anchor_point_T_mm"
         ).astype(float).tolist()
@@ -266,10 +299,29 @@ class XYImageJacobianCalibrationRuntime(QObject):
             raise ValueError(
                 f"每个偏移至少需要 {quality.minimum_frames_per_offset} 帧"
             )
-        if len({tuple(value) for value in self.command_offsets_xy_mm}) != 9:
-            raise ValueError("Task9必须提供九个互不重复的3×3 XY偏移")
-        if any(max(abs(value) for value in offset) > 2.0 + 1e-9 for offset in self.command_offsets_xy_mm):
-            raise ValueError("Task9命令偏移不得超出±2mm")
+        expected_unique_offset_count = int(expected_unique_offset_count)
+        maximum_offset_extent_mm = float(maximum_offset_extent_mm)
+        if expected_unique_offset_count < 3:
+            raise ValueError("XY标定至少需要三个不同偏移")
+        if not math.isfinite(maximum_offset_extent_mm) or maximum_offset_extent_mm <= 0:
+            raise ValueError("XY标定范围必须为有限正数")
+        if (
+            len({tuple(value) for value in self.command_offsets_xy_mm})
+            != expected_unique_offset_count
+        ):
+            raise ValueError(
+                "XY标定偏移数量不符："
+                f"实际{len({tuple(value) for value in self.command_offsets_xy_mm})}，"
+                f"要求{expected_unique_offset_count}"
+            )
+        if any(
+            max(abs(value) for value in offset)
+            > maximum_offset_extent_mm + 1e-9
+            for offset in self.command_offsets_xy_mm
+        ):
+            raise ValueError(
+                f"XY标定命令偏移不得超出±{maximum_offset_extent_mm:g}mm"
+            )
         self.quality = quality
 
         self.intrinsics_path = (
@@ -344,12 +396,16 @@ class XYImageJacobianCalibrationRuntime(QObject):
             self.imaging_j3_mm
             - float(coordinate_definition.get("imaging_j3_mm", math.inf))
         ) > MAXIMUM_J3_DRIFT_MM:
-            raise RuntimeError("P22 float J3与Stage4标定高度不一致")
+            raise RuntimeError(
+                f"{self.anchor_target_name}锚点J3与Stage4标定高度不一致"
+            )
         if _angular_difference_deg(
             self.anchor_rz_deg,
             float(coordinate_definition.get("rz_mean_deg", math.inf)),
         ) > MAXIMUM_RZ_DRIFT_DEG:
-            raise RuntimeError("P22 float Rz与Stage4标定姿态不一致")
+            raise RuntimeError(
+                f"{self.anchor_target_name}锚点Rz与Stage4标定姿态不一致"
+            )
 
         self.estimator = TrayBoardPoseEstimator(self.geometry, self.intrinsics)
         self._tracker: Optional[TrayPoseTracker] = None
@@ -364,19 +420,24 @@ class XYImageJacobianCalibrationRuntime(QObject):
         self._processing_failed = False
         self._fatal_messages: list[str] = []
 
+        if confirmation_text is None:
+            confirmation_text = (
+                "Task9与只计算的动态演示不同：它会实际移动机械臂。\n\n"
+                "开始前请确认：\n"
+                f"1. 机械臂当前精确位于 {self.anchor_target_name} 固定高度槽中心锚点，"
+                "速度已调低，物理急停可用；\n"
+                "2. 真空已关闭，吸盘和硅片不会接触托盘；\n"
+                f"3. 工作区在{self.anchor_target_name}周围无障碍，相机1与外围A–H固定且清晰；\n"
+                "4. Task9只覆盖世界XY每轴±2mm的3×3小网格；每条2mm边已拆成"
+                "不超过1mm的Cartesian中转目标；\n"
+                "5. Task9不改变J3、不做旋转扫描、不下降、不控制任何DO/真空；\n"
+                f"6. 九点采集后会回到原始{self.anchor_target_name}锚点。\n\n"
+                "确认以上条件后才可继续。"
+            )
         confirmed = ask_light_warning_confirmation(
             parent,
-            "Task9 XY Jacobian小幅运动确认",
-            "Task9与只计算的动态演示不同：它会实际移动机械臂。\n\n"
-            "开始前请确认：\n"
-            "1. 机械臂当前精确位于 P22 float，速度已调低，物理急停可用；\n"
-            "2. 真空已关闭，吸盘和硅片不会接触托盘；\n"
-            "3. 工作区在P22周围无障碍，相机1与外围A–H固定且清晰；\n"
-            "4. Task9只覆盖世界XY每轴±2mm的3×3小网格；每条2mm边已拆成"
-            "不超过1mm的Cartesian中转目标；\n"
-            "5. Task9不改变J3、不做旋转扫描、不下降、不控制任何DO/真空；\n"
-            "6. 九点采集后会回到原始P22 float。\n\n"
-            "确认以上条件后才可继续。",
+            str(confirmation_title),
+            str(confirmation_text),
         )
         if not confirmed:
             raise RuntimeError("用户取消：Task9小幅运动安全条件尚未确认")
@@ -543,7 +604,9 @@ class XYImageJacobianCalibrationRuntime(QObject):
             )
             if self._anchor_robot_xy_mm is None:
                 if rounded_offset != (0.0, 0.0):
-                    raise RuntimeError("Task9首个采集点必须是零偏移P22")
+                    raise RuntimeError(
+                        "Task9首个采集点必须是所选槽的零偏移锚点"
+                    )
                 self._anchor_robot_xy_mm = robot_xy.copy()
             measured_offset = robot_xy - self._anchor_robot_xy_mm
             command_error_mm = float(
@@ -703,8 +766,9 @@ class XYImageJacobianCalibrationRuntime(QObject):
                 bool(record["accepted"]) for record in self._records
             ),
             "fit_summary": report["fit"],
-            "result_file": RESULT_FILENAME,
-            "update_file": UPDATE_FILENAME,
+            "result_file": self.result_filename,
+            "installed_calibration_file": str(self.calibration_relative_path),
+            "update_file": self.update_filename,
         }
 
     def _acquisition_summary(self) -> dict[str, Any]:
@@ -820,6 +884,9 @@ class XYImageJacobianCalibrationRuntime(QObject):
             },
             "fit": dict(fit),
             "source_run_folder": str(self.output_dir.resolve()),
+            "installed_calibration_path": str(
+                (self.project_root / self.calibration_relative_path).resolve()
+            ),
         }
 
     def _write_markdown(self, report: Mapping[str, Any]) -> None:
@@ -842,7 +909,10 @@ class XYImageJacobianCalibrationRuntime(QObject):
             "- [x] 使用仿射局部模型拟合2×2 Jacobian并执行留一偏移交叉验证",
             "- [x] 输入内参、Tray几何和Stage4吸盘target均以SHA-256锁定",
             "- [x] ±2mm采集网格的每条边使用≤1mm中转；逐轴控制瞬时FK已设2.0001mm测试门",
-            "- [x] Task9无Z、无旋转扫描、无真空命令，结束回P22",
+            (
+                "- [x] Task9无Z、无旋转扫描、无真空命令，结束回"
+                f"{self.anchor_target_name}锚点"
+            ),
             "",
             "## 拟合结果",
             "",
@@ -854,21 +924,31 @@ class XYImageJacobianCalibrationRuntime(QObject):
             "",
             "## 使用边界",
             "",
-            "- 当前局部模型的锚点和有效目标仅为 `P22`。跨槽使用前必须另做验证或扩展标定。",
+            (
+                "- 当前局部模型的锚点和有效目标仅为 `"
+                f"{self.anchor_target_name}`；不得复制给其他槽使用。"
+            ),
+            (
+                "- 正式安装位置：`"
+                f"{self.calibration_relative_path.as_posix()}`。"
+            ),
             "- 动态演示可只计算误差；只有经过明确确认的后续闭环任务才可下发修正命令。",
             "- 详细方程和质量门见 `docs/stage5_xy_image_jacobian.md`。",
             "",
             "## 输出",
             "",
-            f"- `{RESULT_FILENAME}`：完整标定、hash和质量门",
+            f"- `{self.result_filename}`：完整标定、hash和质量门",
             "- `points.json`：逐帧机械臂状态、Stage3结果、像素误差和接受原因",
             f"- `{ANNOTATED_DIRECTORY}/`：A–H/Tray轴及红绿十字/误差箭头标注图",
-            f"- `{UPDATE_FILENAME}`：本检查清单",
+            f"- `{self.update_filename}`：本检查清单",
         ]
-        _atomic_text_write(self.output_dir / UPDATE_FILENAME, "\n".join(lines))
+        _atomic_text_write(
+            self.output_dir / self.update_filename, "\n".join(lines)
+        )
 
     @pyqtSlot(bool, str, str)
     def on_task_finished(self, ok: bool, message: str, output_dir_text: str) -> None:
+        self._ensure_target_paths()
         output_dir = Path(output_dir_text)
         if output_dir.resolve() != self.output_dir.resolve():
             raise RuntimeError("Task9运行时输出文件夹不一致")
@@ -926,12 +1006,12 @@ class XYImageJacobianCalibrationRuntime(QObject):
         report = self._base_report(status, message, fit)
         self._enrich_manifest(manifest, report)
         _atomic_json_write(self.manifest_path, manifest)
-        _atomic_json_write(output_dir / RESULT_FILENAME, report)
+        _atomic_json_write(output_dir / self.result_filename, report)
         self._write_markdown(report)
 
         if status == "success":
             _atomic_json_write(
-                self.project_root / CALIBRATION_RELATIVE_PATH,
+                self.project_root / self.calibration_relative_path,
                 report,
             )
         elif ok:

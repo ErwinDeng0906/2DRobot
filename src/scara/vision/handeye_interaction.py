@@ -22,6 +22,7 @@ from scara.pipeline.kinematics import rz_of
 
 from .tray_pose_estimator import CameraIntrinsics
 from .tray_pose_tracker import TrackedTrayPose
+from .full_tray_positioning import metric_suction_error_in_tray
 from .xy_image_jacobian import (
     REQUIRED_XY_JACOBIAN_QUALITY_GATES,
     correction_command_xy_mm,
@@ -64,6 +65,16 @@ class HandEyeEvaluation:
     used_marker_count: int
     reprojection_rms_px: Optional[float]
     annotated_bgr: np.ndarray
+    measurement_id: Optional[str] = None
+    frame_captured_monotonic_s: Optional[float] = None
+    current_joints: Optional[tuple[float, float, float, float]] = None
+    current_pose: Optional[tuple[float, float, float, float, float, float]] = None
+    tray_transform_C_T: Optional[
+        tuple[tuple[float, float, float, float], ...]
+    ] = None
+    suction_point_T_mm: Optional[tuple[float, float, float]] = None
+    target_point_T_mm: Optional[tuple[float, float, float]] = None
+    metric_error_T_mm: Optional[tuple[float, float, float]] = None
 
 
 def sha256_file(path: Path) -> str:
@@ -162,9 +173,15 @@ def load_latest_suction_target(project_root: Path) -> SuctionTargetModel:
 def load_local_xy_jacobian(
     project_root: Path,
     suction: Optional[SuctionTargetModel] = None,
+    target_name: str = "P22",
 ) -> Optional[dict[str, Any]]:
     """Load Stage-5 only when all locked upstream calibrations still match."""
-    path = Path(project_root) / "src/scara/calib/camera1_xy_image_jacobian.json"
+    from scara.vision.local_jacobian_registry import local_jacobian_path
+
+    try:
+        path = local_jacobian_path(project_root, target_name)
+    except ValueError:
+        return None
     if not path.is_file():
         return None
     try:
@@ -217,7 +234,11 @@ def load_local_xy_jacobian(
     coordinate = payload.get("coordinate_definition") or {}
     valid_targets = payload.get("valid_target_names")
     anchor_target = payload.get("anchor_target_name")
-    if not isinstance(valid_targets, list) or anchor_target not in valid_targets:
+    if (
+        not isinstance(valid_targets, list)
+        or anchor_target not in valid_targets
+        or str(target_name) != str(anchor_target)
+    ):
         return None
     if coordinate.get("command_frame") != "robot_controller_world_XY":
         return None
@@ -285,7 +306,7 @@ def _jacobian_correction_in_current_domain(
     Optional[tuple[float, float]],
     Optional[tuple[float, float]],
 ]:
-    """Return a correction only inside the measured Task-9 P22 domain.
+    """Return a correction only inside the selected slot's Task-9 domain.
 
     This is a read-only gate.  ``robot_state`` is a cached UI status snapshot;
     no controller object or hardware method is accepted by this module.
@@ -295,15 +316,16 @@ def _jacobian_correction_in_current_domain(
     coordinate = jacobian_payload.get("coordinate_definition") or {}
     anchor_target = str(jacobian_payload.get("anchor_target_name") or "")
     valid_targets = jacobian_payload.get("valid_target_names") or []
-    if (
-        target_name != "P22"
-        or anchor_target != "P22"
-        or target_name not in valid_targets
-    ):
+    if anchor_target != target_name or target_name not in valid_targets:
+        note = (
+            "阶段5局部Jacobian只验证于P22；其他槽只显示视觉像素误差"
+            if anchor_target == "P22"
+            else f"没有加载与{target_name}匹配的局部Jacobian；只显示视觉像素误差"
+        )
         return (
             None,
             False,
-            "阶段5局部Jacobian只验证于P22；其他槽只显示视觉像素误差",
+            note,
             None,
             None,
             None,
@@ -421,7 +443,10 @@ def _jacobian_correction_in_current_domain(
     return (
         correction,
         True,
-        "当前机械臂状态与候选修正均位于Task9 P22局部标定域；仅计算，未下发",
+        (
+            "当前机械臂状态与候选修正均位于Task9 "
+            f"{target_name}局部标定域；仅计算，未下发"
+        ),
         float(age),
         current_xy,
         delta_xy,
@@ -607,6 +632,11 @@ def evaluate_handeye_frame(
     if target_name not in slots:
         raise KeyError(f"unknown Tray slot {target_name}")
     transform = np.asarray(tracked.filtered_T_C_T, dtype=np.float64)
+    metric = metric_suction_error_in_tray(
+        transform,
+        suction.p_C_S_mm,
+        slots[target_name],
+    )
     slot_pixel_array = project_tray_points_from_transform(
         [slots[target_name]], transform, intrinsics
     )[0]
@@ -718,6 +748,18 @@ def evaluate_handeye_frame(
         used_marker_count=len(raw.used_marker_ids),
         reprojection_rms_px=raw.reprojection_rms_px,
         annotated_bgr=annotated,
+        tray_transform_C_T=tuple(
+            tuple(float(value) for value in row) for row in transform
+        ),
+        suction_point_T_mm=tuple(
+            float(value) for value in metric["suction_point_T_mm"]
+        ),
+        target_point_T_mm=tuple(
+            float(value) for value in metric["target_point_T_mm"]
+        ),
+        metric_error_T_mm=tuple(
+            float(value) for value in metric["metric_error_T_mm"]
+        ),
     )
 
 

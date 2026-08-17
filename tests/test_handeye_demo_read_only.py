@@ -422,6 +422,16 @@ class HandEyeEvaluationTests(unittest.TestCase):
         self.assertEqual(evaluation.alignment_threshold_px, 3.0)
         self.assertTrue(evaluation.aligned)
         self.assertEqual(evaluation.annotated_bgr.shape, frame.shape)
+        self.assertIsNotNone(evaluation.tray_transform_C_T)
+        self.assertIsNotNone(evaluation.suction_point_T_mm)
+        self.assertIsNotNone(evaluation.target_point_T_mm)
+        self.assertIsNotNone(evaluation.metric_error_T_mm)
+        np.testing.assert_allclose(
+            np.asarray(evaluation.target_point_T_mm)
+            - np.asarray(evaluation.suction_point_T_mm),
+            evaluation.metric_error_T_mm,
+            atol=1e-9,
+        )
 
         # Exact drawing colours survive OpenCV anti-aliasing at the line core.
         colours = evaluation.annotated_bgr.reshape(-1, 3)
@@ -625,7 +635,7 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def test_dialog_has_36_targets_and_buttons_remain_read_only(self) -> None:
+    def test_dialog_has_36_targets_local_calibration_and_positioning_buttons(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self._temporary_project(root)
@@ -643,11 +653,59 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                 ]
                 self.assertTrue(any("机械臂不会移动" in text for text in safety_labels))
 
-                # Exercise the validation button without allowing QMessageBox.exec
-                # to start a nested/modal event loop.
-                with patch.object(QMessageBox, "exec", return_value=0) as modal:
-                    dialog.validation_button.click()
-                modal.assert_called_once()
+                self.assertFalse(hasattr(dialog, "validation_button"))
+                self.assertEqual(
+                    dialog.local_jacobian_button.text(),
+                    "local Jacobian标定",
+                )
+                self.assertEqual(dialog.stage7b_button.text(), "单点有限闭环")
+                self.assertEqual(dialog.full_tray_button.text(), "全盘定位")
+                controls = None
+                root_layout = dialog.layout()
+                for index in range(root_layout.count()):
+                    candidate = root_layout.itemAt(index).layout()
+                    if candidate is not None and any(
+                        candidate.itemAt(item).widget() is dialog.stage7b_button
+                        for item in range(candidate.count())
+                    ):
+                        controls = candidate
+                        break
+                self.assertIsNotNone(controls)
+                control_widgets = [
+                    controls.itemAt(index).widget()
+                    for index in range(controls.count())
+                ]
+                self.assertEqual(
+                    control_widgets.index(dialog.local_jacobian_button),
+                    control_widgets.index(dialog.stage7b_button) - 1,
+                )
+                self.assertEqual(
+                    control_widgets.index(dialog.full_tray_button),
+                    control_widgets.index(dialog.stage7b_button) + 1,
+                )
+                safety_text = "\n".join(safety_labels)
+                self.assertIn("确认左侧选取的是P22", safety_text)
+
+                calibrated: list[str] = []
+                dialog.local_jacobian_calibration_requested.connect(
+                    calibrated.append
+                )
+                dialog.target_combo.setCurrentText("P31")
+                dialog.local_jacobian_button.click()
+                self.assertEqual(calibrated, ["P31"])
+
+                emitted: list[bool] = []
+                dialog.full_tray_start_requested.connect(
+                    lambda: emitted.append(True)
+                )
+                dialog.target_combo.setCurrentText("P22")
+                with patch.object(
+                    QMessageBox,
+                    "exec",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ):
+                    dialog.full_tray_button.click()
+                self.assertEqual(emitted, [True])
 
                 # A stale PASS image/result must be explicitly discarded.
                 dialog._last_image = QImage(8, 8, QImage.Format.Format_RGB888)
@@ -758,6 +816,23 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
             }
             jacobian_path.write_text(json.dumps(payload), encoding="utf-8")
             self.assertIsNotNone(load_local_xy_jacobian(root, suction))
+
+            p31_payload = json.loads(json.dumps(payload))
+            p31_payload["anchor_target_name"] = "P31"
+            p31_payload["valid_target_names"] = ["P31"]
+            p31_path = (
+                calib
+                / "Jacobians"
+                / "camera1_xy_image_jacobian_P31.json"
+            )
+            p31_path.parent.mkdir(parents=True, exist_ok=True)
+            p31_path.write_text(json.dumps(p31_payload), encoding="utf-8")
+            self.assertIsNotNone(
+                load_local_xy_jacobian(root, suction, "P31")
+            )
+            self.assertIsNone(
+                load_local_xy_jacobian(root, suction, "P30")
+            )
 
             old_schema = json.loads(json.dumps(payload))
             old_schema["schema_version"] = 1

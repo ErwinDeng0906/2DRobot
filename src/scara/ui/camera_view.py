@@ -25,9 +25,17 @@ class ScaraCameraThread(QThread):
     frame_ready = pyqtSignal(QImage)
     error = pyqtSignal(str)
 
-    def __init__(self, index: int = 0, width: int = 1280, height: int = 720, parent=None):
+    def __init__(
+        self,
+        index: int = 0,
+        width: int = 1280,
+        height: int = 720,
+        parent=None,
+        connection_generation: int = 1,
+    ):
         super().__init__(parent)
         self._index = index
+        self._connection_generation = max(1, int(connection_generation))
         self._w, self._h = width, height
         self._running = False
         self._last_frame = None
@@ -38,6 +46,12 @@ class ScaraCameraThread(QThread):
     @property
     def source_index(self) -> int:
         return self._index
+
+    @property
+    def connection_generation(self) -> int:
+        """1 for the first connection of this source, >1 after reconnect."""
+
+        return self._connection_generation
 
     def run(self) -> None:
         try:

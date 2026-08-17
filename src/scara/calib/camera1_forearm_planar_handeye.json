@@ -1,0 +1,426 @@
+{
+  "schema_version": 1,
+  "status": "success",
+  "calibrated_at": "2026-08-17T18:58:59+08:00",
+  "model": "fixed_height_planar_camera1_to_forearm",
+  "frame_definition": {
+    "world_frame": "SCARA controller world XY",
+    "forearm_frame": "F origin at J4 axis; yaw alpha=J1+J2",
+    "camera_frame": "OpenCV camera1 frame",
+    "tray_frame": "Stage2 rigid Tray frame T",
+    "forearm_angle_formula": "alpha_deg = J1_deg + J2_deg",
+    "j4_or_terminal_rz_used_for_camera_yaw": false
+  },
+  "scope": {
+    "planar_xy_supported": true,
+    "fixed_height_only": true,
+    "z_supported": false,
+    "full_6dof_supported": false,
+    "required_j3_mm": -27.0046
+  },
+  "installation_check": {
+    "checked_at": "2026-08-17T18:58:59+08:00",
+    "valid_until": null,
+    "expired": false,
+    "policy": "no automatic calendar expiry configured; camera reconnect still triggers runtime probe"
+  },
+  "camera": {
+    "source_index": 1,
+    "resolution": {
+      "width": 1280,
+      "height": 720
+    }
+  },
+  "R_F_C": [
+    [
+      0.00033524103837786177,
+      0.9999997554015786,
+      -0.000613848701975148
+    ],
+    [
+      0.9997602395011284,
+      -0.0003217209569819567,
+      0.021894291682364377
+    ],
+    [
+      0.021894088839063366,
+      -0.0006210413903822761,
+      -0.9997601028154197
+    ]
+  ],
+  "locked_inputs": {
+    "camera_intrinsics_path": "C:\\Users\\Admin\\Desktop\\2D robot\\RobotArm_SCARA_Control 0812\\src\\scara\\calib\\camera1_intrinsics.json",
+    "camera_intrinsics_sha256": "797467D6E657F246FE95D8CD612489061D0FA791FD97E1F9EAD4001282A55DDF",
+    "tray_geometry_path": "C:\\Users\\Admin\\Desktop\\2D robot\\RobotArm_SCARA_Control 0812\\src\\scara\\calib\\tray_board_geometry.json",
+    "tray_geometry_sha256": "5B2E80D1BCCBBC00783A1B795F15BFE549CCDCC463C87135DC1DFF50872BC296",
+    "suction_target_path": "C:\\Users\\Admin\\Desktop\\2D robot\\RobotArm_SCARA_Control 0812\\Trajectory Photos\\260814171235\\camera1_suction_target.json",
+    "suction_target_sha256": "6B0B4DFCB8476A2BD219471C769B7D6C95D2F965E3CB330D230AB0781C2D75D9",
+    "source_runs": [
+      {
+        "run_name": "task8_260814171235",
+        "points_path": "C:\\Users\\Admin\\Desktop\\2D robot\\RobotArm_SCARA_Control 0812\\Trajectory Photos\\260814171235\\points.json",
+        "points_sha256": "82CBC11B7421ECB706B74060FF910CB33BADF86537E35891E8C8FF55D4603438",
+        "aggregate_pose_count": 6
+      },
+      {
+        "run_name": "task13_260817155954",
+        "points_path": "C:\\Users\\Admin\\Desktop\\2D robot\\RobotArm_SCARA_Control 0812\\Trajectory Photos\\260817155954\\points.json",
+        "points_sha256": "AE4DB04619405D7E48B3FD225331EE7A2D0406FAA2511033E2581C9638D0DEBF",
+        "aggregate_pose_count": 16
+      }
+    ]
+  },
+  "source_run_models": {
+    "task8_260814171235": {
+      "transform_W_T_planar": [
+        [
+          0.9998106957773436,
+          0.019456942442857932,
+          168.7851487992119
+        ],
+        [
+          -0.01945694244285759,
+          0.9998106957773435,
+          321.2470063413433
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "yaw_world_from_tray_deg": -1.1148710350241267,
+      "training_slots": [
+        "P02",
+        "P20",
+        "P50",
+        "P55"
+      ],
+      "holdout_slots": [
+        "P22",
+        "P52"
+      ],
+      "R_F_C_run_estimate": [
+        [
+          0.0010084863255617588,
+          0.9999122646127557,
+          -0.013207801948886395
+        ],
+        [
+          0.9998124742620502,
+          -0.0007527830282556935,
+          0.01935070096169894
+        ],
+        [
+          0.01933906061130891,
+          -0.013224840063389138,
+          -0.99972551449884
+        ]
+      ]
+    },
+    "task13_260817155954": {
+      "transform_W_T_planar": [
+        [
+          0.9998352056147876,
+          0.018153831916039465,
+          168.7496518518892
+        ],
+        [
+          -0.01815383191603947,
+          0.9998352056147874,
+          321.49676785910066
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "yaw_world_from_tray_deg": -1.0401950908435615,
+      "training_slots": [
+        "P02",
+        "P11",
+        "P14",
+        "P20",
+        "P22",
+        "P24",
+        "P30",
+        "P40",
+        "P44",
+        "P50",
+        "P52",
+        "P55"
+      ],
+      "holdout_slots": [
+        "P04",
+        "P15",
+        "P35",
+        "P53"
+      ],
+      "R_F_C_run_estimate": [
+        [
+          0.00010366984019899813,
+          0.999993572268381,
+          0.0035839467748546654
+        ],
+        [
+          0.9997413213720779,
+          -0.00018515486093464498,
+          0.022743264033313105
+        ],
+        [
+          0.022743781430882487,
+          0.0035806618938725742,
+          -0.9997349144981512
+        ]
+      ]
+    }
+  },
+  "training": {
+    "aggregate_training_pose_count": 16,
+    "independent_pose_count": 16,
+    "world_xy_span_mm": 146.15164155766433,
+    "forearm_alpha_span_deg": 49.777300000000025,
+    "maximum_imaging_j3_deviation_mm": 0.012000000000000455,
+    "excluded_slots": [
+      "P00",
+      "P05",
+      "P25",
+      "P45"
+    ],
+    "stress_only_slots": [
+      "P01",
+      "P10"
+    ]
+  },
+  "validation": {
+    "whole_slot_holdout": true,
+    "random_frame_split_used": false,
+    "xy_error_mm": {
+      "count": 6,
+      "rms": 0.4772648494622052,
+      "p95": 0.6825894209571354,
+      "maximum": 0.7270542012839682
+    },
+    "yaw_error_deg": {
+      "count": 6,
+      "rms": 0.17604010387449548,
+      "p95": 0.23200744504993764,
+      "maximum": 0.2372046796376992
+    },
+    "rows": [
+      {
+        "run_name": "task8_260814171235",
+        "slot": "P22",
+        "actual_world_xy_mm": [
+          118.338,
+          272.772
+        ],
+        "predicted_world_xy_mm": [
+          118.27130738155478,
+          272.5644695542658
+        ],
+        "xy_error_mm": 0.21798346556952483,
+        "yaw_error_deg": 0.11809219741715538,
+        "accepted_frame_count": 20
+      },
+      {
+        "run_name": "task8_260814171235",
+        "slot": "P52",
+        "actual_world_xy_mm": [
+          42.984,
+          273.486
+        ],
+        "predicted_world_xy_mm": [
+          42.66830699547599,
+          273.30630915742205
+        ],
+        "xy_error_mm": 0.3632504260310918,
+        "yaw_error_deg": 0.1622990552356498,
+        "accepted_frame_count": 20
+      },
+      {
+        "run_name": "task13_260817155954",
+        "slot": "P04",
+        "actual_world_xy_mm": [
+          167.523,
+          221.969
+        ],
+        "predicted_world_xy_mm": [
+          167.12014111095317,
+          221.75268546036295
+        ],
+        "xy_error_mm": 0.45726060899931775,
+        "yaw_error_deg": 0.21641574128665297,
+        "accepted_frame_count": 9
+      },
+      {
+        "run_name": "task13_260817155954",
+        "slot": "P15",
+        "actual_world_xy_mm": [
+          142.122,
+          197.377
+        ],
+        "predicted_world_xy_mm": [
+          141.80960389328934,
+          196.92530994212564
+        ],
+        "xy_error_mm": 0.5491950799766367,
+        "yaw_error_deg": 0.2372046796376992,
+        "accepted_frame_count": 10
+      },
+      {
+        "run_name": "task13_260817155954",
+        "slot": "P35",
+        "actual_world_xy_mm": [
+          92.076,
+          198.211
+        ],
+        "predicted_world_xy_mm": [
+          91.82914721010015,
+          197.91608281836992
+        ],
+        "xy_error_mm": 0.38459386877845325,
+        "yaw_error_deg": 0.027278633348998937,
+        "accepted_frame_count": 10
+      },
+      {
+        "run_name": "task13_260817155954",
+        "slot": "P53",
+        "actual_world_xy_mm": [
+          42.944,
+          248.988
+        ],
+        "predicted_world_xy_mm": [
+          42.94888269564528,
+          248.26096219432006
+        ],
+        "xy_error_mm": 0.7270542012839682,
+        "yaw_error_deg": 0.20447005075462243,
+        "accepted_frame_count": 10
+      }
+    ],
+    "stress_rows": [],
+    "cross_run_rotation_difference_deg": {
+      "values": [
+        0.9829661862410998
+      ],
+      "maximum": 0.9829661862410998
+    }
+  },
+  "quality_policy": {
+    "maximum_cross_run_rotation_difference_deg": 1.0,
+    "policy_note": "Operator-authorized 1.00 deg cross-run limit; values near the limit have low margin and remain visible in the report."
+  },
+  "prevalidated_probe_poses": [
+    {
+      "run_name": "task13_260817155954",
+      "slot": "P20",
+      "tray_xy_mm": [
+        -49.43144404791469,
+        0.4607698789578958
+      ],
+      "world_xy_mm": [
+        119.147,
+        322.765
+      ],
+      "joints": [
+        43.0862,
+        61.8741,
+        -27.0166,
+        5.862
+      ],
+      "forearm_alpha_deg": 104.96029999999999
+    },
+    {
+      "run_name": "task13_260817155954",
+      "slot": "P55",
+      "tray_xy_mm": [
+        -123.95531111113326,
+        -124.74280237527951
+      ],
+      "world_xy_mm": [
+        42.135,
+        198.995
+      ],
+      "joints": [
+        30.1517,
+        120.4215,
+        -27.0166,
+        -39.7508
+      ],
+      "forearm_alpha_deg": 150.57319999999999
+    },
+    {
+      "run_name": "task13_260817155954",
+      "slot": "P14",
+      "tray_xy_mm": [
+        -24.737588431164397,
+        -99.96620417148357
+      ],
+      "world_xy_mm": [
+        142.527,
+        222.374
+      ],
+      "joints": [
+        16.3876,
+        98.3867,
+        -27.0166,
+        -3.952
+      ],
+      "forearm_alpha_deg": 114.77430000000001
+    }
+  ],
+  "quality_gates": {
+    "independent_robot_poses": {
+      "passed": true,
+      "actual": 16,
+      "limit": ">=12"
+    },
+    "world_xy_excitation": {
+      "passed": true,
+      "actual": 146.15164155766433,
+      "limit": ">=100.00 mm"
+    },
+    "forearm_alpha_excitation": {
+      "passed": true,
+      "actual": 49.777300000000025,
+      "limit": ">=30.00 deg"
+    },
+    "fixed_imaging_j3_consistency": {
+      "passed": true,
+      "actual": 0.012000000000000455,
+      "limit": "<=0.05 mm from Stage4 imaging J3"
+    },
+    "holdout_xy_rms": {
+      "passed": true,
+      "actual": 0.4772648494622052,
+      "limit": "<=0.50 mm"
+    },
+    "holdout_xy_p95": {
+      "passed": true,
+      "actual": 0.6825894209571354,
+      "limit": "<=0.80 mm"
+    },
+    "holdout_xy_maximum": {
+      "passed": true,
+      "actual": 0.7270542012839682,
+      "limit": "<=1.20 mm"
+    },
+    "holdout_yaw_rms": {
+      "passed": true,
+      "actual": 0.17604010387449548,
+      "limit": "<=0.20 deg"
+    },
+    "holdout_yaw_maximum": {
+      "passed": true,
+      "actual": 0.2372046796376992,
+      "limit": "<=0.50 deg"
+    },
+    "cross_run_rotation_consistency": {
+      "passed": true,
+      "actual": 0.9829661862410998,
+      "limit": "<=1.00 deg with >=2 runs"
+    }
+  }
+}

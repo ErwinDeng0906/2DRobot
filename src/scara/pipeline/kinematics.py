@@ -47,6 +47,33 @@ def fk_wrist(j1_deg: float, j2_deg: float) -> Tuple[float, float]:
             L1_MM * math.sin(j1) + L2_MM * math.sin(j12))
 
 
+def forearm_pose_W_F(j1_deg: float, j2_deg: float) -> List[List[float]]:
+    """Return the planar homogeneous pose ``^W T_F`` of camera forearm frame F.
+
+    ``F`` is deliberately independent of J3 and J4: its origin is the J4-axis
+    centre and its x-axis follows the physical forearm, whose world yaw is
+    ``alpha = J1 + J2``.  The returned 3x3 matrix is an SE(2) transform::
+
+        [ cos(alpha) -sin(alpha)  wrist_x ]
+        [ sin(alpha)  cos(alpha)  wrist_y ]
+        [     0           0          1    ]
+
+    Keeping this equation in the kinematics layer prevents camera registration
+    code from accidentally substituting terminal J4 or absolute tool Rz for
+    the camera-1 forearm angle.
+    """
+
+    alpha = math.radians(float(j1_deg) + float(j2_deg))
+    cosine = math.cos(alpha)
+    sine = math.sin(alpha)
+    wrist_x, wrist_y = fk_wrist(j1_deg, j2_deg)
+    return [
+        [float(cosine), float(-sine), float(wrist_x)],
+        [float(sine), float(cosine), float(wrist_y)],
+        [0.0, 0.0, 1.0],
+    ]
+
+
 def rz_of(j1_deg: float, j2_deg: float, j4_deg: float) -> float:
     """末端绝对朝向（度）。"""
     return _norm_deg(j1_deg + j2_deg + j4_deg - 90.0)

@@ -207,7 +207,9 @@ class ScaraControlWidget(QWidget):
         self._owns = owns_controller
         self._ctrl = controller or ScaraController(self._cfg)
         self._cam: Optional[ScaraCameraThread] = None
+        self._camera_connection_counts: dict[int, int] = {}
         self._handeye_dialog: Optional[QDialog] = None
+        self._handeye_motion_mode: Optional[str] = None
         self._handeye_state_lock = threading.Lock()
         self._handeye_controller_connected = False
         self._latest_handeye_robot_state: Optional[dict[str, object]] = None
@@ -221,6 +223,7 @@ class ScaraControlWidget(QWidget):
         self._action_runtime: Optional[object] = None
         self._action_task: Optional[dict] = None
         self._action_worker: Optional[ActionWorker] = None
+        self._one_shot_action_restore: Optional[tuple[object, ...]] = None
         self._action_control_states: list[tuple[QWidget, bool]] = []
         self._resume_camera_index: Optional[int] = None
 
@@ -383,7 +386,7 @@ class ScaraControlWidget(QWidget):
         )
         g.addWidget(self._btn_handeye_demo)
         handeye_note = QLabel(
-            "目标槽下拉选择、Stage3实时位姿、A–H重投影和Jacobian验证。"
+            "目标槽下拉选择、Stage3实时位姿、A–H重投影、局部Jacobian标定和XY定位。"
             "动态演示与验证按钮只计算，机械臂不会移动。"
         )
         handeye_note.setObjectName("muted")
@@ -666,7 +669,11 @@ class ScaraControlWidget(QWidget):
             seen: set[int] = set()
             for widget_type in widget_types:
                 for widget in self._left_panel.findChildren(widget_type):
-                    if widget is self._btn_run_action or id(widget) in seen:
+                    if (
+                        widget is self._btn_run_action
+                        or widget is self._btn_estop
+                        or id(widget) in seen
+                    ):
                         continue
                     seen.add(id(widget))
                     self._action_control_states.append((widget, widget.isEnabled()))
@@ -718,6 +725,9 @@ class ScaraControlWidget(QWidget):
         point_count = sum(step["type"] == "record_point" for step in task["actions"])
         photo_count = sum(step["type"] == "capture" for step in task["actions"])
         video_count = sum(step["type"] == "start_video" for step in task["actions"])
+        runtime_move_count = sum(
+            step["type"] == "runtime_move_joints" for step in task["actions"]
+        )
         confirmation = QMessageBox(self)
         confirmation.setIcon(QMessageBox.Icon.Warning)
         confirmation.setWindowTitle("确认执行动作")
@@ -725,6 +735,7 @@ class ScaraControlWidget(QWidget):
             f"动作：{task['name']}\n"
             f"相机源：{', '.join(f'#{source}' for source in sources) or '无'}\n"
             f"记录点：{point_count}；照片：{photo_count}；录像：{video_count}\n"
+            f"运行时人工确认关节运动：{runtime_move_count}\n"
             "相机坐标：旋转相机按 Rz 计算；源1按 J1+J2 计算\n\n"
             "动作会按脚本自动运动并直接打开所需相机源。\n"
             f"输出：{output_dir}\n\n"
@@ -767,6 +778,16 @@ class ScaraControlWidget(QWidget):
                         "任务运行时必须实现 on_photo_saved(path) 和 "
                         "on_task_finished(ok, message, output_dir)"
                     )
+                on_runtime_move = getattr(
+                    runtime,
+                    "on_runtime_move_joints_requested",
+                    None,
+                )
+                if runtime_move_count and not callable(on_runtime_move):
+                    raise ValueError(
+                        "含runtime_move_joints的任务运行时必须实现 "
+                        "on_runtime_move_joints_requested(request)"
+                    )
                 fatal_error = getattr(runtime, "fatal_error", None)
                 if fatal_error is not None:
                     connect_fatal_error = getattr(fatal_error, "connect", None)
@@ -778,6 +799,18 @@ class ScaraControlWidget(QWidget):
                 QMessageBox.critical(self, "任务准备失败", str(exc))
                 self._append("动作错误", f"任务运行时启动失败：{exc}", _D["error"])
                 return
+        elif runtime_move_count:
+            QMessageBox.critical(
+                self,
+                "任务准备失败",
+                "runtime_move_joints任务必须提供create_task_runtime()。",
+            )
+            self._append(
+                "动作错误",
+                "动态关节运动缺少任务运行时；已拒绝启动",
+                _D["error"],
+            )
+            return
 
         # The action opens sources 0/1/2 itself.  Release the preview capture to
         # avoid DirectShow device contention, then restore it after the run.
@@ -819,6 +852,10 @@ class ScaraControlWidget(QWidget):
         self._action_worker.operator_checkpoint_requested.connect(
             self._on_action_operator_checkpoint
         )
+        if runtime_move_count:
+            self._action_worker.runtime_move_joints_requested.connect(
+                self._on_action_runtime_move_joints
+            )
         self._action_worker.run_finished.connect(self._on_action_finished)
 
         self._set_action_controls_locked(True)
@@ -839,6 +876,53 @@ class ScaraControlWidget(QWidget):
         worker.request_stop()
         self._btn_run_action.setText("正在安全停止…")
         self._btn_run_action.setEnabled(False)
+
+    def _on_action_runtime_move_joints(self, request: dict) -> None:
+        """Let the task runtime display one proposal; never move from the UI.
+
+        The callback may open a modal confirmation dialog.  Its dictionary is
+        only transferred to ActionWorker, where it is treated as untrusted and
+        subjected to a fresh controller read plus the independent kinematic
+        audit.  An exception returns ``abort`` so the worker cannot remain
+        blocked waiting for a GUI that has already failed.
+        """
+
+        worker = self._action_worker
+        if worker is None or not worker.isRunning():
+            return
+        runtime = self._action_runtime
+        callback = getattr(
+            runtime,
+            "on_runtime_move_joints_requested",
+            None,
+        )
+        request_id = str(request.get("request_id") or "")
+        if not callable(callback):
+            response = {
+                "request_id": request_id,
+                "decision": "abort",
+                "reason": "任务运行时缺少动态关节运动处理函数",
+            }
+            worker.respond_runtime_move_joints(response)
+            self._append("动作错误", response["reason"], _D["error"])
+            return
+        try:
+            response = callback(dict(request))
+            if not isinstance(response, dict):
+                raise ValueError(
+                    "on_runtime_move_joints_requested必须返回字典"
+                )
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            response = {
+                "request_id": request_id,
+                "decision": "abort",
+                "reason": f"Stage7A弹窗/计算失败：{message}",
+            }
+            self._append("动作错误", response["reason"], _D["error"])
+        worker = self._action_worker
+        if worker is not None and worker.isRunning():
+            worker.respond_runtime_move_joints(response)
 
     def _on_action_operator_checkpoint(
         self,
@@ -922,6 +1006,7 @@ class ScaraControlWidget(QWidget):
             _D["success"] if ok else _D["error"],
         )
         self._action_worker = None
+        self._restore_one_shot_action()
 
         resume_index = self._resume_camera_index
         self._resume_camera_index = None
@@ -946,7 +1031,13 @@ class ScaraControlWidget(QWidget):
                 return
             self._btn_cam.setText("连接相机"); self._cam_lbl.setText("相机已断开")
             return
-        self._cam = ScaraCameraThread(index=self._cam_idx.value())
+        camera_index = int(self._cam_idx.value())
+        generation = self._camera_connection_counts.get(camera_index, 0) + 1
+        self._camera_connection_counts[camera_index] = generation
+        self._cam = ScaraCameraThread(
+            index=camera_index,
+            connection_generation=generation,
+        )
         self._cam.frame_ready.connect(self._on_frame)
         self._cam.error.connect(self._on_camera_error)
         self._cam.start(); self._btn_cam.setText("断开相机")
@@ -991,6 +1082,15 @@ class ScaraControlWidget(QWidget):
             )
             self._handeye_dialog = dialog
             dialog.destroyed.connect(self._on_handeye_dialog_destroyed)
+            dialog.local_jacobian_calibration_requested.connect(
+                self._start_local_jacobian_calibration
+            )
+            dialog.stage7b_start_requested.connect(self._start_stage7b)
+            dialog.stage7b_stop_requested.connect(self._stop_stage7b)
+            dialog.full_tray_start_requested.connect(
+                self._start_full_tray_positioning
+            )
+            dialog.full_tray_stop_requested.connect(self._stop_stage7b)
             dialog.show()
             self._append(
                 "手眼交互",
@@ -1004,6 +1104,299 @@ class ScaraControlWidget(QWidget):
 
     def _on_handeye_dialog_destroyed(self, _object=None) -> None:
         self._handeye_dialog = None
+
+    def _restore_one_shot_action(self) -> None:
+        """Restore the task-panel import after a hand-eye one-shot Task9 run."""
+
+        saved = self._one_shot_action_restore
+        self._one_shot_action_restore = None
+        if saved is None:
+            return
+        (
+            self._action_file,
+            self._action_builder,
+            self._action_camera_calculator,
+            source_calculators,
+            self._action_runtime_factory,
+            self._action_task,
+        ) = saved
+        self._action_source_position_calculators = dict(source_calculators)
+        self._btn_run_action.setEnabled(self._action_builder is not None)
+
+    def _start_local_jacobian_calibration(self, target_name: str) -> None:
+        """Run target-locked Task9 through the existing exclusive task worker."""
+
+        if self._action_worker is not None and self._action_worker.isRunning():
+            self._append(
+                "local Jacobian标定",
+                "已有任务或XY定位会话运行中",
+                _D["warning"],
+            )
+            return
+        if self._one_shot_action_restore is not None:
+            self._append(
+                "local Jacobian标定",
+                "上一次临时任务尚未完成收尾",
+                _D["warning"],
+            )
+            return
+
+        project_root = Path(__file__).resolve().parents[3]
+        task9_path = project_root / "Preset Trajectories" / "task9_jacobiantest.py"
+        try:
+            module_name = (
+                f"_scara_local_task9_{target_name}_"
+                f"{time.monotonic_ns()}"
+            )
+            spec = importlib.util.spec_from_file_location(module_name, task9_path)
+            if spec is None or spec.loader is None:
+                raise ValueError("无法创建Task9模块加载器")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            if getattr(module, "ACTION_API_VERSION", None) != 1:
+                raise ValueError("Task9动作API版本无效")
+            build_for_target = getattr(module, "build_action_for_target", None)
+            runtime_for_target = getattr(
+                module, "create_task_runtime_for_target", None
+            )
+            if not callable(build_for_target) or not callable(runtime_for_target):
+                raise ValueError("Task9缺少目标槽参数化入口")
+            # Build once before closing the live dialog so geometry/IK errors
+            # cannot turn into a partially-started acquisition.
+            preview = normalize_action_task(build_for_target(target_name))
+        except Exception as exc:
+            QMessageBox.critical(self, "local Jacobian标定准备失败", str(exc))
+            self._append(
+                "local Jacobian标定",
+                f"{target_name}准备失败：{exc}",
+                _D["error"],
+            )
+            return
+
+        self._one_shot_action_restore = (
+            self._action_file,
+            self._action_builder,
+            self._action_camera_calculator,
+            dict(self._action_source_position_calculators),
+            self._action_runtime_factory,
+            self._action_task,
+        )
+        self._action_file = task9_path
+        self._action_builder = lambda: build_for_target(target_name)
+        self._action_camera_calculator = None
+        self._action_source_position_calculators = {}
+        self._action_runtime_factory = (
+            lambda output_dir, parent: runtime_for_target(
+                output_dir, target_name, parent=parent
+            )
+        )
+        self._action_task = preview
+        self._append(
+            "local Jacobian标定",
+            (
+                f"已锁定目标{target_name}；Task9只会验证当前已在该槽中心，"
+                "随后执行±2mm九点采集"
+            ),
+            _D["warning"],
+        )
+        self._on_run_action()
+        worker = self._action_worker
+        if worker is None:
+            self._restore_one_shot_action()
+
+    def _start_stage7b(self) -> None:
+        """Start the finite XY loop while keeping camera1/Stage3 live.
+
+        The dialog supplies calculations and evidence only.  The same
+        ActionWorker used by imported tasks remains the sole controller owner
+        and independently rechecks every proposed joint target.
+        """
+
+        dialog = self._handeye_dialog
+        if dialog is None:
+            return
+        if self._action_worker is not None and self._action_worker.isRunning():
+            self._append("单点有限闭环", "已有任务或闭环运行中", _D["warning"])
+            return
+        if self._cam is None or self._cam.source_index != 1 or not self._cam.isRunning():
+            self._append("单点有限闭环", "相机1未运行，已拒绝启动", _D["error"])
+            return
+        if not self._ctrl.motion_ready():
+            return
+        project_root = Path(__file__).resolve().parents[3]
+        output_dir = project_root / "Trajectory Photos" / datetime.now().strftime("%y%m%d%H%M%S")
+        try:
+            task = normalize_action_task(dialog.prepare_stage7b_session(output_dir))
+        except Exception as exc:
+            if getattr(dialog, "stage7b_active", False):
+                try:
+                    dialog.finish_stage7b_session(False, f"准备失败：{exc}")
+                except Exception:
+                    pass
+            QMessageBox.critical(self, "单点有限闭环准备失败", str(exc))
+            self._append("单点有限闭环", f"准备失败：{exc}", _D["error"])
+            return
+
+        worker = ActionWorker(
+            self._ctrl,
+            task,
+            output_dir,
+            camera_position_calculator=self._action_camera_calculator,
+            source_position_calculators=self._action_source_position_calculators,
+            parent=self,
+        )
+        self._action_task = task
+        self._action_worker = worker
+        self._handeye_motion_mode = "single_loop"
+        worker.progress.connect(
+            lambda message: self._append("单点有限闭环", message, _D["accent"])
+        )
+        worker.runtime_move_joints_requested.connect(
+            self._on_stage7b_runtime_move_joints
+        )
+        worker.run_finished.connect(self._on_stage7b_finished)
+        self._set_action_controls_locked(True)
+        self._btn_run_action.setEnabled(False)
+        self._btn_cam.setEnabled(False)
+        self._cam_idx.setEnabled(False)
+        self._btn_snap.setEnabled(False)
+        self._append(
+            "单点有限闭环",
+            f"有限闭环已启动；输出文件夹 {output_dir}",
+            _D["warning"],
+        )
+        worker.start()
+
+    def _start_full_tray_positioning(self) -> None:
+        """Start runtime Tray registration, dynamic coarse route and metric loop."""
+
+        dialog = self._handeye_dialog
+        if dialog is None:
+            return
+        if self._action_worker is not None and self._action_worker.isRunning():
+            self._append("全盘定位", "已有任务或XY定位会话运行中", _D["warning"])
+            return
+        if self._cam is None or self._cam.source_index != 1 or not self._cam.isRunning():
+            self._append("全盘定位", "相机1未运行，已拒绝启动", _D["error"])
+            return
+        if not self._ctrl.motion_ready():
+            return
+        project_root = Path(__file__).resolve().parents[3]
+        output_dir = (
+            project_root
+            / "Trajectory Photos"
+            / datetime.now().strftime("%y%m%d%H%M%S")
+        )
+        try:
+            task = normalize_action_task(
+                dialog.prepare_full_tray_session(output_dir)
+            )
+        except Exception as exc:
+            if getattr(dialog, "stage7b_active", False):
+                try:
+                    dialog.finish_stage7b_session(False, f"准备失败：{exc}")
+                except Exception:
+                    pass
+            QMessageBox.critical(self, "全盘定位准备失败", str(exc))
+            self._append("全盘定位", f"准备失败：{exc}", _D["error"])
+            return
+
+        worker = ActionWorker(
+            self._ctrl,
+            task,
+            output_dir,
+            camera_position_calculator=self._action_camera_calculator,
+            source_position_calculators=self._action_source_position_calculators,
+            parent=self,
+        )
+        self._action_task = task
+        self._action_worker = worker
+        self._handeye_motion_mode = "full_tray"
+        worker.progress.connect(
+            lambda message: self._append("全盘定位", message, _D["accent"])
+        )
+        worker.runtime_move_joints_requested.connect(
+            self._on_stage7b_runtime_move_joints
+        )
+        worker.run_finished.connect(self._on_stage7b_finished)
+        self._set_action_controls_locked(True)
+        self._btn_run_action.setEnabled(False)
+        self._btn_cam.setEnabled(False)
+        self._cam_idx.setEnabled(False)
+        self._btn_snap.setEnabled(False)
+        self._append(
+            "全盘定位",
+            f"P22全盘定位已启动；输出文件夹 {output_dir}",
+            _D["warning"],
+        )
+        worker.start()
+
+    def _on_stage7b_runtime_move_joints(self, request: dict) -> None:
+        worker = self._action_worker
+        dialog = self._handeye_dialog
+        if worker is None or not worker.isRunning():
+            return
+        if dialog is None:
+            worker.respond_runtime_move_joints(
+                {
+                    "request_id": str(request.get("request_id") or ""),
+                    "decision": "abort",
+                    "reason": "手眼交互动态演示窗口已失效",
+                }
+            )
+            return
+
+        def respond(response: dict) -> None:
+            current = self._action_worker
+            if current is worker and current.isRunning():
+                current.respond_runtime_move_joints(response)
+
+        dialog.begin_stage7b_request(dict(request), respond)
+
+    def _stop_stage7b(self) -> None:
+        worker = self._action_worker
+        if worker is not None and worker.isRunning():
+            worker.request_stop()
+            label = (
+                "全盘定位"
+                if self._handeye_motion_mode == "full_tray"
+                else "单点有限闭环"
+            )
+            self._append(
+                label,
+                "已请求安全停止；不会再授权新的XY修正",
+                _D["warning"],
+            )
+
+    def _on_stage7b_finished(self, ok: bool, message: str, output_dir: str) -> None:
+        mode = self._handeye_motion_mode
+        label = "全盘定位" if mode == "full_tray" else "单点有限闭环"
+        dialog = self._handeye_dialog
+        if dialog is not None:
+            try:
+                finished = dialog.finish_stage7b_session(ok, message)
+                if (
+                    isinstance(finished, tuple)
+                    and len(finished) == 2
+                ):
+                    ok = bool(finished[0])
+                    message = str(finished[1])
+            except Exception as exc:
+                ok = False
+                message = f"{message}；{label}报告收尾失败：{exc}"
+        self._set_action_controls_locked(False)
+        self._btn_cam.setEnabled(True)
+        self._cam_idx.setEnabled(True)
+        self._btn_snap.setEnabled(True)
+        self._btn_run_action.setEnabled(self._action_builder is not None)
+        self._action_worker = None
+        self._handeye_motion_mode = None
+        self._append(
+            f"{label}完成" if ok else f"{label}停止",
+            f"{message}；文件夹：{output_dir}",
+            _D["success"] if ok else _D["error"],
+        )
 
     def _handeye_robot_state_snapshot(self) -> Optional[dict[str, object]]:
         """Return a copy of the latest UI status; never poll the controller."""
@@ -1429,13 +1822,23 @@ class ScaraControlWidget(QWidget):
 
     def cleanup(self) -> None:
         try:
+            # Stage7B may have an ActionWorker waiting on the live Stage3
+            # dialog.  Stop and join the sole hardware owner before asking the
+            # dialog/monitor to close, otherwise closeEvent correctly refuses
+            # destruction while the closed loop is armed.
+            if self._action_worker is not None and self._action_worker.isRunning():
+                self._action_worker.request_stop()
+                self._action_worker.wait(15000)
+            dialog = self._handeye_dialog
+            if dialog is not None and getattr(dialog, "stage7b_active", False):
+                try:
+                    dialog.finish_stage7b_session(False, "应用退出时安全停止")
+                except Exception:
+                    pass
             # Give an in-flight Stage3 call one longer bounded chance to finish.
             # A failed close retains the dialog reference instead of destroying
             # a live QThread.
             self._close_handeye_dialog("退出清理", final_wait_ms=15000)
-            if self._action_worker is not None and self._action_worker.isRunning():
-                self._action_worker.request_stop()
-                self._action_worker.wait(3000)
             # 主界面退出：先断 snrobot，再清零 DO，避免抢连接导致关泵失败。
             if self._owns:
                 if self._ctrl.is_connected():
