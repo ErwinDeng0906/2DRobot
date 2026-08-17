@@ -25,6 +25,7 @@ ACTION_API_VERSION = 1
 SUPPORTED_ACTION_TYPES = {
     "assert_joints",
     "move_joints",
+    "runtime_move_joints",
     "move_xyzr",
     "wait",
     "capture",
@@ -33,6 +34,38 @@ SUPPORTED_ACTION_TYPES = {
     "record_point",
     "operator_checkpoint",
 }
+
+# ``runtime_move_joints`` is intentionally much narrower than an ordinary
+# imported ``move_joints`` step.  These are engine-enforced Stage-7A ceilings,
+# not defaults that an imported task may relax.
+RUNTIME_MOVE_MAXIMUM_STEP_NORM_MM = 0.25
+RUNTIME_MOVE_MAXIMUM_AXIS_STEP_MM = 0.25
+RUNTIME_MOVE_MAXIMUM_LOCAL_EXTENT_MM = 2.0
+RUNTIME_MOVE_MINIMUM_DOMAIN_MARGIN_MM = 0.20
+RUNTIME_MOVE_MAXIMUM_J3_TOLERANCE_MM = 0.20
+RUNTIME_MOVE_MAXIMUM_RZ_TOLERANCE_DEG = 0.20
+RUNTIME_MOVE_MAXIMUM_TARGET_RZ_TOLERANCE_DEG = 0.15
+RUNTIME_MOVE_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 0.30
+RUNTIME_MOVE_MAXIMUM_STATE_DRIFT_XY_MM = 0.05
+RUNTIME_MOVE_MAXIMUM_STATE_DRIFT_JOINT = 0.05
+RUNTIME_MOVE_MAXIMUM_SEQUENTIAL_TRANSIENT_MM = 0.50
+RUNTIME_MOVE_MAXIMUM_MOVE_TOLERANCE = 0.05
+RUNTIME_MOVE_MAXIMUM_PROPOSAL_AGE_S = 60.0
+RUNTIME_MOVE_MAXIMUM_FK_POSE_MISMATCH_MM = 0.20
+STAGE7B_RUNTIME_REQUEST_KEY = "stage7b_p22_finite_loop"
+STAGE7B_MAXIMUM_STEP_NORM_MM = 0.75
+STAGE7B_MAXIMUM_AXIS_STEP_MM = 0.75
+STAGE7B_MAXIMUM_LOCAL_EXTENT_MM = 10.0
+STAGE7B_MAXIMUM_SEQUENTIAL_TRANSIENT_MM = 1.50
+FULL_TRAY_GEOMETRY_REQUEST_KEY = "full_tray_p22_metric_geometry_correction"
+FULL_TRAY_GEOMETRY_MAXIMUM_STEP_NORM_MM = 3.0
+FULL_TRAY_GEOMETRY_MAXIMUM_AXIS_STEP_MM = 3.0
+FULL_TRAY_GEOMETRY_MAXIMUM_LOCAL_EXTENT_MM = 5.0
+FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM = 6.0
+FULL_TRAY_GEOMETRY_MAXIMUM_RZ_TOLERANCE_DEG = 0.30
+FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 1.0
+FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_XY_MM = 0.20
+FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_JOINT = 0.20
 
 
 def _finite(value: object, label: str) -> float:
@@ -50,6 +83,55 @@ def _joint_values(value: object, label: str) -> list[float]:
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         raise ValueError(f"{label} 必须包含 J1/J2/J3/J4 四个值")
     return [_finite(item, f"{label}[{index}]") for index, item in enumerate(value)]
+
+
+def _vector_values(value: object, length: int, label: str) -> list[float]:
+    if not isinstance(value, (list, tuple)) or len(value) != int(length):
+        raise ValueError(f"{label} 必须包含 {length} 个数值")
+    return [_finite(item, f"{label}[{index}]") for index, item in enumerate(value)]
+
+
+def _positive_at_most(
+    value: object,
+    label: str,
+    maximum: float,
+) -> float:
+    result = _finite(value, label)
+    if result <= 0.0 or result > float(maximum) + 1e-12:
+        raise ValueError(f"{label} 必须在 (0, {maximum:g}] 范围内")
+    return result
+
+
+def _json_safe_mapping(
+    value: object,
+    label: str,
+    *,
+    maximum_characters: int = 1_000_000,
+) -> dict:
+    """Return a detached JSON mapping or fail closed.
+
+    Runtime proposal objects are persisted into ``points.json``.  Round-trip
+    serialization both rejects NaN/custom objects and prevents a GUI runtime
+    from mutating the audit payload after it has authorized a request.
+    """
+
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} 必须是JSON对象")
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} 包含不可序列化或非有限值") from exc
+    if len(encoded) > int(maximum_characters):
+        raise ValueError(f"{label} 过大，拒绝写入运行记录")
+    decoded = json.loads(encoded)
+    if not isinstance(decoded, dict):  # pragma: no cover - guarded above
+        raise ValueError(f"{label} 必须是JSON对象")
+    return decoded
 
 
 def normalize_action_task(raw_task: object) -> dict:
@@ -101,6 +183,7 @@ def normalize_action_task(raw_task: object) -> dict:
         if kind in {
             "assert_joints",
             "move_joints",
+            "runtime_move_joints",
             "move_xyzr",
             "record_point",
             "operator_checkpoint",
@@ -126,6 +209,251 @@ def normalize_action_task(raw_task: object) -> dict:
                 )
                 if step["j3_tolerance_mm"] <= 0:
                     raise ValueError(f"第 {index} 步 j3_tolerance_mm 必须大于 0")
+        elif kind == "runtime_move_joints":
+            # A runtime may calculate a target only inside this immutable,
+            # normalized envelope.  ActionWorker independently re-reads the
+            # controller and audits the returned target before any command.
+            request_key = str(raw.get("request_key") or "").strip()
+            if not request_key:
+                raise ValueError(
+                    f"第 {index} 步 runtime_move_joints.request_key 不能为空"
+                )
+            target_name = str(raw.get("target_name") or "P22").strip()
+            if target_name != "P22":
+                raise ValueError(
+                    f"第 {index} 步 runtime_move_joints目前只允许target_name=P22"
+                )
+            is_stage7b = request_key == STAGE7B_RUNTIME_REQUEST_KEY
+            is_full_tray_geometry = (
+                request_key == FULL_TRAY_GEOMETRY_REQUEST_KEY
+            )
+            calibration_sha256 = str(
+                raw.get("calibration_sha256") or ""
+            ).strip().upper()
+            if len(calibration_sha256) != 64 or any(
+                character not in "0123456789ABCDEF"
+                for character in calibration_sha256
+            ):
+                raise ValueError(
+                    f"第 {index} 步 calibration_sha256 必须是64位SHA-256十六进制"
+                )
+            fine_calibration_sha256 = str(
+                raw.get("fine_calibration_sha256") or ""
+            ).strip().upper()
+            if is_stage7b and (
+                len(fine_calibration_sha256) != 64
+                or any(character not in "0123456789ABCDEF" for character in fine_calibration_sha256)
+            ):
+                raise ValueError(
+                    f"第 {index} 步 fine_calibration_sha256 必须是64位SHA-256十六进制"
+                )
+            maximum_extent = (
+                STAGE7B_MAXIMUM_LOCAL_EXTENT_MM
+                if is_stage7b
+                else (
+                    FULL_TRAY_GEOMETRY_MAXIMUM_LOCAL_EXTENT_MM
+                    if is_full_tray_geometry
+                    else RUNTIME_MOVE_MAXIMUM_LOCAL_EXTENT_MM
+                )
+            )
+            maximum_step_norm = (
+                STAGE7B_MAXIMUM_STEP_NORM_MM
+                if is_stage7b
+                else (
+                    FULL_TRAY_GEOMETRY_MAXIMUM_STEP_NORM_MM
+                    if is_full_tray_geometry
+                    else RUNTIME_MOVE_MAXIMUM_STEP_NORM_MM
+                )
+            )
+            maximum_axis_step = (
+                STAGE7B_MAXIMUM_AXIS_STEP_MM
+                if is_stage7b
+                else (
+                    FULL_TRAY_GEOMETRY_MAXIMUM_AXIS_STEP_MM
+                    if is_full_tray_geometry
+                    else RUNTIME_MOVE_MAXIMUM_AXIS_STEP_MM
+                )
+            )
+            maximum_transient_xy = (
+                STAGE7B_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
+                if is_stage7b
+                else (
+                    FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
+                    if is_full_tray_geometry
+                    else RUNTIME_MOVE_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
+                )
+            )
+            maximum_rz_tolerance = (
+                FULL_TRAY_GEOMETRY_MAXIMUM_RZ_TOLERANCE_DEG
+                if is_full_tray_geometry
+                else RUNTIME_MOVE_MAXIMUM_RZ_TOLERANCE_DEG
+            )
+            maximum_transient_rz = (
+                FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
+                if is_full_tray_geometry
+                else RUNTIME_MOVE_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
+            )
+            maximum_state_drift_xy = (
+                FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_XY_MM
+                if is_full_tray_geometry
+                else RUNTIME_MOVE_MAXIMUM_STATE_DRIFT_XY_MM
+            )
+            maximum_state_drift_joint = (
+                FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_JOINT
+                if is_full_tray_geometry
+                else RUNTIME_MOVE_MAXIMUM_STATE_DRIFT_JOINT
+            )
+            extent = _positive_at_most(
+                raw.get("local_extent_mm"),
+                f"第 {index} 步 local_extent_mm",
+                maximum_extent,
+            )
+            margin = _finite(
+                raw.get("domain_margin_mm"),
+                f"第 {index} 步 domain_margin_mm",
+            )
+            if (
+                margin < RUNTIME_MOVE_MINIMUM_DOMAIN_MARGIN_MM - 1e-12
+                or margin >= extent
+            ):
+                raise ValueError(
+                    f"第 {index} 步 domain_margin_mm 必须至少为"
+                    f" {RUNTIME_MOVE_MINIMUM_DOMAIN_MARGIN_MM:g} 且小于local_extent_mm"
+                )
+            raw_precompensate_rz = raw.get("precompensate_rz", False)
+            if not isinstance(raw_precompensate_rz, bool):
+                raise ValueError(
+                    f"第 {index} 步 precompensate_rz 必须是布尔值"
+                )
+            step.update(
+                {
+                    "request_key": request_key,
+                    "target_name": target_name,
+                    "calibration_sha256": calibration_sha256,
+                    "fine_calibration_sha256": fine_calibration_sha256,
+                    "anchor_robot_xy_mm": _vector_values(
+                        raw.get("anchor_robot_xy_mm"),
+                        2,
+                        f"第 {index} 步 anchor_robot_xy_mm",
+                    ),
+                    "local_extent_mm": extent,
+                    "domain_margin_mm": margin,
+                    "required_j3_mm": _finite(
+                        raw.get("required_j3_mm"),
+                        f"第 {index} 步 required_j3_mm",
+                    ),
+                    "required_rz_deg": _finite(
+                        raw.get("required_rz_deg"),
+                        f"第 {index} 步 required_rz_deg",
+                    ),
+                    "max_xy_step_norm_mm": _positive_at_most(
+                        raw.get(
+                            "max_xy_step_norm_mm",
+                            maximum_step_norm,
+                        ),
+                        f"第 {index} 步 max_xy_step_norm_mm",
+                        maximum_step_norm,
+                    ),
+                    "max_xy_axis_mm": _positive_at_most(
+                        raw.get(
+                            "max_xy_axis_mm",
+                            maximum_axis_step,
+                        ),
+                        f"第 {index} 步 max_xy_axis_mm",
+                        maximum_axis_step,
+                    ),
+                    "j3_tolerance_mm": _positive_at_most(
+                        raw.get(
+                            "j3_tolerance_mm",
+                            RUNTIME_MOVE_MAXIMUM_J3_TOLERANCE_MM,
+                        ),
+                        f"第 {index} 步 j3_tolerance_mm",
+                        RUNTIME_MOVE_MAXIMUM_J3_TOLERANCE_MM,
+                    ),
+                    "rz_tolerance_deg": _positive_at_most(
+                        raw.get(
+                            "rz_tolerance_deg",
+                            maximum_rz_tolerance,
+                        ),
+                        f"第 {index} 步 rz_tolerance_deg",
+                        maximum_rz_tolerance,
+                    ),
+                    "target_rz_tolerance_deg": _positive_at_most(
+                        raw.get(
+                            "target_rz_tolerance_deg",
+                            RUNTIME_MOVE_MAXIMUM_TARGET_RZ_TOLERANCE_DEG,
+                        ),
+                        f"第 {index} 步 target_rz_tolerance_deg",
+                        RUNTIME_MOVE_MAXIMUM_TARGET_RZ_TOLERANCE_DEG,
+                    ),
+                    "max_sequential_transient_rz_deg": _positive_at_most(
+                        raw.get(
+                            "max_sequential_transient_rz_deg",
+                            maximum_transient_rz,
+                        ),
+                        f"第 {index} 步 max_sequential_transient_rz_deg",
+                        maximum_transient_rz,
+                    ),
+                    "precompensate_rz": raw_precompensate_rz,
+                    # Stage7B uses a measured 20 x 20 mm endpoint domain and
+                    # explicitly permits the controller's natural sequential
+                    # J1/J2 path to leave that model domain.  Stage7A keeps the
+                    # stricter intermediate-domain gate.  This policy is
+                    # derived from the recognized request key, not trusted
+                    # from an imported task field.
+                    "enforce_sequential_intermediate_domain": not (
+                        is_stage7b or is_full_tray_geometry
+                    ),
+                    "max_state_drift_xy_mm": _positive_at_most(
+                        raw.get(
+                            "max_state_drift_xy_mm",
+                            maximum_state_drift_xy,
+                        ),
+                        f"第 {index} 步 max_state_drift_xy_mm",
+                        maximum_state_drift_xy,
+                    ),
+                    "max_state_drift_joint": _positive_at_most(
+                        raw.get(
+                            "max_state_drift_joint",
+                            maximum_state_drift_joint,
+                        ),
+                        f"第 {index} 步 max_state_drift_joint",
+                        maximum_state_drift_joint,
+                    ),
+                    "max_sequential_transient_xy_mm": _positive_at_most(
+                        raw.get(
+                            "max_sequential_transient_xy_mm",
+                            maximum_transient_xy,
+                        ),
+                        f"第 {index} 步 max_sequential_transient_xy_mm",
+                        maximum_transient_xy,
+                    ),
+                    "move_tolerance": _positive_at_most(
+                        raw.get(
+                            "move_tolerance",
+                            RUNTIME_MOVE_MAXIMUM_MOVE_TOLERANCE,
+                        ),
+                        f"第 {index} 步 move_tolerance",
+                        RUNTIME_MOVE_MAXIMUM_MOVE_TOLERANCE,
+                    ),
+                    "proposal_max_age_s": _positive_at_most(
+                        raw.get(
+                            "proposal_max_age_s",
+                            RUNTIME_MOVE_MAXIMUM_PROPOSAL_AGE_S,
+                        ),
+                        f"第 {index} 步 proposal_max_age_s",
+                        RUNTIME_MOVE_MAXIMUM_PROPOSAL_AGE_S,
+                    ),
+                    "fk_pose_xy_tolerance_mm": _positive_at_most(
+                        raw.get(
+                            "fk_pose_xy_tolerance_mm",
+                            RUNTIME_MOVE_MAXIMUM_FK_POSE_MISMATCH_MM,
+                        ),
+                        f"第 {index} 步 fk_pose_xy_tolerance_mm",
+                        RUNTIME_MOVE_MAXIMUM_FK_POSE_MISMATCH_MM,
+                    ),
+                }
+            )
         elif kind == "move_xyzr":
             for key in ("x_mm", "y_mm", "z_mm", "r_deg"):
                 step[key] = _finite(raw.get(key, 0.0), f"第 {index} 步 {key}")
@@ -450,6 +778,7 @@ class ActionWorker(QThread):
     video_saved = pyqtSignal(str)
     point_recorded = pyqtSignal(str)
     operator_checkpoint_requested = pyqtSignal(str, str, str, str)
+    runtime_move_joints_requested = pyqtSignal(dict)
     run_finished = pyqtSignal(bool, str, str)
 
     def __init__(
@@ -479,6 +808,12 @@ class ActionWorker(QThread):
         self._manifest: dict = {}
         self._operator_decision_event = threading.Event()
         self._operator_decision: Optional[bool] = None
+        self._runtime_move_response_event = threading.Event()
+        self._runtime_move_response_lock = threading.Lock()
+        self._runtime_move_pending_request_id: Optional[str] = None
+        self._runtime_move_response: Optional[object] = None
+        self._runtime_move_request_sequence = 0
+        self._runtime_session_complete = False
         self._repeatable = any(
             step["type"] == "operator_checkpoint"
             for step in self._task["actions"]
@@ -498,6 +833,37 @@ class ActionWorker(QThread):
         """
         self._operator_decision = bool(continue_collection)
         self._operator_decision_event.set()
+
+    def respond_runtime_move_joints(self, response: object) -> None:
+        """Return one UI/runtime decision to the paused action thread.
+
+        The response is deliberately treated as untrusted input.  This method
+        only transfers it across threads; validation, a fresh controller read,
+        and the independent kinematic audit all happen on the worker thread.
+        Stale or duplicate responses cannot release a later request.
+        """
+
+        with self._runtime_move_response_lock:
+            pending = self._runtime_move_pending_request_id
+            if pending is None or self._runtime_move_response_event.is_set():
+                return
+            if isinstance(response, dict) and str(
+                response.get("request_id") or ""
+            ) not in {"", pending}:
+                return
+            try:
+                detached: object = _json_safe_mapping(
+                    response,
+                    "runtime_move_joints response",
+                )
+            except ValueError as exc:
+                detached = {
+                    "request_id": pending,
+                    "decision": "abort",
+                    "reason": str(exc),
+                }
+            self._runtime_move_response = detached
+            self._runtime_move_response_event.set()
 
     def _interruptible_wait(self, seconds: float) -> bool:
         remaining = max(0.0, float(seconds))
@@ -530,9 +896,69 @@ class ActionWorker(QThread):
             raise RuntimeError(f"{context}：状态中缺少 J1/J2/J3/J4")
         if not isinstance(pose, (list, tuple)) or len(pose) != 6:
             raise RuntimeError(f"{context}：状态中缺少 x/y/z/Rx/Ry/Rz")
+        connected_reader = getattr(self._controller, "is_connected", None)
+        connected = bool(connected_reader()) if callable(connected_reader) else False
+        controller_safety = {
+            "captured_monotonic_s": time.monotonic(),
+            "connected": connected,
+            "effectively_enabled": status.get("effectively_enabled") is True,
+            "enable": int(status.get("enable", 0)),
+            "estop": status.get("estop") is True,
+            "soft_estop": status.get("soft_estop") is True,
+            "warn": int(status.get("warn", -1)),
+            "need_clear": status.get("need_clear") is True,
+            "mode": str(status.get("mode") or "?"),
+        }
         return {
             "joints": [_finite(value, f"{context}.joints") for value in joints],
             "pose": [_finite(value, f"{context}.pose") for value in pose],
+            "controller_safety": controller_safety,
+        }
+
+    def _read_runtime_motion_state(self, context: str) -> dict:
+        """Read joints, pose, and authoritative controller safety flags.
+
+        Missing flags are false/failing by design.  A Stage-7A runtime gets
+        this detached snapshot for display and calculation, but ActionWorker
+        always performs another read after the operator confirms.
+        """
+
+        status = self._controller.read_all_sync()
+        if not isinstance(status, dict):
+            raise RuntimeError(f"{context}：读取机械臂状态失败")
+        joints = _joint_values(status.get("joints"), f"{context}.joints")
+        pose = _vector_values(status.get("pose"), 6, f"{context}.pose")
+        connected_reader = getattr(self._controller, "is_connected", None)
+        connected = bool(connected_reader()) if callable(connected_reader) else False
+
+        sequence_lock = getattr(self._controller, "_motion_sequence_lock", None)
+        lock_reader = getattr(sequence_lock, "locked", None)
+        if callable(lock_reader):
+            controller_idle = not bool(lock_reader())
+        else:
+            ready_reader = getattr(self._controller, "motion_ready", None)
+            controller_idle = bool(ready_reader()) if callable(ready_reader) else False
+
+        warn = int(status.get("warn", -1))
+        estop = status.get("estop") is True
+        soft_estop = status.get("soft_estop") is True
+        need_clear = status.get("need_clear") is True
+        enabled = status.get("effectively_enabled") is True
+        return {
+            "captured_monotonic_s": time.monotonic(),
+            "joints": joints,
+            "pose": pose,
+            "controller_connected": connected,
+            "controller_enabled": enabled,
+            "warn": warn,
+            "need_clear": need_clear,
+            "estop": estop,
+            "soft_estop": soft_estop,
+            "alarm_clear": warn == 0 and not need_clear,
+            "estop_clear": not estop,
+            "soft_estop_clear": not soft_estop,
+            "controller_idle": controller_idle,
+            "mode": str(status.get("mode") or "?"),
         }
 
     def _record_point(self, name: str) -> None:
@@ -567,6 +993,7 @@ class ActionWorker(QThread):
                 "Rz_deg": pose[5],
             },
             "camera_position": camera,
+            "controller_safety": dict(state["controller_safety"]),
         }
         if self._repeatable:
             point["collection_round"] = self._collection_round
@@ -723,6 +1150,563 @@ class ActionWorker(QThread):
         self._save_manifest()
         self.video_saved.emit(str(self._output_dir / metadata["filename"]))
 
+    @staticmethod
+    def _runtime_move_limits(step: dict) -> dict:
+        keys = (
+            "anchor_robot_xy_mm",
+            "local_extent_mm",
+            "domain_margin_mm",
+            "required_j3_mm",
+            "required_rz_deg",
+            "max_xy_step_norm_mm",
+            "max_xy_axis_mm",
+            "j3_tolerance_mm",
+            "rz_tolerance_deg",
+            "target_rz_tolerance_deg",
+            "max_sequential_transient_rz_deg",
+            "precompensate_rz",
+            "enforce_sequential_intermediate_domain",
+            "max_state_drift_xy_mm",
+            "max_state_drift_joint",
+            "max_sequential_transient_xy_mm",
+            "move_tolerance",
+            "proposal_max_age_s",
+            "fk_pose_xy_tolerance_mm",
+        )
+        return {key: step[key] for key in keys}
+
+    @staticmethod
+    def _runtime_controller_gates(state: dict) -> dict[str, bool]:
+        return {
+            "controller_connected": state.get("controller_connected") is True,
+            "controller_enabled": state.get("controller_enabled") is True,
+            "alarm_clear": state.get("alarm_clear") is True,
+            "estop_clear": state.get("estop_clear") is True,
+            "soft_estop_clear": state.get("soft_estop_clear") is True,
+            "controller_idle": state.get("controller_idle") is True,
+            "worker_not_stopped": True,
+        }
+
+    @staticmethod
+    def _runtime_state_drift(
+        displayed: dict,
+        fresh: dict,
+    ) -> tuple[float, float]:
+        displayed_pose = _vector_values(displayed.get("pose"), 6, "displayed.pose")
+        fresh_pose = _vector_values(fresh.get("pose"), 6, "fresh.pose")
+        displayed_joints = _joint_values(
+            displayed.get("joints"), "displayed.joints"
+        )
+        fresh_joints = _joint_values(fresh.get("joints"), "fresh.joints")
+        xy_drift = math.hypot(
+            fresh_pose[0] - displayed_pose[0],
+            fresh_pose[1] - displayed_pose[1],
+        )
+        joint_drift = max(
+            abs(actual - previous)
+            for actual, previous in zip(fresh_joints, displayed_joints)
+        )
+        return float(xy_drift), float(joint_drift)
+
+    @staticmethod
+    def _audit_runtime_target(
+        current_state: dict,
+        target_joints: Sequence[float],
+        step: dict,
+    ) -> dict:
+        """Call the shared, controller-free kinematic safety audit."""
+
+        from scara.pipeline.xy_correction_planner import (
+            audit_fixed_rz_xy_target,
+        )
+
+        audit = audit_fixed_rz_xy_target(
+            current_state["joints"],
+            current_state["pose"],
+            target_joints,
+            anchor_robot_xy_mm=step["anchor_robot_xy_mm"],
+            local_extent_mm=step["local_extent_mm"],
+            domain_margin_mm=step["domain_margin_mm"],
+            required_j3_mm=step["required_j3_mm"],
+            j3_tolerance_mm=step["j3_tolerance_mm"],
+            required_rz_deg=step["required_rz_deg"],
+            rz_tolerance_deg=step["rz_tolerance_deg"],
+            max_xy_step_norm_mm=step["max_xy_step_norm_mm"],
+            max_xy_axis_mm=step["max_xy_axis_mm"],
+            max_sequential_transient_xy_mm=step[
+                "max_sequential_transient_xy_mm"
+            ],
+            target_rz_tolerance_deg=step["target_rz_tolerance_deg"],
+            max_sequential_transient_rz_deg=step[
+                "max_sequential_transient_rz_deg"
+            ],
+            precompensate_rz=step["precompensate_rz"],
+            enforce_sequential_intermediate_domain=step[
+                "enforce_sequential_intermediate_domain"
+            ],
+        )
+        closure_gate = (audit.get("gates") or {}).get(
+            "controller_pose_matches_fk"
+        )
+        if isinstance(closure_gate, dict):
+            try:
+                closure = float(closure_gate.get("actual"))
+            except (TypeError, ValueError, OverflowError):
+                closure = math.inf
+            closure_gate["passed"] = bool(
+                math.isfinite(closure)
+                and closure <= step["fk_pose_xy_tolerance_mm"] + 1e-12
+            )
+            closure_gate["limit"] = (
+                f"<={step['fk_pose_xy_tolerance_mm']:.3f} mm"
+            )
+            audit["passed"] = all(
+                isinstance(gate, dict) and gate.get("passed") is True
+                for gate in (audit.get("gates") or {}).values()
+            )
+        return audit
+
+    def _runtime_move_joints(self, step: dict) -> None:
+        """Pause for one supervised target and execute it only after re-audit."""
+
+        if step["request_key"] == STAGE7B_RUNTIME_REQUEST_KEY:
+            runtime_label = "单点有限闭环"
+        elif step["request_key"] == FULL_TRAY_GEOMETRY_REQUEST_KEY:
+            runtime_label = "全盘定位Stage3毫米几何修正"
+        else:
+            runtime_label = "Stage7A"
+        displayed_state = self._read_runtime_motion_state(
+            f"{step['name']} 提案前检查"
+        )
+        self._runtime_move_request_sequence += 1
+        request_id = (
+            f"runtime-move-{self._runtime_move_request_sequence:03d}-"
+            f"{time.monotonic_ns()}"
+        )
+        requested_monotonic_s = time.monotonic()
+        request = {
+            "schema_version": 1,
+            "request_id": request_id,
+            "request_key": step["request_key"],
+            "target_name": step["target_name"],
+            "name": step["name"],
+            "requested_at": datetime.now().astimezone().isoformat(
+                timespec="milliseconds"
+            ),
+            "requested_monotonic_s": requested_monotonic_s,
+            "calibration_sha256": step["calibration_sha256"],
+            "fine_calibration_sha256": step.get("fine_calibration_sha256", ""),
+            "limits": self._runtime_move_limits(step),
+            "controller_state": displayed_state,
+            "external_safety_gates": {
+                **self._runtime_controller_gates(displayed_state),
+                "camera_fresh": False,
+                "operator_consent": False,
+            },
+        }
+        audit_entry: dict = {
+            "request_id": request_id,
+            "request_key": step["request_key"],
+            "target_name": step["target_name"],
+            "name": step["name"],
+            "status": "awaiting_operator_decision",
+            "request": request,
+        }
+        self._manifest.setdefault("runtime_moves", []).append(audit_entry)
+        self._save_manifest()
+
+        with self._runtime_move_response_lock:
+            self._runtime_move_pending_request_id = request_id
+            self._runtime_move_response = None
+            self._runtime_move_response_event.clear()
+        self.progress.emit(f"{step['name']}：等待{runtime_label}计算与确认")
+        self.runtime_move_joints_requested.emit(
+            _json_safe_mapping(request, "runtime_move_joints request")
+        )
+
+        try:
+            while not self._runtime_move_response_event.wait(0.1):
+                if self._stop_requested.is_set():
+                    audit_entry["status"] = "stopped_while_waiting"
+                    self._save_manifest()
+                    raise RuntimeError("动作已取消")
+            if self._stop_requested.is_set():
+                audit_entry["status"] = "stopped_while_waiting"
+                self._save_manifest()
+                raise RuntimeError("动作已取消")
+            with self._runtime_move_response_lock:
+                raw_response = self._runtime_move_response
+            response = _json_safe_mapping(
+                raw_response,
+                "runtime_move_joints response",
+            )
+            audit_entry["response"] = response
+            audit_entry["responded_at"] = datetime.now().astimezone().isoformat(
+                timespec="milliseconds"
+            )
+
+            if str(response.get("request_id") or "") != request_id:
+                raise RuntimeError(f"{runtime_label}响应request_id不匹配，已拒绝运动")
+            decision = str(response.get("decision") or "").strip().lower()
+            allowed_decisions = {"approve", "decline", "abort"}
+            if step["request_key"] == STAGE7B_RUNTIME_REQUEST_KEY:
+                allowed_decisions.add("complete")
+            if decision not in allowed_decisions:
+                raise RuntimeError(
+                    "运行时响应decision必须是" + "/".join(sorted(allowed_decisions))
+                )
+            audit_entry["operator_decision"] = decision
+            if decision == "complete":
+                if str(response.get("calibration_sha256") or "").upper() != step["calibration_sha256"]:
+                    raise RuntimeError(f"{runtime_label}完成响应的宽域Jacobian hash不匹配")
+                if str(response.get("fine_calibration_sha256") or "").upper() != step["fine_calibration_sha256"]:
+                    raise RuntimeError(f"{runtime_label}完成响应的精细Jacobian hash不匹配")
+                audit_entry["status"] = "session_completed_no_motion"
+                audit_entry["completion_reason"] = str(
+                    response.get("reason") or f"{runtime_label}达到终止条件"
+                )
+                self._runtime_session_complete = True
+                self._save_manifest()
+                self.progress.emit(f"{step['name']}：{runtime_label}已到达，正常结束且不再运动")
+                return
+            if decision == "decline":
+                audit_entry["status"] = "declined_no_motion"
+                self._save_manifest()
+                self.progress.emit(f"{step['name']}：人员拒绝，本步不运动")
+                return
+            if decision == "abort":
+                audit_entry["status"] = "aborted_no_motion"
+                self._save_manifest()
+                raise RuntimeError(
+                    str(response.get("reason") or f"{runtime_label}运行时终止任务")
+                )
+
+            response_hash = str(
+                response.get("calibration_sha256") or ""
+            ).strip().upper()
+            if response_hash != step["calibration_sha256"]:
+                raise RuntimeError(f"{runtime_label}响应使用的Jacobian hash与任务锁定值不一致")
+            proposal = _json_safe_mapping(
+                response.get("proposal"),
+                f"{runtime_label} proposal",
+            )
+            if proposal.get("motion_authorized") is not True:
+                raise RuntimeError(f"{runtime_label} proposal未明确授权单步运动")
+            if not str(proposal.get("proposal_id") or "").strip():
+                raise RuntimeError(f"{runtime_label} proposal缺少proposal_id")
+            if str(proposal.get("target_name") or "") != step["target_name"]:
+                raise RuntimeError(f"{runtime_label} proposal目标不是本任务锁定的P22")
+            audit_step = step
+            if step["request_key"] == STAGE7B_RUNTIME_REQUEST_KEY:
+                tier = str(proposal.get("model_tier") or "")
+                if tier not in {"coarse_task11", "fine_task9"}:
+                    raise RuntimeError(f"{runtime_label} proposal缺少有效的两级模型标识")
+                if str(proposal.get("wide_calibration_sha256") or "").upper() != step["calibration_sha256"]:
+                    raise RuntimeError(f"{runtime_label}宽域Jacobian hash与任务锁定值不一致")
+                if str(proposal.get("fine_calibration_sha256") or "").upper() != step["fine_calibration_sha256"]:
+                    raise RuntimeError(f"{runtime_label}精细Jacobian hash与任务锁定值不一致")
+                audit_step = dict(step)
+                if tier == "fine_task9":
+                    audit_step.update(
+                        local_extent_mm=2.0,
+                        domain_margin_mm=0.2,
+                        max_xy_step_norm_mm=min(step["max_xy_step_norm_mm"], 0.25),
+                        max_xy_axis_mm=min(step["max_xy_axis_mm"], 0.25),
+                        max_sequential_transient_xy_mm=min(
+                            step["max_sequential_transient_xy_mm"], 0.50
+                        ),
+                    )
+            proposal_command_xy = _vector_values(
+                (proposal.get("calculation") or {}).get(
+                    "commanded_correction_xy_mm"
+                ),
+                2,
+                f"{runtime_label} proposal commanded_correction_xy_mm",
+            )
+            target_joints = _joint_values(
+                response.get("target_joints"),
+                f"{runtime_label} target_joints",
+            )
+
+            displayed_target_audit = self._audit_runtime_target(
+                displayed_state,
+                target_joints,
+                audit_step,
+            )
+            audit_entry["displayed_kinematic_audit"] = displayed_target_audit
+            if displayed_target_audit.get("passed") is not True:
+                failed = [
+                    name
+                    for name, gate in (
+                        displayed_target_audit.get("gates") or {}
+                    ).items()
+                    if not isinstance(gate, dict) or gate.get("passed") is not True
+                ]
+                raise RuntimeError(
+                    f"{runtime_label}目标未通过显示状态下的独立审计："
+                    + (", ".join(failed) if failed else "未知门")
+                )
+            displayed_step_xy = _vector_values(
+                displayed_target_audit.get("step_xy_mm"),
+                2,
+                f"{runtime_label} displayed step_xy_mm",
+            )
+            command_mismatch = math.hypot(
+                displayed_step_xy[0] - proposal_command_xy[0],
+                displayed_step_xy[1] - proposal_command_xy[1],
+            )
+            audit_entry["proposal_target_command_mismatch_mm"] = (
+                command_mismatch
+            )
+            if command_mismatch > 0.002:
+                raise RuntimeError(
+                    f"{runtime_label}目标关节与已显示的XY修正不一致"
+                    f"（差值{command_mismatch:.4f}mm）"
+                )
+
+            proposal_age_s = time.monotonic() - requested_monotonic_s
+            audit_entry["proposal_age_s_at_revalidation"] = proposal_age_s
+            if (
+                proposal_age_s < 0.0
+                or proposal_age_s > audit_step["proposal_max_age_s"]
+            ):
+                raise RuntimeError(
+                    f"{runtime_label}提案已过期（{proposal_age_s:.2f}s > "
+                    f"{audit_step['proposal_max_age_s']:.2f}s）"
+                )
+
+            fresh_state = self._read_runtime_motion_state(
+                f"{step['name']} 下发前重新检查"
+            )
+            audit_entry["fresh_controller_state"] = fresh_state
+            fresh_gates = self._runtime_controller_gates(fresh_state)
+            audit_entry["fresh_controller_gates"] = fresh_gates
+            failed_controller = [
+                name for name, passed in fresh_gates.items() if not passed
+            ]
+            if self._stop_requested.is_set():
+                failed_controller.append("worker_not_stopped")
+            if failed_controller:
+                raise RuntimeError(
+                    f"{runtime_label}下发前控制器安全门失败："
+                    + ", ".join(sorted(set(failed_controller)))
+                )
+
+            xy_drift, joint_drift = self._runtime_state_drift(
+                displayed_state,
+                fresh_state,
+            )
+            audit_entry["state_drift_since_display"] = {
+                "xy_mm": xy_drift,
+                "maximum_joint_deg_or_mm": joint_drift,
+            }
+            if xy_drift > audit_step["max_state_drift_xy_mm"] + 1e-12:
+                raise RuntimeError(
+                    f"{runtime_label}确认期间机械臂XY变化{xy_drift:.4f}mm，旧提案已作废"
+                )
+            if joint_drift > audit_step["max_state_drift_joint"] + 1e-12:
+                raise RuntimeError(
+                    f"{runtime_label}确认期间关节变化{joint_drift:.4f}，旧提案已作废"
+                )
+
+            kinematic_audit = self._audit_runtime_target(
+                fresh_state,
+                target_joints,
+                audit_step,
+            )
+            audit_entry["fresh_kinematic_audit"] = kinematic_audit
+            if kinematic_audit.get("passed") is not True:
+                failed = [
+                    name
+                    for name, gate in (kinematic_audit.get("gates") or {}).items()
+                    if not isinstance(gate, dict) or gate.get("passed") is not True
+                ]
+                raise RuntimeError(
+                    f"{runtime_label}候选关节目标安全审计失败："
+                    + (", ".join(failed) if failed else "未知门")
+                )
+
+            precompensation = kinematic_audit.get("rz_precompensation")
+            if audit_step["precompensate_rz"]:
+                if not isinstance(precompensation, dict):
+                    raise RuntimeError(f"{runtime_label}缺少J4 Rz预补偿审计数据")
+                precompensation_target = _joint_values(
+                    precompensation.get("target_joints"),
+                    f"{runtime_label} Rz precompensation target_joints",
+                )
+                precompensation_delta = abs(
+                    float(precompensation.get("delta_j4_deg"))
+                )
+                precompensation_required = bool(
+                    precompensation_delta > audit_step["move_tolerance"] + 1e-12
+                )
+            else:
+                precompensation_target = list(fresh_state["joints"])
+                precompensation_delta = 0.0
+                precompensation_required = False
+            audit_entry["rz_precompensation"] = {
+                **(dict(precompensation) if isinstance(precompensation, dict) else {}),
+                "required_by_tolerance": precompensation_required,
+                "move_tolerance_deg": audit_step["move_tolerance"],
+                "executed": False,
+            }
+            # Persist the complete authorization evidence before the first
+            # physical command.  A crash or emergency stop therefore cannot
+            # leave an unaudited movement behind.
+            audit_entry["status"] = (
+                "authorized_pending_rz_precompensation"
+                if precompensation_required
+                else "authorized_pending_motion"
+            )
+            audit_entry["target_joints"] = target_joints
+            audit_entry["proposal"] = proposal
+            self._save_manifest()
+
+            motion_start_state = fresh_state
+            if precompensation_required:
+                audit_entry["physical_motion_started"] = True
+                if not self._controller.goto_joints_sync(
+                    f"{step['name']} / J4 Rz预补偿",
+                    precompensation_target,
+                    should_stop=self._stop_requested.is_set,
+                    tolerance=audit_step["move_tolerance"],
+                ):
+                    audit_entry["status"] = "rz_precompensation_failed"
+                    self._save_manifest()
+                    raise RuntimeError(f"{runtime_label} J4 Rz预补偿运动失败")
+
+                precompensated_state = self._read_runtime_motion_state(
+                    f"{step['name']} J4 Rz预补偿后检查"
+                )
+                audit_entry["rz_precompensation"]["executed"] = True
+                audit_entry["rz_precompensation"]["final_controller_state"] = (
+                    precompensated_state
+                )
+                precompensation_controller_gates = self._runtime_controller_gates(
+                    precompensated_state
+                )
+                precompensation_controller_gates["worker_not_stopped"] = (
+                    not self._stop_requested.is_set()
+                )
+                audit_entry["rz_precompensation"]["controller_gates"] = (
+                    precompensation_controller_gates
+                )
+                if not all(precompensation_controller_gates.values()):
+                    audit_entry["status"] = "rz_precompensation_verification_failed"
+                    self._save_manifest()
+                    raise RuntimeError(f"{runtime_label} J4 Rz预补偿后控制器安全门失败")
+                precompensation_joint_error = max(
+                    abs(actual - target)
+                    for actual, target in zip(
+                        precompensated_state["joints"], precompensation_target
+                    )
+                )
+                audit_entry["rz_precompensation"]["joint_error_max"] = (
+                    precompensation_joint_error
+                )
+                if precompensation_joint_error > audit_step["move_tolerance"] + 1e-12:
+                    audit_entry["status"] = "rz_precompensation_verification_failed"
+                    self._save_manifest()
+                    raise RuntimeError(
+                        f"{runtime_label} J4 Rz预补偿到位误差"
+                        f"{precompensation_joint_error:.4f}超过容差"
+                    )
+                post_precompensation_audit = self._audit_runtime_target(
+                    precompensated_state,
+                    target_joints,
+                    audit_step,
+                )
+                audit_entry["post_precompensation_kinematic_audit"] = (
+                    post_precompensation_audit
+                )
+                if post_precompensation_audit.get("passed") is not True:
+                    audit_entry["status"] = "rz_precompensation_verification_failed"
+                    self._save_manifest()
+                    raise RuntimeError(
+                        f"{runtime_label} J4 Rz预补偿后XY目标运动学复核失败"
+                    )
+                motion_start_state = precompensated_state
+                audit_entry["status"] = (
+                    "rz_precompensation_completed_pending_xy_motion"
+                )
+                self._save_manifest()
+
+            audit_entry["physical_motion_started"] = True
+            if not self._controller.goto_joints_sync(
+                step["name"],
+                target_joints,
+                should_stop=self._stop_requested.is_set,
+                tolerance=audit_step["move_tolerance"],
+            ):
+                audit_entry["status"] = "motion_failed"
+                self._save_manifest()
+                raise RuntimeError(f"移动到 {step['name']} 失败")
+
+            final_state = self._read_runtime_motion_state(
+                f"{step['name']} 到位后检查"
+            )
+            audit_entry["final_controller_state"] = final_state
+            final_controller_gates = self._runtime_controller_gates(final_state)
+            final_controller_gates["worker_not_stopped"] = (
+                not self._stop_requested.is_set()
+            )
+            audit_entry["final_controller_gates"] = final_controller_gates
+            failed_final_controller = [
+                name
+                for name, passed in final_controller_gates.items()
+                if not passed
+            ]
+            if failed_final_controller:
+                audit_entry["status"] = "final_verification_failed"
+                self._save_manifest()
+                raise RuntimeError(
+                    f"{runtime_label}到位后控制器安全门失败："
+                    + ", ".join(sorted(failed_final_controller))
+                )
+            final_joint_error = max(
+                abs(actual - target)
+                for actual, target in zip(final_state["joints"], target_joints)
+            )
+            audit_entry["final_joint_error_max"] = final_joint_error
+            if final_joint_error > audit_step["move_tolerance"] + 1e-12:
+                audit_entry["status"] = "final_verification_failed"
+                self._save_manifest()
+                raise RuntimeError(
+                    f"{runtime_label}最终关节误差{final_joint_error:.4f}超过容差"
+                )
+            final_audit = self._audit_runtime_target(
+                motion_start_state,
+                final_state["joints"],
+                audit_step,
+            )
+            audit_entry["actual_motion_audit"] = final_audit
+            if final_audit.get("passed") is not True:
+                audit_entry["status"] = "final_verification_failed"
+                self._save_manifest()
+                raise RuntimeError(f"{runtime_label}实际到位状态未通过运动安全复核")
+            audit_entry["status"] = "motion_completed"
+            self._save_manifest()
+        except Exception as exc:
+            if audit_entry.get("status") not in {
+                "declined_no_motion",
+                "aborted_no_motion",
+                "stopped_while_waiting",
+                "motion_failed",
+                "final_verification_failed",
+                "rz_precompensation_failed",
+                "rz_precompensation_verification_failed",
+            }:
+                audit_entry["status"] = "rejected_no_motion"
+            audit_entry["failure_reason"] = str(exc) or exc.__class__.__name__
+            self._save_manifest()
+            raise
+        finally:
+            with self._runtime_move_response_lock:
+                if self._runtime_move_pending_request_id == request_id:
+                    self._runtime_move_pending_request_id = None
+                self._runtime_move_response = None
+                self._runtime_move_response_event.clear()
+
     def _assert_joints(self, step: dict) -> None:
         state = self._read_state(step["name"])
         errors = [
@@ -756,6 +1740,8 @@ class ActionWorker(QThread):
             self._assert_joints(step)
         elif kind == "move_joints":
             self._move_joints(step)
+        elif kind == "runtime_move_joints":
+            self._runtime_move_joints(step)
         elif kind == "move_xyzr":
             if not self._controller.move_xyzr_sync(
                 step["name"],
@@ -800,6 +1786,7 @@ class ActionWorker(QThread):
                 "points": [],
                 "photos": [],
                 "videos": [],
+                "runtime_moves": [],
             }
             if self._repeatable:
                 self._manifest["collection_mode"] = "operator_repeated_scan"
@@ -849,6 +1836,8 @@ class ActionWorker(QThread):
                         continue
                     break
                 self._execute_step(step)
+                if self._runtime_session_complete:
+                    break
                 index += 1
 
             ok = True

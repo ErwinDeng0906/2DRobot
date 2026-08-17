@@ -4,6 +4,34 @@
 `src/scara/vision/xy_image_jacobian_runtime.py` 的算法和安全约定。阶段 5 的目的，是在
 固定观察高度和固定吸盘朝向下，测量机械臂世界坐标 XY 小命令会怎样改变相机1中的槽位误差。
 
+## 0. 2026-08-17 多槽Task9入口与文件规则
+
+动态演示顶部新增 `local Jacobian标定`。按钮读取并锁定左侧当前 `目标槽`，随后把槽名同时
+传给 `build_action_for_target(target)` 和 `create_task_runtime_for_target(target)`。Task9的数学、
+九点偏移和质量门不变；每份结果的 `anchor_target_name` 与 `valid_target_names` 只允许包含
+本次所选槽。
+
+P22继续优先使用已经示教和实测的 `P22 float`，且既有正式文件不移动：
+
+```text
+src/scara/calib/camera1_xy_image_jacobian.json
+```
+
+P22以外的槽由Stage2托盘几何计算世界XY锚点，以P00固定观察姿态锁定J3、绝对Rz和IK分支，
+因此不要求手工teach全部36槽。通过全部质量门后按槽号安装：
+
+```text
+src/scara/calib/Jacobians/camera1_xy_image_jacobian_P00.json
+...
+src/scara/calib/Jacobians/camera1_xy_image_jacobian_P55.json
+```
+
+Task9仍是局部标定，不负责跨托盘移动。按按钮前必须先把机械臂置于所选槽的计算锚点；第一条
+`assert_joints`不通过时不会开始九点运动。P22保留原先不超过1mm的Cartesian中转，其他槽使用
+不超过0.5mm的中转；所有槽都在动作生成阶段按真实J1→J2→J3→J4顺序审计瞬时XY和Rz。
+动态演示切换槽位时也只加载该槽对应文件；缺文件、目标名/hash或质量门不匹配时只显示像素
+误差，不提供局部修正量。`单点有限闭环`的运动授权范围没有因本次标定入口而自动扩大。
+
 ## 1. 已锁定的输入
 
 阶段 5 不重新标定阶段 1–4，而是读取并锁定：

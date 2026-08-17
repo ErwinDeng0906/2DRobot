@@ -20,4 +20,11 @@
   Δimage_error = J·Δrobot_world_XY，并进行条件数与按offset留一验证。
 - scara.vision.handeye_interaction：阶段6，只读加载阶段3/4/5结果，投影指定
   槽中心、A–H重投影角点和Tray坐标轴；不导入任何运动后端。
+- scara.vision.wide_xy_jacobian / wide_xy_jacobian_runtime：Task11的P22
+  20×20mm宽域训练、独立验证与正式模型安装。
+- scara.vision.stage7b_servo / stage7b_session：阶段7B两级有限闭环的纯计算、
+  响应门与证据保存；控制器仍只由UI的ActionWorker持有。
+- scara.vision.full_tray_positioning / full_tray_positioning_session：由P00/
+  Stage2几何生成全盘粗目标，结合Stage3/4计算托盘系毫米误差、执行一次几何
+  修正，并强制切换到Task9 P22局部精修；视觉会话仍不持有控制器。
 """
