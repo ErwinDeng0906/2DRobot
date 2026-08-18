@@ -12,6 +12,14 @@
 - scara.vision.tray_pose_estimator：阶段3，检测A–H并由RANSAC/重投影质量门
   求当前相机帧的 ^C T_T。
 - scara.vision.tray_pose_tracker：对合格的 ^C T_T 做跳变拒绝和时间滤波。
+- scara.vision.slot_marker_observation：把固定的36槽和槽内marker ID投影到
+  当前图像，并做多尺度marker观测；旧layout不再参与运行时槽位排序。
+- scara.vision.wafer_shape_quality：在透视校正后的单槽小图中判断硅片颜色、
+  正方形程度、中心偏移、相对角度、重叠边线和多连通块。
+- scara.vision.tray_occupancy：按完整视野、明确遮挡、硅片和marker证据给出
+  empty/occupied/warning/abnormal/out_of_view/occluded/unknown，信息不足不猜测。
+- scara.vision.tray_vision_fusion：组合Tray位姿、36槽投影、槽内marker和硅片
+  质量；位姿质量门失败时停止，并提供点击像素到Tray毫米坐标的只读转换。
 - scara.vision.suction_target_calibration：阶段4固定工作平面吸盘target的
   多帧SE(3)聚合、稳健拟合和按位置留一验证（纯数值模块）。
 - scara.vision.suction_target_calibration_runtime：Task8逐图调用阶段3、回写
