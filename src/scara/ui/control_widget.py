@@ -209,6 +209,7 @@ class ScaraControlWidget(QWidget):
         self._cam: Optional[ScaraCameraThread] = None
         self._camera_connection_counts: dict[int, int] = {}
         self._handeye_dialog: Optional[QDialog] = None
+        self._wafer_transfer_dialog: Optional[QDialog] = None
         self._handeye_motion_mode: Optional[str] = None
         self._handeye_state_lock = threading.Lock()
         self._handeye_controller_connected = False
@@ -384,7 +385,14 @@ class ScaraControlWidget(QWidget):
         self._btn_handeye_demo.setToolTip(
             "打开相机1实时槽位/吸盘误差叠加；只计算，不移动机械臂"
         )
-        g.addWidget(self._btn_handeye_demo)
+        self._btn_wafer_transfer = _btn("转移视觉", "primary")
+        self._btn_wafer_transfer.setToolTip(
+            "相机1实时托盘/硅片分析、点击锁定槽位和吸盘距离跟踪；只计算"
+        )
+        row = QHBoxLayout()
+        row.addWidget(self._btn_handeye_demo)
+        row.addWidget(self._btn_wafer_transfer)
+        g.addLayout(row)
         handeye_note = QLabel(
             "目标槽下拉选择、Stage3实时位姿、A–H重投影、局部Jacobian标定和XY定位。"
             "动态演示与验证按钮只计算，机械臂不会移动。"
@@ -528,6 +536,7 @@ class ScaraControlWidget(QWidget):
         self._btn_import_action.clicked.connect(self._choose_action_file)
         self._btn_run_action.clicked.connect(self._on_run_action)
         self._btn_handeye_demo.clicked.connect(self._open_handeye_demo)
+        self._btn_wafer_transfer.clicked.connect(self._open_wafer_transfer)
         self._btn_cam.clicked.connect(self._toggle_camera)
         self._btn_snap.clicked.connect(self._snapshot)
         self._ctrl.connection_changed.connect(self._on_conn)
@@ -700,6 +709,8 @@ class ScaraControlWidget(QWidget):
 
         # Task capture needs exclusive camera access.  Refuse to proceed until
         # the read-only Stage3 monitor has really exited.
+        if not self._close_wafer_transfer_dialog("开始任务前"):
+            return
         if not self._close_handeye_dialog("开始任务前"):
             return
 
@@ -1025,6 +1036,8 @@ class ScaraControlWidget(QWidget):
             self._append("相机", "动作执行期间不能切换或断开相机", _D["warning"])
             return
         if self._cam is not None:
+            if not self._close_wafer_transfer_dialog("断开相机前"):
+                return
             if not self._close_handeye_dialog("断开相机前"):
                 return
             if not self._stop_camera_thread("断开相机"):
@@ -1055,6 +1068,8 @@ class ScaraControlWidget(QWidget):
         if self._handeye_dialog is not None:
             self._handeye_dialog.raise_()
             self._handeye_dialog.activateWindow()
+            return
+        if not self._close_wafer_transfer_dialog("打开手眼动态演示前"):
             return
 
         required_source = 1
@@ -1102,8 +1117,64 @@ class ScaraControlWidget(QWidget):
             QMessageBox.critical(self, "动态演示启动失败", str(exc))
             self._append("手眼交互", f"启动失败：{exc}", _D["error"])
 
+    def _open_wafer_transfer(self) -> None:
+        """Open the observation-only, target-locked wafer transfer view."""
+
+        if self._action_worker is not None and self._action_worker.isRunning():
+            self._append(
+                "转移视觉",
+                "任务执行期间相机被任务独占，不能打开转移视觉",
+                _D["warning"],
+            )
+            return
+        if self._wafer_transfer_dialog is not None:
+            self._wafer_transfer_dialog.raise_()
+            self._wafer_transfer_dialog.activateWindow()
+            return
+        if not self._close_handeye_dialog("打开转移视觉前"):
+            return
+
+        required_source = 1
+        if self._cam is not None and self._cam.source_index != required_source:
+            if not self._stop_camera_thread("切换到转移视觉相机1"):
+                return
+            self._btn_cam.setText("连接相机")
+            self._cam_lbl.setText("正在切换到转移视觉所需的相机1……")
+        if self._cam is None:
+            self._cam_idx.setValue(required_source)
+            self._toggle_camera()
+        if self._cam is None or self._cam.source_index != required_source:
+            self._append("转移视觉", "相机1启动失败", _D["error"])
+            return
+
+        try:
+            from scara.ui.wafer_transfer_dialog import WaferTransferDialog
+
+            project_root = Path(__file__).resolve().parents[3]
+            dialog = WaferTransferDialog(
+                project_root,
+                self._cam,
+                self,
+                robot_state_provider=self._handeye_robot_state_snapshot,
+            )
+            self._wafer_transfer_dialog = dialog
+            dialog.destroyed.connect(self._on_wafer_transfer_dialog_destroyed)
+            dialog.show()
+            self._append(
+                "转移视觉",
+                "实时转移视觉已打开：只计算，不移动机械臂",
+                _D["success"],
+            )
+        except Exception as exc:
+            self._wafer_transfer_dialog = None
+            QMessageBox.critical(self, "转移视觉启动失败", str(exc))
+            self._append("转移视觉", f"启动失败：{exc}", _D["error"])
+
     def _on_handeye_dialog_destroyed(self, _object=None) -> None:
         self._handeye_dialog = None
+
+    def _on_wafer_transfer_dialog_destroyed(self, _object=None) -> None:
+        self._wafer_transfer_dialog = None
 
     def _restore_one_shot_action(self) -> None:
         """Restore the task-panel import after a hand-eye one-shot Task9 run."""
@@ -1471,6 +1542,36 @@ class ScaraControlWidget(QWidget):
         )
         return False
 
+    def _close_wafer_transfer_dialog(
+        self,
+        context: str,
+        final_wait_ms: int = 0,
+    ) -> bool:
+        """Close only after the transfer-vision monitor has exited."""
+
+        dialog = self._wafer_transfer_dialog
+        if dialog is None:
+            return True
+        try:
+            closed = bool(dialog.close())
+            if not closed and final_wait_ms > 0:
+                monitor = getattr(dialog, "monitor", None)
+                stop = getattr(monitor, "stop", None)
+                if callable(stop) and bool(stop(final_wait_ms)):
+                    closed = bool(dialog.close())
+        except RuntimeError:
+            self._wafer_transfer_dialog = None
+            return True
+        if closed:
+            self._wafer_transfer_dialog = None
+            return True
+        self._append(
+            "转移视觉",
+            f"{context}被暂停：后台视觉线程仍在退出，请稍候重试",
+            _D["warning"],
+        )
+        return False
+
     def _stop_camera_thread(self, context: str, timeout_ms: int = 1500) -> bool:
         """Stop DirectShow acquisition and retain the object on timeout."""
 
@@ -1490,9 +1591,12 @@ class ScaraControlWidget(QWidget):
     def _on_camera_error(self, message: str) -> None:
         self._append("相机", message, _D["error"])
         # Keep the dialog referenced if a Stage3 call has not exited yet.
+        transfer_closed = self._close_wafer_transfer_dialog(
+            "相机异常后的窗口关闭"
+        )
         dialog_closed = self._close_handeye_dialog("相机异常后的窗口关闭")
         camera_stopped = self._stop_camera_thread("相机异常后的线程关闭")
-        if not dialog_closed or not camera_stopped:
+        if not transfer_closed or not dialog_closed or not camera_stopped:
             self._btn_cam.setText("相机停止中")
             return
         self._btn_cam.setText("连接相机")
@@ -1838,6 +1942,10 @@ class ScaraControlWidget(QWidget):
             # Give an in-flight Stage3 call one longer bounded chance to finish.
             # A failed close retains the dialog reference instead of destroying
             # a live QThread.
+            self._close_wafer_transfer_dialog(
+                "退出清理",
+                final_wait_ms=15000,
+            )
             self._close_handeye_dialog("退出清理", final_wait_ms=15000)
             # 主界面退出：先断 snrobot，再清零 DO，避免抢连接导致关泵失败。
             if self._owns:

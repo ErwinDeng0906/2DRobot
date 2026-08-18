@@ -3,6 +3,9 @@
 日期：2026-08-18
 开发分支：`agent/integrate-tray-marker-vision`
 
+基于本层实现的实时目标锁定、`W←T` 登记和转移状态机见
+`docs/wafer_transfer_runtime_integration.md`。
+
 ## 1. 合并范围
 
 旧版工具完整保留在 `tools/tray_marker_detector_v2/`，用于结果对照和回归。新代码没有修改 SCARA 控制、ActionWorker、拍照流程或任何机械臂运动接口。
