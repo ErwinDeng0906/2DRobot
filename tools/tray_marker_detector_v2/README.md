@@ -1,5 +1,11 @@
 # Tray Marker Detector V2
 
+> 分层合并说明：本目录保留为旧版回归基线。新的毫米坐标、槽位投影、
+> 硅片质量和 fail-closed 融合入口见
+> `src/scara/vision/tray_vision_fusion.py`、`tools/analyze_layered_tray.py` 和
+> `docs/tray_marker_layered_integration.md`。`tray_marker_layout.json` 中新增的
+> `metric_slot_transform=rot270` 固定了旧图像行列与当前 P00...P55 的关系。
+
 This folder keeps the tray marker tool developed for the 6x6 wafer tray.
 It is intentionally kept as a standalone tool first, so it can be added to the
 main 2DRobot repository without changing the SCARA control flow.
