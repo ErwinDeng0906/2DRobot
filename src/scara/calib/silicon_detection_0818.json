@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "profile_name": "silicon_detection_0818",
+  "description": "Camera-1 layered tray silicon detection and slot-state parameters. Production consumers load this file instead of embedding a separate parameter set.",
+  "tray_vision": {
+    "slot_half_extent_mm": 11.5,
+    "canonical_patch_size": 192
+  },
+  "wafer_quality": {
+    "lower_hsv": [110, 20, 20],
+    "upper_hsv": [165, 255, 255],
+    "dark_value_max": 155,
+    "dark_saturation_min": 28,
+    "minimum_area_ratio": 0.075,
+    "maximum_area_ratio": 0.82,
+    "minimum_chromatic_fraction": 0.62,
+    "normal_max_aspect_ratio": 1.2,
+    "warning_max_aspect_ratio": 1.38,
+    "normal_min_rectangularity": 0.8,
+    "warning_min_rectangularity": 0.64,
+    "normal_min_solidity": 0.9,
+    "warning_min_solidity": 0.82,
+    "normal_max_center_offset_ratio": 0.18,
+    "warning_max_center_offset_ratio": 0.32,
+    "normal_max_yaw_deg": 8.0,
+    "warning_max_yaw_deg": 15.0,
+    "maximum_normal_side_ratio": 0.86,
+    "stacked_second_component_ratio": 0.1,
+    "stacked_internal_line_count": 2,
+    "stacked_internal_line_score": 0.45,
+    "irregular_outline_vertex_threshold": 6,
+    "irregular_outline_max_solidity": 0.95,
+    "stacked_second_quadrilateral_ratio": 0.18,
+    "stacked_quadrilateral_max_aspect_ratio": 1.35,
+    "stacked_quadrilateral_min_rectangularity": 0.72,
+    "stacked_quadrilateral_min_solidity": 0.86,
+    "stacked_l_min_leg_ratio": 0.22,
+    "stacked_l_angle_tolerance_deg": 20.0,
+    "slot_boundary_margin_ratio": 0.01
+  },
+  "slot_decision": {
+    "minimum_image_coverage_ratio": 0.9,
+    "explicit_occlusion_ratio": 0.25
+  }
+}

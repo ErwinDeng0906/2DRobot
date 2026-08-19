@@ -554,6 +554,7 @@ def evaluate_handeye_frame(
     jacobian_payload: Optional[Mapping[str, Any]] = None,
     robot_state: Optional[Mapping[str, Any]] = None,
     *,
+    base_annotated_bgr: Optional[np.ndarray] = None,
     alignment_threshold_px: float = 3.0,
     maximum_robot_state_age_s: float = ROBOT_STATE_MAXIMUM_AGE_S,
 ) -> HandEyeEvaluation:
@@ -570,11 +571,16 @@ def evaluate_handeye_frame(
         raise ValueError("maximum_robot_state_age_s must be positive and finite")
 
     raw = tracked.raw
-    annotated = (
-        raw.annotated_image.copy()
-        if raw.annotated_image is not None
-        else np.asarray(frame_bgr).copy()
-    )
+    if base_annotated_bgr is not None:
+        annotated = np.asarray(base_annotated_bgr).copy()
+        if annotated.shape != np.asarray(frame_bgr).shape:
+            raise ValueError("base annotated image must match the camera frame")
+    else:
+        annotated = (
+            raw.annotated_image.copy()
+            if raw.annotated_image is not None
+            else np.asarray(frame_bgr).copy()
+        )
     target_pixel = suction.target_pixel_px
     _draw_cross(annotated, target_pixel, (0, 0, 255))
     cv2.putText(

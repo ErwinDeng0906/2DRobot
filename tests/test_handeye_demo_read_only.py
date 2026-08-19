@@ -33,9 +33,16 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from PyQt6.QtGui import QImage
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QGraphicsView, QMessageBox
 
-from scara.ui.handeye_demo_dialog import HandEyeDemoDialog
+from scara.ui.camera_view import (
+    DIRECTSHOW_EXPOSURE_DEFAULT,
+    DIRECTSHOW_EXPOSURE_MAX,
+    DIRECTSHOW_EXPOSURE_MIN,
+    ScaraCameraThread,
+    _validated_exposure_value,
+)
+from scara.ui.handeye_demo_dialog import CameraImageView, HandEyeDemoDialog
 from scara.vision.handeye_interaction import (
     SuctionTargetModel,
     evaluate_handeye_frame,
@@ -219,6 +226,26 @@ class FakeCamera:
         return None
 
 
+class ExposureCamera(FakeCamera):
+    def __init__(self, *, running: bool = True) -> None:
+        super().__init__(running=running)
+        self.exposure_requests: list[int] = []
+        self.restore_calls = 0
+        self.recovery_calls = 0
+
+    def request_exposure_value(self, exposure: int) -> bool:
+        self.exposure_requests.append(int(exposure))
+        return self.running
+
+    def restore_original_exposure(self) -> bool:
+        self.restore_calls += 1
+        return self.running
+
+    def request_auto_exposure_recovery(self) -> bool:
+        self.recovery_calls += 1
+        return self.running
+
+
 class FrozenPacketCamera(FakeCamera):
     """Return one captured frame forever, with an unchanged sequence number."""
 
@@ -239,10 +266,212 @@ class FrozenPacketCamera(FakeCamera):
 
 
 class ReadOnlySourceAuditTests(unittest.TestCase):
+    def test_hardware_exposure_accepts_only_supported_integer_stops(self) -> None:
+        for value in range(DIRECTSHOW_EXPOSURE_MIN, DIRECTSHOW_EXPOSURE_MAX + 1):
+            self.assertEqual(_validated_exposure_value(value), value)
+            self.assertEqual(_validated_exposure_value(float(value)), value)
+        for invalid in (-14, -5.5, -0.5, 0, float("nan")):
+            with self.assertRaises(ValueError):
+                _validated_exposure_value(invalid)
+
+        camera = ScaraCameraThread(index=1)
+        with self.assertRaises(ValueError):
+            camera.request_exposure_value(-5.5)
+
+    def test_camera_thread_applies_driver_exposure_not_pixel_brightness(self) -> None:
+        class FakeHardwareCapture:
+            def __init__(self) -> None:
+                self.values = {
+                    cv2.CAP_PROP_EXPOSURE: -5.0,
+                    cv2.CAP_PROP_AUTO_EXPOSURE: 0.75,
+                }
+                self.set_calls: list[tuple[int, float]] = []
+
+            def get(self, prop: int) -> float:
+                return float(self.values[prop])
+
+            def set(self, prop: int, value: float) -> bool:
+                self.set_calls.append((prop, float(value)))
+                self.values[prop] = float(value)
+                return True
+
+        camera = ScaraCameraThread(index=1)
+        capture = FakeHardwareCapture()
+        success, _message = camera._apply_hardware_exposure(capture, cv2, -6)
+        self.assertTrue(success)
+        self.assertIn((cv2.CAP_PROP_AUTO_EXPOSURE, 0.25), capture.set_calls)
+        self.assertIn((cv2.CAP_PROP_EXPOSURE, -6.0), capture.set_calls)
+        success, _message = camera._restore_hardware_exposure(capture, cv2)
+        self.assertTrue(success)
+        self.assertIn((cv2.CAP_PROP_AUTO_EXPOSURE, 0.75), capture.set_calls)
+
+    def test_fractional_exposure_is_rejected_before_touching_driver(self) -> None:
+        class FakeHardwareCapture:
+            def __init__(self) -> None:
+                self.values = {
+                    cv2.CAP_PROP_EXPOSURE: -5.0,
+                    cv2.CAP_PROP_AUTO_EXPOSURE: 0.75,
+                }
+                self.set_calls: list[tuple[int, float]] = []
+
+            def get(self, prop: int) -> float:
+                return float(self.values[prop])
+
+            def set(self, prop: int, value: float) -> bool:
+                self.set_calls.append((prop, float(value)))
+                self.values[prop] = float(value)
+                return True
+
+        camera = ScaraCameraThread(index=1)
+        capture = FakeHardwareCapture()
+        with self.assertRaises(ValueError):
+            camera._apply_hardware_exposure(capture, cv2, -5.5)
+        self.assertEqual(capture.set_calls, [])
+
+    def test_fixed_one_auto_mode_readback_does_not_block_integer_exposure(self) -> None:
+        class FixedOneModeCapture:
+            def __init__(self) -> None:
+                self.exposure = -5.0
+                self.set_calls: list[tuple[int, float]] = []
+
+            def get(self, prop: int) -> float:
+                if prop == cv2.CAP_PROP_AUTO_EXPOSURE:
+                    return 1.0
+                return float(self.exposure)
+
+            def set(self, prop: int, value: float) -> bool:
+                self.set_calls.append((prop, float(value)))
+                if prop == cv2.CAP_PROP_EXPOSURE:
+                    self.exposure = float(value)
+                # This driver accepts mode writes but always reads back 1.0.
+                return True
+
+        camera = ScaraCameraThread(index=1)
+        capture = FixedOneModeCapture()
+        success, message = camera._apply_hardware_exposure(capture, cv2, -6)
+        self.assertTrue(success)
+        self.assertEqual(capture.exposure, -6.0)
+        self.assertIn("自动模式读回 1.000 不可靠", message)
+        self.assertIn("稳定后的整数曝光读回确认", message)
+
+    def test_unsupported_minus_one_mode_readback_uses_exposure_as_evidence(self) -> None:
+        class UnsupportedModeReadbackCapture:
+            def __init__(self) -> None:
+                self.exposure = -5.0
+
+            def get(self, prop: int) -> float:
+                if prop == cv2.CAP_PROP_AUTO_EXPOSURE:
+                    return -1.0
+                return float(self.exposure)
+
+            def set(self, prop: int, value: float) -> bool:
+                if prop == cv2.CAP_PROP_EXPOSURE:
+                    self.exposure = float(value)
+                return True
+
+        camera = ScaraCameraThread(index=1)
+        capture = UnsupportedModeReadbackCapture()
+        success, message = camera._apply_hardware_exposure(capture, cv2, -6)
+        self.assertTrue(success)
+        self.assertEqual(capture.exposure, -6.0)
+        self.assertIn("自动模式读回 -1.000 不可靠", message)
+        restored, restore_message = camera._restore_hardware_exposure(capture, cv2)
+        self.assertTrue(restored)
+        self.assertEqual(capture.exposure, -5.0)
+        self.assertIn("已恢复原整数曝光值", restore_message)
+
+    def test_unknown_mode_readback_accepts_default_auto_without_fixed_write(self) -> None:
+        class UnsupportedAutoReadbackCapture:
+            def __init__(self) -> None:
+                self.set_calls: list[tuple[int, float]] = []
+
+            def get(self, prop: int) -> float:
+                if prop == cv2.CAP_PROP_AUTO_EXPOSURE:
+                    return -1.0
+                return -5.0
+
+            def set(self, prop: int, value: float) -> bool:
+                self.set_calls.append((prop, float(value)))
+                return True
+
+            def read(self):
+                return True, np.full((20, 20, 3), 80, dtype=np.uint8)
+
+        camera = ScaraCameraThread(index=1)
+        capture = UnsupportedAutoReadbackCapture()
+        with patch("scara.ui.camera_view.time.sleep", return_value=None):
+            success, message = camera._recover_auto_exposure(capture, cv2)
+        self.assertTrue(success, message)
+        self.assertIn("驱动已接受请求", message)
+        self.assertTrue(camera._original_auto_exposure_enabled)
+        self.assertEqual(
+            [(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)],
+            capture.set_calls,
+        )
+        self.assertFalse(
+            any(prop == cv2.CAP_PROP_EXPOSURE for prop, _value in capture.set_calls)
+        )
+
+    def test_restore_requires_confirmed_auto_mode_instead_of_exposure_only(self) -> None:
+        class AutoRestoreFailureCapture:
+            def __init__(self) -> None:
+                self.values = {
+                    cv2.CAP_PROP_EXPOSURE: -6.0,
+                    cv2.CAP_PROP_AUTO_EXPOSURE: 0.25,
+                }
+
+            def get(self, prop: int) -> float:
+                return float(self.values[prop])
+
+            def set(self, prop: int, value: float) -> bool:
+                if prop == cv2.CAP_PROP_AUTO_EXPOSURE:
+                    return False
+                self.values[prop] = float(value)
+                return True
+
+        camera = ScaraCameraThread(index=1)
+        camera._original_exposure_raw = -5.0
+        camera._original_auto_exposure_raw = 0.75
+        camera._original_auto_exposure_enabled = True
+        success, message = camera._restore_hardware_exposure(
+            AutoRestoreFailureCapture(), cv2
+        )
+        self.assertFalse(success)
+        self.assertIn("未确认恢复自动曝光", message)
+
+    def test_black_frame_guard_rolls_back_to_auto_exposure(self) -> None:
+        class BlackAfterManualCapture:
+            def __init__(self) -> None:
+                self.values = {
+                    cv2.CAP_PROP_EXPOSURE: -5.0,
+                    cv2.CAP_PROP_AUTO_EXPOSURE: 0.75,
+                }
+                self.set_calls: list[tuple[int, float]] = []
+
+            def get(self, prop: int) -> float:
+                return float(self.values[prop])
+
+            def set(self, prop: int, value: float) -> bool:
+                self.set_calls.append((prop, float(value)))
+                self.values[prop] = float(value)
+                return True
+
+            def read(self):
+                return True, np.zeros((20, 20, 3), dtype=np.uint8)
+
+        camera = ScaraCameraThread(index=1)
+        camera._last_frame = np.full((20, 20, 3), 120, dtype=np.uint8)
+        capture = BlackAfterManualCapture()
+        success, message = camera._apply_hardware_exposure(capture, cv2, -6)
+        self.assertFalse(success)
+        self.assertIn("画面亮度异常下降", message)
+        self.assertEqual(capture.values[cv2.CAP_PROP_AUTO_EXPOSURE], 0.75)
+
     def test_read_only_modules_do_not_import_or_call_motion_backends(self) -> None:
         sources = [
             SRC / "scara/ui/handeye_demo_dialog.py",
             SRC / "scara/vision/handeye_interaction.py",
+            SRC / "scara/vision/tray_vision_fusion.py",
         ]
         forbidden_import_fragments = (
             "controller",
@@ -483,6 +712,40 @@ class HandEyeEvaluationTests(unittest.TestCase):
         self.assertIsNone(evaluation.correction_xy_mm)
         self.assertFalse(evaluation.correction_available)
 
+    def test_optional_tray_overlay_is_preserved_under_handeye_drawing(self) -> None:
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        base = np.full_like(frame, (17, 33, 49))
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, 3] = [45.0, 30.0, 500.0]
+        tracked = _tracked_pose(frame, accepted=True, transform=transform)
+        slot_pixel = project_tray_points_from_transform(
+            [self.geometry["slots"]["P22"]], transform, _intrinsics()
+        )[0]
+        evaluation = evaluate_handeye_frame(
+            frame,
+            tracked,
+            "P22",
+            self.geometry,
+            _intrinsics(),
+            _suction(tuple((slot_pixel - np.array([1.0, -1.0])).tolist())),
+            base_annotated_bgr=base,
+        )
+        preserved = np.all(
+            evaluation.annotated_bgr == np.asarray((17, 33, 49)), axis=2
+        )
+        self.assertGreater(int(np.count_nonzero(preserved)), frame.shape[0] * frame.shape[1] // 2)
+
+        with self.assertRaisesRegex(ValueError, "must match"):
+            evaluate_handeye_frame(
+                frame,
+                tracked,
+                "P22",
+                self.geometry,
+                _intrinsics(),
+                _suction(),
+                base_annotated_bgr=np.zeros((10, 10, 3), dtype=np.uint8),
+            )
+
     def _evaluate_domain_case(
         self,
         *,
@@ -590,6 +853,9 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
         geometry_path.write_bytes(
             (SRC / "scara/calib/tray_board_geometry.json").read_bytes()
         )
+        (calib / "silicon_detection_0818.json").write_bytes(
+            (SRC / "scara/calib/silicon_detection_0818.json").read_bytes()
+        )
         intrinsics_path = calib / "camera1_intrinsics.json"
         intrinsics_path.write_text(
             json.dumps(
@@ -634,6 +900,72 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        layout_path = root / "tools/tray_marker_detector_v2/tray_marker_layout.json"
+        layout_path.parent.mkdir(parents=True)
+        layout_path.write_bytes(
+            (
+                PROJECT_ROOT
+                / "tools/tray_marker_detector_v2/tray_marker_layout.json"
+            ).read_bytes()
+        )
+
+    @staticmethod
+    def _tray_result_for_table():
+        slots = []
+        summary = {
+            "empty": 34,
+            "empty_unread_marker": 0,
+            "occupied": 1,
+            "warning": 0,
+            "stacked": 0,
+            "outside_slot": 0,
+            "stacked_outside_slot": 0,
+            "out_of_view": 0,
+            "occluded": 0,
+            "unknown": 1,
+            "analyzed": 36,
+        }
+        for row in range(6):
+            for column in range(6):
+                slot_name = f"P{row}{column}"
+                if slot_name == "P00":
+                    state = "occupied"
+                    offset = (1.25, -0.50)
+                    distance = math.hypot(*offset)
+                    wafer = SimpleNamespace(
+                        found=True,
+                        flags=("synthetic_wafer",),
+                        confidence=0.91,
+                    )
+                elif slot_name == "P01":
+                    state = "unknown"
+                    offset = None
+                    distance = None
+                    wafer = SimpleNamespace(found=False, flags=(), confidence=0.0)
+                else:
+                    state = "empty"
+                    offset = None
+                    distance = None
+                    wafer = SimpleNamespace(found=False, flags=(), confidence=0.0)
+                slots.append(
+                    SimpleNamespace(
+                        projection=SimpleNamespace(slot_key=slot_name),
+                        decision=SimpleNamespace(
+                            state=SimpleNamespace(value=state),
+                            reason=f"synthetic {state}",
+                            flags=(),
+                        ),
+                        wafer=wafer,
+                        wafer_offset_T_mm=offset,
+                        wafer_offset_distance_mm=distance,
+                    )
+                )
+        return SimpleNamespace(
+            quality_passed=True,
+            failure_reason=None,
+            slots=tuple(slots),
+            summary=summary,
+        )
 
     def test_dialog_has_36_targets_local_calibration_and_positioning_buttons(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -648,6 +980,33 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                     {f"P{row}{column}" for row in range(6) for column in range(6)},
                 )
                 self.assertIn("只计算", dialog.windowTitle())
+                self.assertEqual(dialog.slot_table.rowCount(), 36)
+                self.assertEqual(dialog.slot_table.columnCount(), 6)
+                self.assertEqual(
+                    dialog.silicon_parameter_button.text(), "硅片判定参数"
+                )
+                self.assertEqual(
+                    dialog.silicon_detection_config.source_path.name,
+                    "silicon_detection_0818.json",
+                )
+                self.assertEqual(
+                    [
+                        dialog.slot_table.horizontalHeaderItem(column).text()
+                        for column in range(6)
+                    ],
+                    [
+                        "槽位",
+                        "占用",
+                        "ΔX_T (mm)",
+                        "ΔY_T (mm)",
+                        "距离 (mm)",
+                        "硅片状态",
+                    ],
+                )
+                self.assertEqual(
+                    [dialog.slot_table.item(row, 0).text() for row in range(36)],
+                    [f"P{row}{column}" for row in range(6) for column in range(6)],
+                )
                 safety_labels = [
                     label.text() for label in dialog.findChildren(type(dialog.status))
                 ]
@@ -661,7 +1020,7 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                 self.assertEqual(dialog.stage7b_button.text(), "单点有限闭环")
                 self.assertEqual(dialog.full_tray_button.text(), "全盘定位")
                 controls = None
-                root_layout = dialog.layout()
+                root_layout = dialog.content_layout
                 for index in range(root_layout.count()):
                     candidate = root_layout.itemAt(index).layout()
                     if candidate is not None and any(
@@ -716,12 +1075,302 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                 self.assertIsNone(dialog._last_evaluation)
                 self.assertIsNone(dialog._last_evaluation_at)
                 self.assertIn("判断已失效", dialog.status.text())
+                self.assertTrue(
+                    all(
+                        dialog.slot_table.item(row, 1).text() == "不确定"
+                        and dialog.slot_table.item(row, 5).text() == "当前帧不可用"
+                        for row in range(36)
+                    )
+                )
             finally:
                 camera.running = False
                 dialog.close()
                 self.app.processEvents()
                 if dialog.monitor.isRunning():
                     self.assertTrue(dialog.monitor.stop())
+
+    def test_hardware_exposure_slider_uses_integer_directshow_stops_and_restores(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._temporary_project(root)
+            camera = ExposureCamera(running=True)
+            dialog = HandEyeDemoDialog(root, camera)
+            try:
+                self.assertTrue(dialog.monitor.stop())
+                self.assertTrue(dialog.exposure_slider.isEnabled())
+                self.assertEqual(
+                    dialog.exposure_slider.minimum(), DIRECTSHOW_EXPOSURE_MIN
+                )
+                self.assertEqual(
+                    dialog.exposure_slider.maximum(), DIRECTSHOW_EXPOSURE_MAX
+                )
+                self.assertEqual(
+                    dialog.exposure_slider.value(), DIRECTSHOW_EXPOSURE_DEFAULT
+                )
+                dialog.exposure_apply_button.click()
+                self.assertEqual(
+                    camera.exposure_requests[-1], DIRECTSHOW_EXPOSURE_DEFAULT
+                )
+
+                dialog.exposure_slider.setValue(-7)
+                self.assertEqual(camera.exposure_requests[-1], -7)
+                self.assertEqual(dialog.exposure_value_label.text(), "-7")
+
+                dialog.exposure_slider.setValue(-13)
+                self.assertEqual(camera.exposure_requests[-1], -13)
+                self.assertEqual(dialog.exposure_value_label.text(), "-13")
+
+                dialog.exposure_slider.setValue(-1)
+                self.assertEqual(camera.exposure_requests[-1], -1)
+                self.assertEqual(dialog.exposure_value_label.text(), "-1")
+
+            finally:
+                dialog.close()
+                self.app.processEvents()
+
+            self.assertEqual(camera.restore_calls, 1)
+
+    def test_silicon_parameter_picker_hot_switches_valid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._temporary_project(root)
+            selected = root / "lower_side_ratio.json"
+            payload = json.loads(
+                (
+                    root / "src/scara/calib/silicon_detection_0818.json"
+                ).read_text(encoding="utf-8-sig")
+            )
+            payload["profile_name"] = "lower_side_ratio"
+            payload["wafer_quality"]["maximum_normal_side_ratio"] = 0.77
+            selected.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            camera = FakeCamera(running=True)
+            dialog = HandEyeDemoDialog(root, camera)
+            try:
+                self.assertTrue(dialog.monitor.stop())
+                with patch(
+                    "scara.ui.handeye_demo_dialog.QFileDialog.getOpenFileName",
+                    return_value=(str(selected), "JSON 配置文件 (*.json)"),
+                ):
+                    dialog.silicon_parameter_button.click()
+                self.assertEqual(
+                    dialog.silicon_detection_config.profile_name,
+                    "lower_side_ratio",
+                )
+                self.assertAlmostEqual(
+                    dialog.monitor._tray_vision_config.wafer_quality.maximum_normal_side_ratio,
+                    0.77,
+                )
+                self.assertIn("lower_side_ratio.json", dialog.silicon_parameter_label.text())
+                self.assertIsNone(dialog._last_image)
+            finally:
+                dialog.close()
+                self.app.processEvents()
+
+            reopened = HandEyeDemoDialog(root, camera)
+            try:
+                self.assertTrue(reopened.monitor.stop())
+                self.assertEqual(
+                    "lower_side_ratio",
+                    reopened.silicon_detection_config.profile_name,
+                )
+                self.assertAlmostEqual(
+                    0.77,
+                    reopened.monitor._tray_vision_config.wafer_quality.maximum_normal_side_ratio,
+                )
+                self.assertIn(
+                    "默认：lower_side_ratio.json",
+                    reopened.silicon_parameter_label.text(),
+                )
+            finally:
+                reopened.close()
+                self.app.processEvents()
+
+    def test_invalid_silicon_parameter_file_keeps_current_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._temporary_project(root)
+            selected = root / "partial.json"
+            selected.write_text('{"schema_version": 1}', encoding="utf-8")
+            camera = FakeCamera(running=True)
+            dialog = HandEyeDemoDialog(root, camera)
+            try:
+                self.assertTrue(dialog.monitor.stop())
+                before = dialog.silicon_detection_config
+                with (
+                    patch(
+                        "scara.ui.handeye_demo_dialog.QFileDialog.getOpenFileName",
+                        return_value=(str(selected), "JSON 配置文件 (*.json)"),
+                    ),
+                    patch(
+                        "scara.ui.handeye_demo_dialog.QMessageBox.critical"
+                    ) as critical,
+                ):
+                    dialog.silicon_parameter_button.click()
+                self.assertIs(dialog.silicon_detection_config, before)
+                critical.assert_called_once()
+                self.assertFalse(
+                    (root / "local_silicon_detection_selection.json").exists()
+                )
+            finally:
+                dialog.close()
+                self.app.processEvents()
+
+    def test_hardware_exposure_recovery_button_forces_auto_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._temporary_project(root)
+            camera = ExposureCamera(running=True)
+            dialog = HandEyeDemoDialog(root, camera)
+            try:
+                self.assertTrue(dialog.monitor.stop())
+                dialog.exposure_slider.setValue(-7)
+                dialog.exposure_recovery_button.click()
+                self.assertEqual(camera.recovery_calls, 1)
+                self.assertEqual(dialog.exposure_slider.value(), -7)
+                self.assertEqual(
+                    dialog.exposure_value_label.text(),
+                    "AUTO（恢复中）",
+                )
+            finally:
+                dialog.close()
+                self.app.processEvents()
+            self.assertEqual(camera.restore_calls, 0)
+
+    def test_slot_table_maps_occupancy_offsets_and_states(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._temporary_project(root)
+            camera = FakeCamera(running=True)
+            dialog = HandEyeDemoDialog(root, camera)
+            try:
+                self.assertTrue(dialog.monitor.stop())
+                dialog._update_slot_table(self._tray_result_for_table())
+                p00 = dialog._slot_row_by_name["P00"]
+                self.assertEqual(dialog.slot_table.item(p00, 1).text(), "是")
+                self.assertEqual(dialog.slot_table.item(p00, 2).text(), "+1.25")
+                self.assertEqual(dialog.slot_table.item(p00, 3).text(), "-0.50")
+                self.assertEqual(
+                    dialog.slot_table.item(p00, 4).text(),
+                    f"{math.hypot(1.25, -0.50):.2f}",
+                )
+                self.assertEqual(dialog.slot_table.item(p00, 5).text(), "正常")
+                self.assertIn(
+                    "synthetic_wafer", dialog.slot_table.item(p00, 5).toolTip()
+                )
+
+                p01 = dialog._slot_row_by_name["P01"]
+                self.assertEqual(dialog.slot_table.item(p01, 1).text(), "不确定")
+                self.assertEqual(dialog.slot_table.item(p01, 2).text(), "—")
+                self.assertEqual(dialog.slot_table.item(p01, 5).text(), "证据不足")
+
+                p02 = dialog._slot_row_by_name["P02"]
+                self.assertEqual(dialog.slot_table.item(p02, 1).text(), "否")
+                self.assertEqual(dialog.slot_table.item(p02, 5).text(), "空槽")
+                self.assertIn("占用=1", dialog.tray_summary.text())
+                self.assertIn("空槽=34", dialog.tray_summary.text())
+                self.assertIn("不确定=1", dialog.tray_summary.text())
+            finally:
+                camera.running = False
+                dialog.close()
+                self.app.processEvents()
+
+    def test_camera1_preview_uses_full_width_aspect_ratio_and_zoom_pan(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._temporary_project(root)
+            camera = FakeCamera(running=True)
+            dialog = HandEyeDemoDialog(root, camera)
+            try:
+                self.assertTrue(dialog.monitor.stop())
+                dialog.resize(1200, 960)
+                dialog.show()
+                image = QImage(1280, 720, QImage.Format.Format_RGB888)
+                image.fill(0x305070)
+                dialog._last_image = image
+                dialog._refresh_preview()
+                self.app.processEvents()
+
+                self.assertIsInstance(dialog.preview, CameraImageView)
+                self.assertTrue(dialog.preview.has_image)
+                self.assertLessEqual(dialog.width() - dialog.preview.width(), 40)
+                expected_height = dialog.preview.heightForWidth(
+                    dialog.preview.width()
+                )
+                self.assertLessEqual(abs(dialog.preview.height() - expected_height), 2)
+                self.assertEqual(dialog.zoom_label.text(), "100%")
+                self.assertTrue(dialog.zoom_in_button.isEnabled())
+                self.assertFalse(dialog.zoom_out_button.isEnabled())
+
+                dialog.zoom_in_button.click()
+                self.app.processEvents()
+                self.assertAlmostEqual(dialog.preview.zoom_factor, 1.25)
+                self.assertEqual(dialog.zoom_label.text(), "125%")
+                self.assertEqual(
+                    dialog.preview.dragMode(),
+                    QGraphicsView.DragMode.ScrollHandDrag,
+                )
+                center_before = dialog.preview.mapToScene(
+                    dialog.preview.viewport().rect().center()
+                )
+                dialog._last_image = image.copy()
+                dialog._refresh_preview()
+                center_after = dialog.preview.mapToScene(
+                    dialog.preview.viewport().rect().center()
+                )
+                self.assertAlmostEqual(center_before.x(), center_after.x(), places=3)
+                self.assertAlmostEqual(center_before.y(), center_after.y(), places=3)
+                self.assertAlmostEqual(dialog.preview.zoom_factor, 1.25)
+
+                dialog.zoom_fit_button.click()
+                self.app.processEvents()
+                self.assertAlmostEqual(dialog.preview.zoom_factor, 1.0)
+                self.assertEqual(
+                    dialog.preview.dragMode(), QGraphicsView.DragMode.NoDrag
+                )
+                dialog._invalidate_current("synthetic stale frame")
+                self.assertFalse(dialog.preview.has_image)
+                self.assertFalse(dialog.zoom_in_button.isEnabled())
+            finally:
+                camera.running = False
+                dialog.close()
+                self.app.processEvents()
+
+    def test_slot_table_distinguishes_stacked_outside_and_both(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._temporary_project(root)
+            camera = FakeCamera(running=True)
+            dialog = HandEyeDemoDialog(root, camera)
+            try:
+                self.assertTrue(dialog.monitor.stop())
+                result = self._tray_result_for_table()
+                expected = {
+                    "P02": ("stacked", "叠片"),
+                    "P03": ("outside_slot", "槽外"),
+                    "P04": ("stacked_outside_slot", "叠片且槽外"),
+                }
+                result.summary["empty"] -= len(expected)
+                for slot_name, (state, _text) in expected.items():
+                    result.summary[state] = 1
+                    analysis = next(
+                        slot
+                        for slot in result.slots
+                        if slot.projection.slot_key == slot_name
+                    )
+                    analysis.decision.state.value = state
+                dialog._update_slot_table(result)
+                for slot_name, (_state, text) in expected.items():
+                    row = dialog._slot_row_by_name[slot_name]
+                    self.assertEqual(dialog.slot_table.item(row, 1).text(), "是")
+                    self.assertEqual(dialog.slot_table.item(row, 5).text(), text)
+                self.assertIn("占用=4", dialog.tray_summary.text())
+                self.assertIn("叠片=1、槽外=1、叠片且槽外=1", dialog.tray_summary.text())
+            finally:
+                camera.running = False
+                dialog.close()
+                self.app.processEvents()
 
     def test_validation_cannot_pass_without_current_robot_domain(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

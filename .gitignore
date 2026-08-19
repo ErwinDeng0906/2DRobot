@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .env
 local_config.toml
+local_silicon_detection_selection.json
 scara_config.toml
 Trajectory Photos/
 scara_snap_*.jpg
