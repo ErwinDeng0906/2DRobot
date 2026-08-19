@@ -1,9 +1,12 @@
 """Wafer shape and stacking evidence in a perspective-normalized slot patch.
 
 The thresholds originate from ``tray_marker_detector_v2`` but are expressed
-as ratios of a canonical slot patch.  This removes camera zoom and most
-perspective effects before measuring square shape, centre offset and yaw.
-Black/white ArUco patterns are excluded by requiring chromatic wafer pixels.
+as ratios of a canonical slot patch.  Production entry points load their
+``WaferQualityConfig`` from ``src/scara/calib/silicon_detection_0818.json``;
+the dataclass defaults remain API/test fallbacks.  Perspective normalization
+removes camera zoom and most perspective effects before measuring square
+shape, centre offset and yaw.  Black/white ArUco patterns are excluded by
+requiring chromatic wafer pixels.
 """
 
 from __future__ import annotations
@@ -39,6 +42,15 @@ class WaferQualityConfig:
     stacked_second_component_ratio: float = 0.10
     stacked_internal_line_count: int = 2
     stacked_internal_line_score: float = 0.45
+    irregular_outline_vertex_threshold: int = 6
+    irregular_outline_max_solidity: float = 0.95
+    stacked_second_quadrilateral_ratio: float = 0.18
+    stacked_quadrilateral_max_aspect_ratio: float = 1.35
+    stacked_quadrilateral_min_rectangularity: float = 0.72
+    stacked_quadrilateral_min_solidity: float = 0.86
+    stacked_l_min_leg_ratio: float = 0.22
+    stacked_l_angle_tolerance_deg: float = 20.0
+    slot_boundary_margin_ratio: float = 0.010
 
 
 DEFAULT_WAFER_QUALITY = WaferQualityConfig()
@@ -65,15 +77,19 @@ class WaferObservation:
     chromatic_fraction: float
     confidence: float
     flags: tuple[str, ...]
+    outside_slot: bool
+    secondary_boxes_patch_px: tuple[tuple[tuple[float, float], ...], ...]
 
     @classmethod
-    def not_found(cls, *flags: str) -> "WaferObservation":
+    def not_found(
+        cls, *flags: str, area_ratio: float = 0.0
+    ) -> "WaferObservation":
         return cls(
             found=False,
             quality="none",
             center_patch_px=None,
             box_patch_px=(),
-            area_ratio=0.0,
+            area_ratio=float(area_ratio),
             side_ratio=0.0,
             aspect_ratio=0.0,
             rectangularity=0.0,
@@ -88,6 +104,8 @@ class WaferObservation:
             chromatic_fraction=0.0,
             confidence=0.0,
             flags=tuple(flags),
+            outside_slot=False,
+            secondary_boxes_patch_px=(),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -111,6 +129,11 @@ class WaferObservation:
             "chromatic_fraction": self.chromatic_fraction,
             "confidence": self.confidence,
             "flags": list(self.flags),
+            "outside_slot": self.outside_slot,
+            "secondary_boxes_patch_px": [
+                [list(point) for point in box]
+                for box in self.secondary_boxes_patch_px
+            ],
         }
 
 
@@ -203,7 +226,7 @@ def _internal_line_evidence(
     object_mask: np.ndarray,
     center: tuple[float, float],
     side_px: float,
-) -> tuple[int, float]:
+) -> tuple[int, float, tuple[tuple[float, float, float, float], ...]]:
     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY) if patch.ndim == 3 else patch
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(gray, 28, 96)
@@ -219,8 +242,9 @@ def _internal_line_evidence(
         maxLineGap=max(4, int(round(0.06 * side_px))),
     )
     if lines is None:
-        return 0, 0.0
+        return 0, 0.0, ()
     lengths: list[float] = []
+    accepted_lines: list[tuple[float, float, float, float]] = []
     cx, cy = center
     for raw_line in lines:
         x0, y0, x1, y1 = (float(value) for value in raw_line.reshape(4))
@@ -228,7 +252,162 @@ def _internal_line_evidence(
         midpoint_distance = math.hypot(0.5 * (x0 + x1) - cx, 0.5 * (y0 + y1) - cy)
         if midpoint_distance <= 0.36 * side_px:
             lengths.append(length)
-    return len(lengths), float(sum(lengths) / max(side_px, 1.0))
+            accepted_lines.append((x0, y0, x1, y1))
+    return (
+        len(lengths),
+        float(sum(lengths) / max(side_px, 1.0)),
+        tuple(accepted_lines),
+    )
+
+
+def _line_intersection(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> Optional[tuple[np.ndarray, float, float]]:
+    p = np.asarray(first[:2], dtype=np.float64)
+    r = np.asarray(first[2:], dtype=np.float64) - p
+    q = np.asarray(second[:2], dtype=np.float64)
+    s = np.asarray(second[2:], dtype=np.float64) - q
+    cross = float(r[0] * s[1] - r[1] * s[0])
+    if abs(cross) <= 1e-6:
+        return None
+    delta = q - p
+    t = float((delta[0] * s[1] - delta[1] * s[0]) / cross)
+    u = float((delta[0] * r[1] - delta[1] * r[0]) / cross)
+    return p + t * r, t, u
+
+
+def _l_shaped_overlap_box(
+    lines: tuple[tuple[float, float, float, float], ...],
+    object_mask: np.ndarray,
+    side_px: float,
+    config: WaferQualityConfig,
+) -> Optional[tuple[tuple[float, float], ...]]:
+    """Confirm two distinct internal edges that form a physical L corner.
+
+    Parallel specular boundaries and duplicate Hough fragments cannot satisfy
+    this test.  The returned quadrilateral is the inferred second-wafer outline
+    used by the camera overlay.
+    """
+    best: Optional[tuple[float, tuple[tuple[float, float], ...]]] = None
+    minimum_leg = float(config.stacked_l_min_leg_ratio) * side_px
+    lower_angle = 90.0 - float(config.stacked_l_angle_tolerance_deg)
+    upper_angle = 90.0 + float(config.stacked_l_angle_tolerance_deg)
+    extension_slack = 0.12
+    height, width = object_mask.shape[:2]
+    for index, first in enumerate(lines):
+        first_vector = np.asarray(first[2:], dtype=np.float64) - np.asarray(first[:2], dtype=np.float64)
+        first_length = float(np.linalg.norm(first_vector))
+        if first_length < minimum_leg:
+            continue
+        first_angle = math.degrees(math.atan2(float(first_vector[1]), float(first_vector[0]))) % 180.0
+        for second in lines[index + 1 :]:
+            second_vector = np.asarray(second[2:], dtype=np.float64) - np.asarray(second[:2], dtype=np.float64)
+            second_length = float(np.linalg.norm(second_vector))
+            if second_length < minimum_leg:
+                continue
+            second_angle = math.degrees(math.atan2(float(second_vector[1]), float(second_vector[0]))) % 180.0
+            angle_difference = abs(first_angle - second_angle)
+            angle_difference = min(angle_difference, 180.0 - angle_difference)
+            if not lower_angle <= angle_difference <= upper_angle:
+                continue
+            intersection = _line_intersection(first, second)
+            if intersection is None:
+                continue
+            corner, first_t, second_t = intersection
+            if not (
+                -extension_slack <= first_t <= 1.0 + extension_slack
+                and -extension_slack <= second_t <= 1.0 + extension_slack
+            ):
+                continue
+            corner_x = int(round(float(corner[0])))
+            corner_y = int(round(float(corner[1])))
+            if not (0 <= corner_x < width and 0 <= corner_y < height):
+                continue
+            if object_mask[corner_y, corner_x] == 0:
+                continue
+            first_endpoints = (np.asarray(first[:2], dtype=np.float64), np.asarray(first[2:], dtype=np.float64))
+            second_endpoints = (np.asarray(second[:2], dtype=np.float64), np.asarray(second[2:], dtype=np.float64))
+            first_far = max(first_endpoints, key=lambda point: float(np.linalg.norm(point - corner)))
+            second_far = max(second_endpoints, key=lambda point: float(np.linalg.norm(point - corner)))
+            first_leg = float(np.linalg.norm(first_far - corner))
+            second_leg = float(np.linalg.norm(second_far - corner))
+            if min(first_leg, second_leg) < minimum_leg:
+                continue
+            first_direction = (first_far - corner) / max(first_leg, 1e-6)
+            second_direction = (second_far - corner) / max(second_leg, 1e-6)
+            inferred_side = min(
+                0.95 * side_px,
+                max(first_leg, second_leg, 0.65 * side_px),
+            )
+            box = np.asarray(
+                [
+                    corner,
+                    corner + first_direction * inferred_side,
+                    corner + (first_direction + second_direction) * inferred_side,
+                    corner + second_direction * inferred_side,
+                ],
+                dtype=np.float64,
+            )
+            score = min(first_leg, second_leg) + 0.25 * max(first_leg, second_leg)
+            serialized = tuple(tuple(float(value) for value in point) for point in box)
+            if best is None or score > best[0]:
+                best = (score, serialized)
+    return None if best is None else best[1]
+
+
+def _second_quadrilateral_box(
+    mask: np.ndarray,
+    primary_mask: np.ndarray,
+    primary_area: float,
+    side_px: float,
+    config: WaferQualityConfig,
+) -> Optional[tuple[tuple[float, float], ...]]:
+    """Return a separate square-like chromatic component, never a thin glare split."""
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if count <= 2:
+        return None
+    overlap_by_label = [
+        int(np.count_nonzero((labels == label) & (primary_mask > 0)))
+        for label in range(count)
+    ]
+    primary_label = int(np.argmax(overlap_by_label))
+    candidates: list[tuple[float, tuple[tuple[float, float], ...]]] = []
+    for label in range(1, count):
+        if label == primary_label:
+            continue
+        area = float(stats[label, cv2.CC_STAT_AREA])
+        if area / max(primary_area, 1.0) < config.stacked_second_quadrilateral_ratio:
+            continue
+        component_mask = np.where(labels == label, 255, 0).astype(np.uint8)
+        contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        component_contour = max(contours, key=cv2.contourArea)
+        contour_area = float(cv2.contourArea(component_contour))
+        rect = cv2.minAreaRect(component_contour)
+        raw_width, raw_height = (float(value) for value in rect[1])
+        short_side = min(raw_width, raw_height)
+        long_side = max(raw_width, raw_height)
+        if short_side < 0.24 * side_px:
+            continue
+        aspect = long_side / max(short_side, 1.0)
+        rectangularity = contour_area / max(short_side * long_side, 1.0)
+        hull_area = max(float(cv2.contourArea(cv2.convexHull(component_contour))), 1.0)
+        solidity = contour_area / hull_area
+        if (
+            aspect > config.stacked_quadrilateral_max_aspect_ratio
+            or rectangularity < config.stacked_quadrilateral_min_rectangularity
+            or solidity < config.stacked_quadrilateral_min_solidity
+        ):
+            continue
+        box = cv2.boxPoints(rect).astype(np.float64)
+        serialized = tuple(tuple(float(value) for value in point) for point in box)
+        candidates.append((area, serialized))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
 def analyze_wafer_patch(
@@ -252,7 +431,10 @@ def analyze_wafer_patch(
     area = float(cv2.contourArea(contour))
     area_ratio = area / max(patch_area, 1.0)
     if area_ratio < config.minimum_area_ratio or area_ratio > config.maximum_area_ratio:
-        return WaferObservation.not_found("candidate_area_out_of_range")
+        return WaferObservation.not_found(
+            "candidate_area_out_of_range",
+            area_ratio=float(area_ratio),
+        )
 
     rect = cv2.minAreaRect(contour)
     (cx, cy), (raw_width, raw_height), _rect_angle = rect
@@ -287,8 +469,37 @@ def analyze_wafer_patch(
     second_component_ratio = (
         float(components[1][0] / max(components[0][0], 1.0)) if len(components) > 1 else 0.0
     )
-    internal_count, internal_score = _internal_line_evidence(
+    internal_count, internal_score, internal_lines = _internal_line_evidence(
         bgr, contour_mask, (float(cx), float(cy)), max(short_side, long_side)
+    )
+    l_shaped_box = _l_shaped_overlap_box(
+        internal_lines,
+        contour_mask,
+        max(short_side, long_side),
+        config,
+    )
+    second_quadrilateral_box = _second_quadrilateral_box(
+        mask,
+        primary_mask,
+        area,
+        max(short_side, long_side),
+        config,
+    )
+    secondary_boxes: tuple[tuple[tuple[float, float], ...], ...] = ()
+    if second_quadrilateral_box is not None:
+        secondary_boxes = (second_quadrilateral_box,)
+    elif l_shaped_box is not None:
+        secondary_boxes = (l_shaped_box,)
+    boundary_margin = max(
+        1.0,
+        float(config.slot_boundary_margin_ratio) * float(min(height, width)),
+    )
+    contour_points = contour.reshape(-1, 2).astype(np.float64)
+    outside_slot = bool(
+        np.min(contour_points[:, 0]) <= boundary_margin
+        or np.max(contour_points[:, 0]) >= float(width - 1) - boundary_margin
+        or np.min(contour_points[:, 1]) <= boundary_margin
+        or np.max(contour_points[:, 1]) >= float(height - 1) - boundary_margin
     )
 
     flags: list[str] = []
@@ -329,12 +540,25 @@ def analyze_wafer_patch(
         severe = True
     if second_component_ratio >= config.stacked_second_component_ratio:
         flags.append("multiple_components")
-        severe = True
+        warning = True
     if internal_count >= config.stacked_internal_line_count and internal_score >= config.stacked_internal_line_score:
         flags.append("internal_overlap_edges")
+        warning = True
+    if l_shaped_box is not None:
+        flags.append("l_shaped_overlap_corner")
+    if second_quadrilateral_box is not None:
+        flags.append("second_quadrilateral")
+    if secondary_boxes:
+        flags.append("stacked_geometry_confirmed")
         severe = True
-    if len(polygon) > 6 and solidity < 0.95:
+    if (
+        len(polygon) > config.irregular_outline_vertex_threshold
+        and solidity < config.irregular_outline_max_solidity
+    ):
         flags.append("irregular_outline")
+        severe = True
+    if outside_slot:
+        flags.append("outside_slot")
         severe = True
 
     quality = "abnormal" if severe else "warning" if warning else "normal"
@@ -361,6 +585,8 @@ def analyze_wafer_patch(
         chromatic_fraction=float(chromatic_fraction),
         confidence=float(max(0.0, min(1.0, confidence))),
         flags=tuple(flags),
+        outside_slot=outside_slot,
+        secondary_boxes_patch_px=secondary_boxes,
     )
 
 

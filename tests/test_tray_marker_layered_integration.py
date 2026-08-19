@@ -6,7 +6,9 @@ import json
 import math
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -23,6 +25,8 @@ from scara.vision.slot_marker_observation import (
     build_slot_projections,
     detect_aruco_observations,
     load_slot_marker_layout,
+    patch_points_to_image,
+    warp_slot_patch,
 )
 from scara.vision.tray_occupancy import SlotState, decide_slot_state
 from scara.vision.tray_pose_estimator import (
@@ -36,8 +40,15 @@ from scara.vision.tray_vision_fusion import (
     TrayVisionAnalyzer,
     image_pixel_to_tray_plane,
     nearest_metric_slot,
+    tracked_pose_estimate,
+    wafer_patch_center_to_tray,
 )
-from scara.vision.wafer_shape_quality import WaferObservation, analyze_wafer_patch
+from scara.vision.tray_pose_tracker import TrackedTrayPose
+from scara.vision.wafer_shape_quality import (
+    DEFAULT_WAFER_QUALITY,
+    WaferObservation,
+    analyze_wafer_patch,
+)
 
 
 GEOMETRY_PATH = PROJECT_ROOT / "src/scara/calib/tray_board_geometry.json"
@@ -176,6 +187,13 @@ class SlotProjectionTests(unittest.TestCase):
 
 
 class WaferQualityTests(unittest.TestCase):
+    def test_rejected_oversized_candidate_keeps_measured_area_for_diagnostics(self) -> None:
+        patch = np.full((192, 192, 3), (80, 20, 80), dtype=np.uint8)
+        observation = analyze_wafer_patch(patch)
+        self.assertFalse(observation.found)
+        self.assertIn("candidate_area_out_of_range", observation.flags)
+        self.assertGreater(observation.area_ratio, DEFAULT_WAFER_QUALITY.maximum_area_ratio)
+
     def test_centered_rotated_square_is_normal_and_angle_is_accurate(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
         _draw_square(patch, (96.0, 96.0), 92.0, 6.0, _purple())
@@ -196,6 +214,51 @@ class WaferQualityTests(unittest.TestCase):
             & set(result.flags),
             result.flags,
         )
+        self.assertNotIn("stacked_geometry_confirmed", result.flags)
+        self.assertEqual(result.secondary_boxes_patch_px, ())
+
+    def test_reflection_edges_are_warning_not_confirmed_stacking(self) -> None:
+        patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(patch, (96.0, 96.0), 92.0, 0.0, _purple(140, 100))
+        cv2.rectangle(patch, (91, 50), (101, 142), _purple(140, 220), -1)
+        result = analyze_wafer_patch(patch)
+        self.assertTrue(result.found)
+        self.assertEqual(result.quality, "warning", result.flags)
+        self.assertIn("internal_overlap_edges", result.flags)
+        self.assertNotIn("stacked_geometry_confirmed", result.flags)
+        self.assertEqual(result.secondary_boxes_patch_px, ())
+
+    def test_l_corner_confirms_stacking_and_produces_second_outline(self) -> None:
+        patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(patch, (78.0, 78.0), 80.0, 0.0, _purple(140, 100))
+        _draw_square(patch, (112.0, 112.0), 80.0, 0.0, _purple(150, 145))
+        result = analyze_wafer_patch(patch)
+        self.assertTrue(result.found)
+        self.assertEqual(result.quality, "abnormal", result.flags)
+        self.assertIn("l_shaped_overlap_corner", result.flags)
+        self.assertIn("stacked_geometry_confirmed", result.flags)
+        self.assertEqual(len(result.secondary_boxes_patch_px), 1)
+        self.assertEqual(len(result.secondary_boxes_patch_px[0]), 4)
+
+    def test_second_quadrilateral_confirms_stacking(self) -> None:
+        patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(patch, (58.0, 96.0), 52.0, 0.0, _purple(140, 100))
+        _draw_square(patch, (134.0, 96.0), 52.0, 0.0, _purple(150, 145))
+        result = analyze_wafer_patch(patch)
+        self.assertTrue(result.found)
+        self.assertIn("second_quadrilateral", result.flags)
+        self.assertIn("stacked_geometry_confirmed", result.flags)
+        self.assertEqual(len(result.secondary_boxes_patch_px), 1)
+        self.assertEqual(len(result.to_json()["secondary_boxes_patch_px"]), 1)
+
+    def test_boundary_crossing_wafer_records_outside_slot_evidence(self) -> None:
+        patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(patch, (170.0, 96.0), 72.0, 0.0, _purple())
+        result = analyze_wafer_patch(patch)
+        self.assertTrue(result.found)
+        self.assertTrue(result.outside_slot)
+        self.assertIn("outside_slot", result.flags)
+        self.assertTrue(result.to_json()["outside_slot"])
 
     def test_black_white_marker_is_not_a_wafer(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
@@ -205,6 +268,97 @@ class WaferQualityTests(unittest.TestCase):
         result = analyze_wafer_patch(patch)
         self.assertFalse(result.found)
         self.assertIn("no_chromatic_candidate", result.flags)
+
+
+class WaferMetricCentreTests(unittest.TestCase):
+    @staticmethod
+    def _projection() -> SlotProjection:
+        return SlotProjection(
+            slot_key="P23",
+            row=2,
+            column=3,
+            center_T_mm=(10.0, 20.0, -2.0),
+            center_px=(320.0, 240.0),
+            polygon_T_mm=(
+                (21.5, 31.5, -2.0),
+                (21.5, 8.5, -2.0),
+                (-1.5, 8.5, -2.0),
+                (-1.5, 31.5, -2.0),
+            ),
+            polygon_px=((200.0, 120.0), (440.0, 120.0), (440.0, 360.0), (200.0, 360.0)),
+            image_coverage_ratio=1.0,
+            projected_area_px=57600.0,
+        )
+
+    def test_patch_centre_to_tray_uses_fixed_metric_orientation(self) -> None:
+        projection = self._projection()
+        center_T, offset_T, distance = wafer_patch_center_to_tray(
+            (120.0, 80.0), projection
+        )
+        expected = np.array(
+            [
+                11.5 * (1.0 - 2.0 * 80.0 / 191.0),
+                11.5 * (1.0 - 2.0 * 120.0 / 191.0),
+            ]
+        )
+        np.testing.assert_allclose(offset_T, expected, atol=1e-12)
+        np.testing.assert_allclose(center_T[:2], np.array([10.0, 20.0]) + expected)
+        self.assertAlmostEqual(distance, float(np.linalg.norm(expected)), places=12)
+
+    def test_fusion_exports_metric_and_image_wafer_centres(self) -> None:
+        image = np.full((720, 1280, 3), 185, dtype=np.uint8)
+        geometry = _geometry()
+        intrinsics = _intrinsics()
+        estimator = TrayBoardPoseEstimator(geometry, intrinsics)
+        provisional_pose = _valid_pose(image)
+        projection = build_slot_projections(
+            geometry, estimator, provisional_pose, image.shape
+        )["P23"]
+        _patch, image_to_patch = warp_slot_patch(image, projection)
+        patch_box = cv2.boxPoints(((120.0, 80.0), (82.0, 82.0), 4.0))
+        image_box = patch_points_to_image(patch_box, image_to_patch)
+        cv2.fillConvexPoly(
+            image,
+            np.round(image_box).astype(np.int32),
+            _purple(),
+            cv2.LINE_AA,
+        )
+        pose = _valid_pose(image)
+        analyzer = TrayVisionAnalyzer(
+            estimator, geometry, load_slot_marker_layout(LAYOUT_PATH)
+        )
+        result = analyzer.analyze(image, pose=pose)
+        analysis = next(
+            slot for slot in result.slots if slot.projection.slot_key == "P23"
+        )
+        self.assertTrue(analysis.wafer.found, analysis.wafer.flags)
+        self.assertIsNotNone(analysis.wafer_center_image_px)
+        self.assertIsNotNone(analysis.wafer_center_T_mm)
+        self.assertIsNotNone(analysis.wafer_offset_T_mm)
+        self.assertIsNotNone(analysis.wafer_offset_distance_mm)
+        expected_image_center = patch_points_to_image(
+            np.asarray([analysis.wafer.center_patch_px], dtype=np.float32),
+            image_to_patch,
+        )[0]
+        np.testing.assert_allclose(
+            analysis.wafer_center_image_px, expected_image_center, atol=0.25
+        )
+        payload = analysis.to_json()
+        self.assertEqual(payload["wafer_center_image_px"], list(analysis.wafer_center_image_px))
+        self.assertEqual(payload["wafer_center_T_mm"], list(analysis.wafer_center_T_mm))
+        self.assertEqual(payload["wafer_offset_T_mm"], list(analysis.wafer_offset_T_mm))
+        self.assertAlmostEqual(
+            payload["wafer_offset_distance_mm"],
+            analysis.wafer_offset_distance_mm,
+        )
+        empty_slot = next(
+            slot for slot in result.slots if slot.projection.slot_key == "P00"
+        )
+        self.assertFalse(empty_slot.wafer.found)
+        self.assertIsNone(empty_slot.wafer_center_image_px)
+        self.assertIsNone(empty_slot.wafer_center_T_mm)
+        self.assertIsNone(empty_slot.wafer_offset_T_mm)
+        self.assertIsNone(empty_slot.wafer_offset_distance_mm)
 
 
 class OccupancyDecisionTests(unittest.TestCase):
@@ -253,6 +407,55 @@ class OccupancyDecisionTests(unittest.TestCase):
         occupied = decide_slot_state(self._projection(), self._marker(), wafer)
         self.assertEqual(occupied.state, SlotState.OCCUPIED)
 
+    def test_abnormal_state_is_split_into_stacked_outside_and_both(self) -> None:
+        contained_patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(contained_patch, (78.0, 78.0), 80.0, 0.0, _purple(140, 100))
+        _draw_square(contained_patch, (112.0, 112.0), 80.0, 0.0, _purple(150, 145))
+        contained = analyze_wafer_patch(contained_patch)
+        self.assertFalse(contained.outside_slot)
+        self.assertEqual(
+            decide_slot_state(self._projection(), self._marker(), contained).state,
+            SlotState.STACKED,
+        )
+
+        outside_patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(outside_patch, (170.0, 96.0), 72.0, 0.0, _purple())
+        outside = analyze_wafer_patch(outside_patch)
+        self.assertEqual(
+            decide_slot_state(self._projection(), self._marker(), outside).state,
+            SlotState.OUTSIDE_SLOT,
+        )
+
+        both = replace(
+            outside,
+            quality="abnormal",
+            flags=tuple(outside.flags) + ("stacked_geometry_confirmed",),
+        )
+        self.assertEqual(
+            decide_slot_state(self._projection(), self._marker(), both).state,
+            SlotState.STACKED_OUTSIDE_SLOT,
+        )
+
+    def test_contained_severe_shape_and_reflection_do_not_become_stacked(self) -> None:
+        distorted_patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        cv2.rectangle(distorted_patch, (45, 70), (147, 122), _purple(), -1)
+        distorted = analyze_wafer_patch(distorted_patch)
+        self.assertEqual(distorted.quality, "abnormal")
+        self.assertEqual(
+            decide_slot_state(self._projection(), self._marker(), distorted).state,
+            SlotState.WARNING,
+        )
+
+        reflection_patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(reflection_patch, (96.0, 96.0), 92.0, 0.0, _purple(140, 100))
+        cv2.rectangle(reflection_patch, (91, 50), (101, 142), _purple(140, 220), -1)
+        reflection = analyze_wafer_patch(reflection_patch)
+        self.assertIn("internal_overlap_edges", reflection.flags)
+        self.assertEqual(
+            decide_slot_state(self._projection(), self._marker(), reflection).state,
+            SlotState.WARNING,
+        )
+
     def test_no_evidence_is_unknown(self) -> None:
         decision = decide_slot_state(
             self._projection(), self._marker(), WaferObservation.not_found()
@@ -260,6 +463,29 @@ class OccupancyDecisionTests(unittest.TestCase):
         self.assertEqual(decision.state, SlotState.UNKNOWN)
         self.assertFalse(decision.safe_to_use_as_empty)
 
+
+class CameraOverlayTests(unittest.TestCase):
+    def test_primary_and_second_wafer_outlines_are_both_drawn(self) -> None:
+        canvas = np.zeros((220, 220, 3), dtype=np.uint8)
+        analysis = SimpleNamespace(
+            projection=SimpleNamespace(
+                polygon_px=((20.0, 20.0), (200.0, 20.0), (200.0, 200.0), (20.0, 200.0)),
+                center_px=(110.0, 110.0),
+                projected_area_px=32400.0,
+                slot_key="P32",
+            ),
+            decision=SimpleNamespace(state=SlotState.STACKED),
+            wafer_box_image_px=((40.0, 40.0), (100.0, 40.0), (100.0, 100.0), (40.0, 100.0)),
+            wafer_secondary_boxes_image_px=(
+                ((110.0, 80.0), (170.0, 80.0), (170.0, 140.0), (110.0, 140.0)),
+            ),
+            wafer_center_image_px=None,
+            wafer_offset_distance_mm=None,
+        )
+        TrayVisionAnalyzer._draw_slot(canvas, analysis)
+        self.assertGreater(int(canvas[40, 70, 2]), 200)  # W1/state-colour outline
+        self.assertGreater(int(canvas[80, 140, 0]), 200)  # W2 cyan outline
+        self.assertGreater(int(canvas[80, 140, 1]), 200)
 
 class FusionFailClosedTests(unittest.TestCase):
     def test_pose_rejection_stops_slot_analysis(self) -> None:
@@ -280,6 +506,59 @@ class FusionFailClosedTests(unittest.TestCase):
         self.assertFalse(result.coordinate_mapping_allowed)
         self.assertEqual(len(result.slots), 0)
         self.assertEqual(result.summary["unknown"], 36)
+
+    def test_tracked_analysis_uses_filtered_pose(self) -> None:
+        image = np.full((720, 1280, 3), 185, dtype=np.uint8)
+        raw = _valid_pose(image)
+        filtered = raw.T_C_T.copy()
+        filtered[0, 3] += 6.0
+        filtered_inverse = np.linalg.inv(filtered)
+        tracked = TrackedTrayPose(
+            raw=raw,
+            accepted_by_tracker=True,
+            tracker_reason=None,
+            filtered_T_C_T=filtered,
+            filtered_T_T_C=filtered_inverse,
+            translation_jump_mm=6.0,
+            rotation_jump_deg=0.0,
+            lost_frame_count=0,
+        )
+        geometry = _geometry()
+        analyzer = TrayVisionAnalyzer(
+            TrayBoardPoseEstimator(geometry, _intrinsics()),
+            geometry,
+            load_slot_marker_layout(LAYOUT_PATH),
+        )
+        result = analyzer.analyze_tracked(image, tracked)
+        self.assertTrue(result.quality_passed)
+        np.testing.assert_allclose(result.pose.T_C_T, filtered, atol=1e-12)
+        converted = tracked_pose_estimate(tracked)
+        np.testing.assert_allclose(converted.tvec_C_T_mm.reshape(3), filtered[:3, 3])
+
+    def test_tracker_rejection_is_authoritative(self) -> None:
+        image = np.full((720, 1280, 3), 185, dtype=np.uint8)
+        raw = _valid_pose(image)
+        tracked = TrackedTrayPose(
+            raw=raw,
+            accepted_by_tracker=False,
+            tracker_reason="synthetic temporal jump",
+            filtered_T_C_T=raw.T_C_T.copy(),
+            filtered_T_T_C=raw.T_T_C.copy(),
+            translation_jump_mm=40.0,
+            rotation_jump_deg=0.0,
+            lost_frame_count=1,
+        )
+        geometry = _geometry()
+        analyzer = TrayVisionAnalyzer(
+            TrayBoardPoseEstimator(geometry, _intrinsics()),
+            geometry,
+            load_slot_marker_layout(LAYOUT_PATH),
+        )
+        result = analyzer.analyze_tracked(image, tracked)
+        self.assertFalse(result.quality_passed)
+        self.assertEqual(result.failure_reason, "synthetic temporal jump")
+        self.assertEqual(result.slots, ())
+        self.assertFalse(result.coordinate_mapping_allowed)
 
 
 if __name__ == "__main__":

@@ -16,8 +16,11 @@
   当前图像，并做多尺度marker观测；旧layout不再参与运行时槽位排序。
 - scara.vision.wafer_shape_quality：在透视校正后的单槽小图中判断硅片颜色、
   正方形程度、中心偏移、相对角度、重叠边线和多连通块。
+- scara.vision.silicon_detection_config：严格加载并校验
+  src/scara/calib/silicon_detection_0818.json，供手眼UI、Task14和离线入口共用。
 - scara.vision.tray_occupancy：按完整视野、明确遮挡、硅片和marker证据给出
-  empty/occupied/warning/abnormal/out_of_view/occluded/unknown，信息不足不猜测。
+  empty/occupied/warning/stacked/outside_slot/stacked_outside_slot/
+  out_of_view/occluded/unknown，信息不足不猜测。
 - scara.vision.tray_vision_fusion：组合Tray位姿、36槽投影、槽内marker和硅片
   质量；位姿质量门失败时停止，并提供点击像素到Tray毫米坐标的只读转换。
 - scara.vision.suction_target_calibration：阶段4固定工作平面吸盘target的
