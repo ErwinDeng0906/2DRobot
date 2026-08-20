@@ -15,7 +15,9 @@ class SlotState(str, Enum):
     EMPTY_UNREAD_MARKER = "empty_unread_marker"
     OCCUPIED = "occupied"
     WARNING = "warning"
-    ABNORMAL = "abnormal"
+    STACKED = "stacked"
+    OUTSIDE_SLOT = "outside_slot"
+    STACKED_OUTSIDE_SLOT = "stacked_outside_slot"
     OUT_OF_VIEW = "out_of_view"
     OCCLUDED = "occluded"
     UNKNOWN = "unknown"
@@ -28,6 +30,32 @@ class SlotDecisionConfig:
 
 
 DEFAULT_SLOT_DECISION = SlotDecisionConfig()
+
+
+_DIRECT_STACKING_FLAGS = frozenset({"stacked_geometry_confirmed"})
+
+
+def _refined_abnormal_state(wafer: WaferObservation) -> tuple[SlotState, str]:
+    """Split the former generic abnormal state into actionable categories.
+
+    A boundary-crossing contour is direct out-of-slot evidence.  Internal
+    lines, multiple color components, and other severe
+    shape anomalies are not stacking unless L-corner or second-quadrilateral
+    geometry has confirmed a second wafer.
+    """
+    flags = set(wafer.flags)
+    outside_slot = bool(wafer.outside_slot or "outside_slot" in flags)
+    direct_stacking = bool(flags & _DIRECT_STACKING_FLAGS)
+    if outside_slot and direct_stacking:
+        return (
+            SlotState.STACKED_OUTSIDE_SLOT,
+            "stacking evidence is present and the wafer footprint crosses the slot boundary",
+        )
+    if outside_slot:
+        return SlotState.OUTSIDE_SLOT, "the wafer footprint crosses the slot boundary"
+    if direct_stacking:
+        return SlotState.STACKED, "second-wafer geometry is confirmed inside the slot"
+    return SlotState.WARNING, "shape evidence is abnormal but stacking geometry is not confirmed"
 
 
 @dataclass(frozen=True)
@@ -87,19 +115,32 @@ def decide_slot_state(
         flags = list(wafer.flags)
         if marker.decoded:
             flags.append("contradictory_marker_and_wafer")
+        if marker.decoded or wafer.quality == "abnormal" or wafer.outside_slot:
+            state, reason = _refined_abnormal_state(wafer)
+            if marker.decoded:
+                reason += "; wafer and decoded empty-slot marker are both visible"
             return SlotDecision(
                 projection.slot_key,
-                SlotState.ABNORMAL,
+                state,
                 occupied=True,
                 safe_to_use_as_empty=False,
-                reason="wafer and decoded empty-slot marker are both visible",
+                reason=reason,
                 flags=tuple(flags),
             )
         state = {
             "normal": SlotState.OCCUPIED,
             "warning": SlotState.WARNING,
-            "abnormal": SlotState.ABNORMAL,
-        }.get(wafer.quality, SlotState.ABNORMAL)
+        }.get(wafer.quality)
+        if state is None:
+            state, reason = _refined_abnormal_state(wafer)
+            return SlotDecision(
+                projection.slot_key,
+                state,
+                occupied=True,
+                safe_to_use_as_empty=False,
+                reason=reason,
+                flags=tuple(flags),
+            )
         return SlotDecision(
             projection.slot_key,
             state,

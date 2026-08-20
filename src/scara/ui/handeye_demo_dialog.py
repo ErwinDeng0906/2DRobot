@@ -12,21 +12,36 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 import cv2
-from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QImage, QPixmap
+from PyQt6.QtCore import QSize, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QCloseEvent, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDialog,
+    QFileDialog,
+    QGraphicsScene,
+    QGraphicsView,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSlider,
+    QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from scara.ui.dialogs import LIGHT_WARNING_DIALOG_STYLESHEET
+from scara.ui.camera_view import (
+    DIRECTSHOW_EXPOSURE_DEFAULT,
+    DIRECTSHOW_EXPOSURE_MAX,
+    DIRECTSHOW_EXPOSURE_MIN,
+)
 from scara.vision.handeye_interaction import (
     HandEyeEvaluation,
     ROBOT_STATE_MAXIMUM_AGE_S,
@@ -40,18 +55,34 @@ from scara.vision.tray_pose_estimator import (
     load_tray_board_geometry,
 )
 from scara.vision.tray_pose_tracker import TrayPoseTracker
+from scara.vision.slot_marker_observation import load_slot_marker_layout
+from scara.vision.silicon_detection_config import (
+    LoadedSiliconDetectionConfig,
+    default_silicon_detection_config_path,
+    load_silicon_detection_config,
+    preferred_silicon_detection_config_path,
+    save_preferred_silicon_detection_config_path,
+)
+from scara.vision.tray_vision_fusion import (
+    DEFAULT_TRAY_VISION_FUSION,
+    TrayVisionAnalyzer,
+    TrayVisionFusionConfig,
+    TrayVisionResult,
+)
 from scara.vision.xy_image_jacobian import REQUIRED_XY_JACOBIAN_QUALITY_GATES
 
 
 _DIALOG_STYLE = """
 QDialog { background-color:#FFFFFF; color:#111827; }
+QScrollArea#dialogScroll { background-color:#FFFFFF; border:0; }
+QWidget#dialogContent { background-color:#FFFFFF; }
 QLabel { color:#111827; }
 QLabel#safetyBanner {
     color:#991B1B; background-color:#FEE2E2;
     border:1px solid #FCA5A5; border-radius:6px;
     padding:9px; font-size:14px; font-weight:800;
 }
-QLabel#preview { background-color:#0B1220; border:1px solid #CBD5E1; }
+QGraphicsView#preview { background-color:#0B1220; border:1px solid #CBD5E1; }
 QLabel#status {
     color:#111827; background-color:#F8FAFC;
     border:1px solid #CBD5E1; border-radius:6px; padding:8px;
@@ -61,6 +92,21 @@ QPlainTextEdit#stage7bStatus {
     color:#111827; background-color:#FFF7ED;
     border:1px solid #FDBA74; border-radius:6px; padding:7px;
     font-family:Consolas, "Microsoft YaHei";
+}
+QLabel#traySummary {
+    color:#0F172A; background-color:#EFF6FF;
+    border:1px solid #BFDBFE; border-radius:5px; padding:6px 8px;
+    font-weight:700;
+}
+QTableWidget#slotTable {
+    color:#111827; background-color:#FFFFFF; alternate-background-color:#F8FAFC;
+    border:1px solid #CBD5E1; gridline-color:#E2E8F0;
+    selection-background-color:#DBEAFE; selection-color:#111827;
+}
+QTableWidget#slotTable QHeaderView::section {
+    color:#0F172A; background-color:#E2E8F0;
+    border:0; border-right:1px solid #CBD5E1; border-bottom:1px solid #CBD5E1;
+    padding:5px; font-weight:700;
 }
 QComboBox {
     color:#111827; background-color:#FFFFFF;
@@ -88,10 +134,181 @@ QPushButton#fullTrayButton:hover { background-color:#065F46; }
 """
 
 
+class CameraImageView(QGraphicsView):
+    """Aspect-ratio preview with fit-relative zoom and mouse panning."""
+
+    zoom_changed = pyqtSignal(float)
+
+    _DEFAULT_ASPECT_RATIO = 720.0 / 1280.0
+    _MIN_ZOOM = 1.0
+    _MAX_ZOOM = 8.0
+    _ZOOM_STEP = 1.25
+
+    def __init__(self, placeholder: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        scene = QGraphicsScene(self)
+        self.setScene(scene)
+        self._pixmap_item = scene.addPixmap(QPixmap())
+        self._has_image = False
+        self._zoom_factor = self._MIN_ZOOM
+        self._aspect_ratio = self._DEFAULT_ASPECT_RATIO
+
+        self._placeholder = QLabel(placeholder, self.viewport())
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._placeholder.setWordWrap(True)
+        self._placeholder.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self._placeholder.setStyleSheet(
+            "color:#E2E8F0; background:transparent; border:0; padding:12px;"
+        )
+
+        self.setObjectName("preview")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.NoAnchor)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setToolTip(
+            "使用放大/缩小按钮或 Ctrl+滚轮缩放；放大后按住鼠标左键拖动画面"
+        )
+        size_policy = QSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        size_policy.setHeightForWidth(True)
+        self.setSizePolicy(size_policy)
+        self.setMinimumSize(480, 270)
+
+    @property
+    def has_image(self) -> bool:
+        return self._has_image
+
+    @property
+    def zoom_factor(self) -> float:
+        return self._zoom_factor
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        frame = 2 * self.frameWidth()
+        image_width = max(1, int(width) - frame)
+        return max(270, int(round(image_width * self._aspect_ratio)) + frame)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        width = 1180
+        return QSize(width, self.heightForWidth(width))
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return QSize(480, self.heightForWidth(480))
+
+    def set_image(self, image: QImage) -> None:
+        """Replace the live frame without resetting an active pan/zoom."""
+        if image.isNull():
+            self.clear_image("当前图像为空")
+            return
+        pixmap = QPixmap.fromImage(image)
+        old_size = self._pixmap_item.pixmap().size()
+        dimensions_changed = not self._has_image or old_size != pixmap.size()
+        self._pixmap_item.setPixmap(pixmap)
+        self.scene().setSceneRect(self._pixmap_item.boundingRect())
+        self._has_image = True
+        self._placeholder.hide()
+
+        new_aspect_ratio = pixmap.height() / max(1, pixmap.width())
+        if not math.isclose(new_aspect_ratio, self._aspect_ratio, abs_tol=1e-6):
+            self._aspect_ratio = new_aspect_ratio
+            self.updateGeometry()
+        if dimensions_changed:
+            self._zoom_factor = self._MIN_ZOOM
+            self._apply_view_transform()
+            self.zoom_changed.emit(self._zoom_factor)
+
+    def clear_image(self, message: str) -> None:
+        self._pixmap_item.setPixmap(QPixmap())
+        self.scene().setSceneRect(0.0, 0.0, 0.0, 0.0)
+        self._has_image = False
+        self._zoom_factor = self._MIN_ZOOM
+        self.resetTransform()
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self._placeholder.setText(message)
+        self._placeholder.show()
+        self.zoom_changed.emit(self._zoom_factor)
+
+    def zoom_in(self) -> None:
+        if not self._has_image:
+            return
+        self._set_zoom(min(self._MAX_ZOOM, self._zoom_factor * self._ZOOM_STEP))
+
+    def zoom_out(self) -> None:
+        if not self._has_image:
+            return
+        next_zoom = self._zoom_factor / self._ZOOM_STEP
+        self._set_zoom(
+            self._MIN_ZOOM if next_zoom < 1.001 else max(self._MIN_ZOOM, next_zoom)
+        )
+
+    def reset_zoom(self) -> None:
+        if self._has_image:
+            self._set_zoom(self._MIN_ZOOM)
+
+    def _set_zoom(self, zoom_factor: float) -> None:
+        old_center = self.mapToScene(self.viewport().rect().center())
+        self._zoom_factor = max(
+            self._MIN_ZOOM, min(self._MAX_ZOOM, float(zoom_factor))
+        )
+        self._apply_view_transform(
+            old_center if self._zoom_factor > self._MIN_ZOOM else None
+        )
+        self.zoom_changed.emit(self._zoom_factor)
+
+    def _apply_view_transform(self, center=None) -> None:
+        if not self._has_image:
+            return
+        image_rect = self._pixmap_item.boundingRect()
+        self.resetTransform()
+        self.fitInView(image_rect, Qt.AspectRatioMode.KeepAspectRatio)
+        self.scale(self._zoom_factor, self._zoom_factor)
+        if center is None:
+            self.centerOn(image_rect.center())
+        else:
+            self.centerOn(center)
+        self.setDragMode(
+            QGraphicsView.DragMode.ScrollHandDrag
+            if self._zoom_factor > self._MIN_ZOOM
+            else QGraphicsView.DragMode.NoDrag
+        )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        old_center = (
+            self.mapToScene(self.viewport().rect().center())
+            if self._has_image and self._zoom_factor > self._MIN_ZOOM
+            else None
+        )
+        super().resizeEvent(event)
+        self._placeholder.setGeometry(self.viewport().rect())
+        self._apply_view_transform(old_center)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        if self._has_image and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if event.angleDelta().y() > 0:
+                self.zoom_in()
+            elif event.angleDelta().y() < 0:
+                self.zoom_out()
+            event.accept()
+            return
+        if self._zoom_factor > self._MIN_ZOOM:
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
 class HandEyeMonitorThread(QThread):
     """Run Stage-3 and overlay calculations without blocking the Qt UI."""
 
-    frame_evaluated = pyqtSignal(QImage, object)
+    frame_evaluated = pyqtSignal(QImage, object, object)
     monitor_error = pyqtSignal(str)
     frame_invalidated = pyqtSignal(str)
 
@@ -106,6 +323,8 @@ class HandEyeMonitorThread(QThread):
             Callable[[], Optional[Mapping[str, Any]]]
         ] = None,
         parent: Optional[QWidget] = None,
+        *,
+        tray_vision_config: TrayVisionFusionConfig = DEFAULT_TRAY_VISION_FUSION,
     ) -> None:
         super().__init__(parent)
         self.camera = camera
@@ -114,6 +333,8 @@ class HandEyeMonitorThread(QThread):
         self._target_name = target_name
         self._jacobian_payload = jacobian_payload
         self._robot_state_provider = robot_state_provider
+        self._tray_vision_config = tray_vision_config
+        self._tray_vision_config_version = 0
         self._state_lock = threading.Lock()
         self._running = True
 
@@ -126,6 +347,15 @@ class HandEyeMonitorThread(QThread):
     ) -> None:
         with self._state_lock:
             self._jacobian_payload = payload
+
+    def set_tray_vision_config(self, config: TrayVisionFusionConfig) -> None:
+        """Use a validated detector profile from the next fresh frame onward."""
+
+        if not isinstance(config, TrayVisionFusionConfig):
+            raise TypeError("config必须是TrayVisionFusionConfig")
+        with self._state_lock:
+            self._tray_vision_config = config
+            self._tray_vision_config_version += 1
 
     def stop(self, timeout_ms: int = 5000) -> bool:
         self._running = False
@@ -144,6 +374,19 @@ class HandEyeMonitorThread(QThread):
 
             estimator = TrayBoardPoseEstimator(geometry, intrinsics)
             tracker = TrayPoseTracker(estimator)
+            slot_layout = load_slot_marker_layout(
+                self.project_root
+                / "tools/tray_marker_detector_v2/tray_marker_layout.json"
+            )
+            with self._state_lock:
+                tray_config = self._tray_vision_config
+                tray_config_version = self._tray_vision_config_version
+            tray_analyzer = TrayVisionAnalyzer(
+                estimator,
+                geometry,
+                slot_layout,
+                config=tray_config,
+            )
         except Exception as exc:  # noqa: BLE001
             self.monitor_error.emit(f"手眼计算初始化失败：{exc}")
             return
@@ -196,6 +439,16 @@ class HandEyeMonitorThread(QThread):
             with self._state_lock:
                 target_name = self._target_name
                 jacobian_payload = self._jacobian_payload
+                requested_tray_config = self._tray_vision_config
+                requested_tray_config_version = self._tray_vision_config_version
+            if requested_tray_config_version != tray_config_version:
+                tray_analyzer = TrayVisionAnalyzer(
+                    estimator,
+                    geometry,
+                    slot_layout,
+                    config=requested_tray_config,
+                )
+                tray_config_version = requested_tray_config_version
             robot_state: Optional[Mapping[str, Any]] = None
             if self._robot_state_provider is not None:
                 try:
@@ -204,6 +457,7 @@ class HandEyeMonitorThread(QThread):
                     robot_state = None
             try:
                 tracked = tracker.update(frame)
+                tray_result = tray_analyzer.analyze_tracked(frame, tracked)
                 evaluation = evaluate_handeye_frame(
                     frame,
                     tracked,
@@ -213,6 +467,7 @@ class HandEyeMonitorThread(QThread):
                     self.suction,
                     jacobian_payload,
                     robot_state,
+                    base_annotated_bgr=tray_result.annotated_image,
                 )
                 joints = None
                 pose = None
@@ -237,6 +492,14 @@ class HandEyeMonitorThread(QThread):
                     current_joints=joints,
                     current_pose=pose,
                 )
+                with self._state_lock:
+                    config_still_current = (
+                        tray_config_version == self._tray_vision_config_version
+                    )
+                if not config_still_current:
+                    # A file was selected while this expensive frame was in
+                    # flight.  Never show a result produced by the old profile.
+                    continue
                 rgb = cv2.cvtColor(evaluation.annotated_bgr, cv2.COLOR_BGR2RGB)
                 height, width, channels = rgb.shape
                 image = QImage(
@@ -246,14 +509,16 @@ class HandEyeMonitorThread(QThread):
                     channels * width,
                     QImage.Format.Format_RGB888,
                 ).copy()
-                self.frame_evaluated.emit(image, evaluation)
+                self.frame_evaluated.emit(image, evaluation, tray_result)
                 last_error = ""
             except Exception as exc:  # noqa: BLE001
                 message = f"实时手眼计算失败：{exc}"
                 if message != last_error:
                     self.frame_invalidated.emit(message)
                     last_error = message
-            self.msleep(100)
+            # Process only the newest packet and avoid building a stale frame
+            # queue.  The vision work itself limits the live update rate.
+            self.msleep(20)
 
 
 class HandEyeDemoDialog(QDialog):
@@ -279,6 +544,20 @@ class HandEyeDemoDialog(QDialog):
         self.project_root = Path(project_root)
         self.camera = camera
         self.robot_state_provider = robot_state_provider
+        self._silicon_config_startup_warning = ""
+        try:
+            preferred_config_path = preferred_silicon_detection_config_path(
+                self.project_root
+            )
+            self.silicon_detection_config: LoadedSiliconDetectionConfig = (
+                load_silicon_detection_config(preferred_config_path)
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the read-only UI available
+            default_path = default_silicon_detection_config_path(self.project_root)
+            self.silicon_detection_config = load_silicon_detection_config(default_path)
+            self._silicon_config_startup_warning = (
+                "上次保存的硅片参数无法加载，已回退到工程默认配置：" f"{exc}"
+            )
         self.suction = load_latest_suction_target(self.project_root)
         self.jacobian_payload = load_local_xy_jacobian(
             self.project_root, self.suction, "P22"
@@ -288,6 +567,7 @@ class HandEyeDemoDialog(QDialog):
         )
         self._last_image: Optional[QImage] = None
         self._last_evaluation: Optional[HandEyeEvaluation] = None
+        self._last_tray_result: Optional[TrayVisionResult] = None
         self._last_evaluation_at: Optional[float] = None
         self._stage7b_session = None
         self._stage7b_pending_request: Optional[dict[str, Any]] = None
@@ -295,6 +575,7 @@ class HandEyeDemoDialog(QDialog):
         self._stage7b_samples: deque[dict[str, Any]] = deque(maxlen=40)
         self._stage7b_active = False
         self._positioning_mode: Optional[str] = None
+        self._exposure_was_adjusted = False
 
         if int(camera.source_index) != self.suction.camera_source:
             raise RuntimeError(
@@ -303,14 +584,27 @@ class HandEyeDemoDialog(QDialog):
             )
 
         self.setWindowTitle("手眼交互 · 动态演示（只计算 / 两种XY定位模式需ARM）")
-        self.resize(1120, 860)
-        self.setMinimumSize(860, 680)
+        self.resize(1200, 960)
+        self.setMinimumSize(900, 760)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setStyleSheet(_DIALOG_STYLE)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setObjectName("dialogScroll")
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        content = QWidget()
+        content.setObjectName("dialogContent")
+        layout = QVBoxLayout(content)
+        self.content_layout = layout
+        layout.setContentsMargins(6, 12, 6, 12)
         layout.setSpacing(9)
+        self.content_scroll.setWidget(content)
+        outer_layout.addWidget(self.content_scroll)
 
         safety = QLabel(
             "默认动态演示只计算，机械臂不会移动。"
@@ -352,18 +646,181 @@ class HandEyeDemoDialog(QDialog):
         controls.addWidget(close_button)
         layout.addLayout(controls)
 
+        exposure_controls = QHBoxLayout()
+        exposure_controls.addWidget(QLabel("相机1硬件曝光："))
+        self.exposure_slider = QSlider(Qt.Orientation.Horizontal)
+        self.exposure_slider.setObjectName("camera1ExposureSlider")
+        # DirectShow exposes this camera's shutter as integral base-2 stops.
+        self.exposure_slider.setRange(
+            DIRECTSHOW_EXPOSURE_MIN,
+            DIRECTSHOW_EXPOSURE_MAX,
+        )
+        self.exposure_slider.setSingleStep(1)
+        self.exposure_slider.setPageStep(1)
+        self.exposure_slider.setTickInterval(1)
+        self.exposure_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.exposure_slider.setValue(DIRECTSHOW_EXPOSURE_DEFAULT)
+        self.exposure_slider.setToolTip(
+            "直接修改DirectShow整数曝光档位（-13到-1）；越负越暗。"
+            "不会对采集后的图像做软件调暗。"
+        )
+        exposure_controls.addWidget(self.exposure_slider, 1)
+        self.exposure_value_label = QLabel(
+            f"{DIRECTSHOW_EXPOSURE_DEFAULT}（尚未应用）"
+        )
+        self.exposure_value_label.setObjectName("camera1ExposureValue")
+        self.exposure_value_label.setMinimumWidth(105)
+        exposure_controls.addWidget(self.exposure_value_label)
+        self.exposure_apply_button = QPushButton("应用")
+        self.exposure_apply_button.setObjectName("camera1ExposureApply")
+        self.exposure_apply_button.setToolTip("应用滑块当前整数曝光档位")
+        exposure_controls.addWidget(self.exposure_apply_button)
+        self.exposure_status_label = QLabel(
+            "仅使用整数档位；每降低1档曝光时间约减半。过低可能影响Marker识别"
+        )
+        self.exposure_status_label.setObjectName("camera1ExposureStatus")
+        self.exposure_status_label.setWordWrap(True)
+        exposure_controls.addWidget(self.exposure_status_label, 1)
+        self.exposure_recovery_button = QPushButton("恢复自动曝光")
+        self.exposure_recovery_button.setObjectName("camera1ExposureRecovery")
+        self.exposure_recovery_button.setToolTip(
+            "直接让相机驱动重新进入自动曝光；用于黑屏或原曝光恢复失败。"
+        )
+        exposure_controls.addWidget(self.exposure_recovery_button)
+        exposure_requester = getattr(self.camera, "request_exposure_value", None)
+        exposure_recovery = getattr(
+            self.camera, "request_auto_exposure_recovery", None
+        )
+        self.exposure_slider.setEnabled(callable(exposure_requester))
+        self.exposure_apply_button.setEnabled(callable(exposure_requester))
+        self.exposure_recovery_button.setEnabled(callable(exposure_recovery))
+        if not callable(exposure_requester):
+            self.exposure_status_label.setText("当前相机接口不支持硬件曝光控制")
+        self.exposure_slider.valueChanged.connect(
+            self._on_exposure_slider_changed
+        )
+        self.exposure_apply_button.clicked.connect(
+            lambda: self._on_exposure_slider_changed(
+                int(self.exposure_slider.value())
+            )
+        )
+        self.exposure_recovery_button.clicked.connect(
+            self._on_auto_exposure_recovery_requested
+        )
+        exposure_signal = getattr(self.camera, "exposure_applied", None)
+        if exposure_signal is not None and hasattr(exposure_signal, "connect"):
+            exposure_signal.connect(self._on_hardware_exposure_applied)
+        layout.addLayout(exposure_controls)
+
+        silicon_parameter_controls = QHBoxLayout()
+        silicon_parameter_controls.addWidget(QLabel("硅片检测配置："))
+        self.silicon_parameter_button = QPushButton("硅片判定参数")
+        self.silicon_parameter_button.setObjectName(
+            "siliconDetectionParameterButton"
+        )
+        self.silicon_parameter_button.setToolTip(
+            "选择完整的硅片判定JSON；验证通过后立即应用并保存为后续默认配置"
+        )
+        silicon_parameter_controls.addWidget(self.silicon_parameter_button)
+        self.silicon_parameter_label = QLabel()
+        self.silicon_parameter_label.setObjectName(
+            "siliconDetectionParameterStatus"
+        )
+        self.silicon_parameter_label.setWordWrap(True)
+        silicon_parameter_controls.addWidget(self.silicon_parameter_label, 1)
+        self._update_silicon_parameter_label()
+        self.silicon_parameter_button.clicked.connect(
+            self._on_select_silicon_detection_parameters
+        )
+        layout.addLayout(silicon_parameter_controls)
+
         legend = QLabel(
             "绿色十字＝指定槽中心　红色十字＝suction target　黄色箭头＝当前图像误差（红→绿）　"
-            "青色圆点＝A–H重投影角点　T-X/T-Y/T-Z＝托盘坐标轴"
+            "青色圆点＝A–H重投影角点　T-X/T-Y/T-Z＝托盘坐标轴\n"
+            "槽框状态：EMPTY空槽、OCC占用、WARN警告、STACK叠片、OUT槽外、"
+            "STACK+OUT叠片且槽外、OOV画面外、UNK证据不足；"
+            "白圈彩心＝硅片中心，连线表示相对槽中心偏差"
         )
         legend.setWordWrap(True)
         layout.addWidget(legend)
 
-        self.preview = QLabel("等待相机1实时画面与Stage3有效位姿……")
-        self.preview.setObjectName("preview")
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumHeight(430)
-        layout.addWidget(self.preview, 1)
+        preview_controls = QHBoxLayout()
+        preview_controls.addWidget(QLabel("相机1动态图（保持原始宽高比）："))
+        preview_controls.addStretch(1)
+        self.zoom_out_button = QPushButton("缩小")
+        self.zoom_out_button.setObjectName("camera1ZoomOut")
+        self.zoom_out_button.setToolTip("缩小实时画面，最小为适应窗口")
+        preview_controls.addWidget(self.zoom_out_button)
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setObjectName("camera1ZoomValue")
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zoom_label.setMinimumWidth(55)
+        preview_controls.addWidget(self.zoom_label)
+        self.zoom_in_button = QPushButton("放大")
+        self.zoom_in_button.setObjectName("camera1ZoomIn")
+        self.zoom_in_button.setToolTip("放大实时画面；放大后按住鼠标左键拖动")
+        preview_controls.addWidget(self.zoom_in_button)
+        self.zoom_fit_button = QPushButton("适应窗口")
+        self.zoom_fit_button.setObjectName("camera1ZoomFit")
+        self.zoom_fit_button.setToolTip("恢复完整画面并按可用宽度等比例显示")
+        preview_controls.addWidget(self.zoom_fit_button)
+        layout.addLayout(preview_controls)
+
+        self.preview = CameraImageView(
+            "等待相机1实时画面与Stage3有效位姿……"
+        )
+        self.preview.zoom_changed.connect(self._on_preview_zoom_changed)
+        self.zoom_out_button.clicked.connect(self.preview.zoom_out)
+        self.zoom_in_button.clicked.connect(self.preview.zoom_in)
+        self.zoom_fit_button.clicked.connect(self.preview.reset_zoom)
+        self._on_preview_zoom_changed(self.preview.zoom_factor)
+        layout.addWidget(self.preview)
+
+        self.tray_summary = QLabel("槽状态：等待相机1新鲜帧")
+        self.tray_summary.setObjectName("traySummary")
+        layout.addWidget(self.tray_summary)
+
+        self.slot_table = QTableWidget(len(slot_names), 6)
+        self.slot_table.setObjectName("slotTable")
+        self.slot_table.setHorizontalHeaderLabels(
+            [
+                "槽位",
+                "占用",
+                "ΔX_T (mm)",
+                "ΔY_T (mm)",
+                "距离 (mm)",
+                "硅片状态",
+            ]
+        )
+        self.slot_table.verticalHeader().setVisible(False)
+        self.slot_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.slot_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.slot_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.slot_table.setAlternatingRowColors(True)
+        self.slot_table.setSortingEnabled(False)
+        self.slot_table.setMinimumHeight(205)
+        self.slot_table.setMaximumHeight(250)
+        header = self.slot_table.horizontalHeader()
+        for column in range(5):
+            header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self._slot_row_by_name: dict[str, int] = {}
+        for row, slot_name in enumerate(slot_names):
+            self._slot_row_by_name[slot_name] = row
+            for column in range(self.slot_table.columnCount()):
+                item = QTableWidgetItem(slot_name if column == 0 else "—")
+                item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                self.slot_table.setItem(row, column, item)
+        self._set_slot_table_unavailable("等待相机1新鲜帧")
+        layout.addWidget(self.slot_table)
 
         self.status = QLabel()
         self.status.setObjectName("status")
@@ -394,6 +851,7 @@ class HandEyeDemoDialog(QDialog):
             self.jacobian_payload,
             self.robot_state_provider,
             self,
+            tray_vision_config=self.silicon_detection_config.fusion_config,
         )
         self.monitor.frame_evaluated.connect(self._on_evaluation)
         self.monitor.monitor_error.connect(self._on_monitor_error)
@@ -407,10 +865,66 @@ class HandEyeDemoDialog(QDialog):
             if self.jacobian_payload is not None
             else "尚未标定；可显示像素误差，但不显示XY修正量"
         )
+        warning_text = (
+            f"配置恢复提示：{self._silicon_config_startup_warning}\n"
+            if self._silicon_config_startup_warning
+            else ""
+        )
         self.status.setText(
             f"Task8：{self.suction.source_path}\n"
             f"Stage5局部Jacobian：{jacobian_text}\n"
+            f"硅片判定参数：{self.silicon_detection_config.source_path.name}\n"
+            f"{warning_text}"
             "状态：等待相机1新鲜帧。"
+        )
+
+    def _update_silicon_parameter_label(self) -> None:
+        config = self.silicon_detection_config
+        label_prefix = "当前（回退）" if self._silicon_config_startup_warning else "默认"
+        self.silicon_parameter_label.setText(
+            f"{label_prefix}：{config.source_path.name}　配置：{config.profile_name}　"
+            f"SHA256：{config.source_sha256[:12]}…"
+        )
+        self.silicon_parameter_label.setToolTip(str(config.source_path))
+
+    def _on_select_silicon_detection_parameters(self) -> None:
+        """Open the native Windows picker and hot-switch a complete profile."""
+
+        selected, _filter = QFileDialog.getOpenFileName(
+            self,
+            "选择硅片判定参数",
+            str(self.silicon_detection_config.source_path.parent),
+            "JSON 配置文件 (*.json)",
+        )
+        if not selected:
+            return
+        try:
+            loaded = load_silicon_detection_config(Path(selected))
+        except Exception as exc:  # noqa: BLE001 - validation message belongs in UI
+            QMessageBox.critical(
+                self,
+                "硅片判定参数无效",
+                f"未应用所选文件，当前参数保持不变。\n\n{exc}",
+            )
+            return
+        try:
+            save_preferred_silicon_detection_config_path(
+                self.project_root, loaded.source_path
+            )
+        except Exception as exc:  # noqa: BLE001 - persistence must be explicit
+            QMessageBox.critical(
+                self,
+                "无法保存默认硅片判定参数",
+                "所选文件有效，但无法保存为后续默认配置，因此本次也未应用。"
+                f"\n\n{exc}",
+            )
+            return
+        self._silicon_config_startup_warning = ""
+        self.silicon_detection_config = loaded
+        self.monitor.set_tray_vision_config(loaded.fusion_config)
+        self._update_silicon_parameter_label()
+        self._invalidate_current(
+            f"硅片判定参数已保存为默认并切换为 {loaded.source_path.name}，等待新鲜帧"
         )
 
     def _on_target_changed(self, target_name: str) -> None:
@@ -422,11 +936,16 @@ class HandEyeDemoDialog(QDialog):
         self.monitor.set_target(target_name)
 
     def _on_evaluation(
-        self, image: QImage, evaluation: HandEyeEvaluation
+        self,
+        image: QImage,
+        evaluation: HandEyeEvaluation,
+        tray_result: TrayVisionResult,
     ) -> None:
         self._last_image = image
         self._last_evaluation = evaluation
+        self._last_tray_result = tray_result
         self._last_evaluation_at = time.monotonic()
+        self._update_slot_table(tray_result)
         self._stage7b_samples.append(
             {
                 "measurement_id": evaluation.measurement_id,
@@ -509,17 +1028,21 @@ class HandEyeDemoDialog(QDialog):
     def _refresh_preview(self) -> None:
         if self._last_image is None:
             return
-        self.preview.setPixmap(
-            QPixmap.fromImage(self._last_image).scaled(
-                self.preview.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+        self.preview.set_image(self._last_image)
 
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        self._refresh_preview()
+    def _on_preview_zoom_changed(self, zoom_factor: float) -> None:
+        """Keep zoom controls consistent with the fit-relative view state."""
+        has_image = self.preview.has_image
+        self.zoom_label.setText(f"{int(round(zoom_factor * 100))}%")
+        self.zoom_out_button.setEnabled(
+            has_image and zoom_factor > CameraImageView._MIN_ZOOM
+        )
+        self.zoom_fit_button.setEnabled(
+            has_image and zoom_factor > CameraImageView._MIN_ZOOM
+        )
+        self.zoom_in_button.setEnabled(
+            has_image and zoom_factor < CameraImageView._MAX_ZOOM
+        )
 
     def _on_monitor_error(self, message: str) -> None:
         self._invalidate_current(message)
@@ -529,14 +1052,193 @@ class HandEyeDemoDialog(QDialog):
         self._last_image = None
         self._last_evaluation = None
         self._last_evaluation_at = None
-        self.preview.setPixmap(QPixmap())
-        self.preview.setText("当前没有可用的新鲜相机1 / Stage3结果")
+        self.preview.clear_image("当前没有可用的新鲜相机1 / Stage3结果")
+        self._last_tray_result = None
+        self._set_slot_table_unavailable(message)
         note = (
             "当前判断已失效；不会授权新的XY定位运动。"
             if self._stage7b_active
             else "当前判断已失效；只计算，机械臂不会移动。"
         )
         self.status.setText(message + "\n" + note)
+
+    def _set_slot_table_unavailable(self, reason: str) -> None:
+        """Invalidate every row so a stale PASS cannot remain visible."""
+        background = QColor("#F1F5F9")
+        foreground = QColor("#475569")
+        for slot_name, row in self._slot_row_by_name.items():
+            values = (slot_name, "不确定", "—", "—", "—", "当前帧不可用")
+            for column, value in enumerate(values):
+                item = self.slot_table.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.slot_table.setItem(row, column, item)
+                item.setText(value)
+                item.setToolTip(reason)
+                item.setBackground(background)
+                item.setForeground(foreground)
+                item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+        self.tray_summary.setText(f"槽状态：不可用 — {reason}")
+
+    def _update_slot_table(self, result: TrayVisionResult) -> None:
+        """Render one complete, current TrayVision result into 36 rows."""
+        if not result.quality_passed or len(result.slots) != 36:
+            self._set_slot_table_unavailable(
+                result.failure_reason or "当前帧未完成36槽分析"
+            )
+            return
+
+        presentation = {
+            "empty": ("否", "空槽", "#DCFCE7", "#166534"),
+            "empty_unread_marker": (
+                "否",
+                "空槽／Marker未解码",
+                "#ECFDF5",
+                "#166534",
+            ),
+            "occupied": ("是", "正常", "#F3E8FF", "#7E22CE"),
+            "warning": ("是", "警告", "#FEF3C7", "#92400E"),
+            "stacked": ("是", "叠片", "#FEE2E2", "#991B1B"),
+            "outside_slot": ("是", "槽外", "#FFEDD5", "#9A3412"),
+            "stacked_outside_slot": (
+                "是",
+                "叠片且槽外",
+                "#FCE7F3",
+                "#9D174D",
+            ),
+            "out_of_view": ("不确定", "画面外", "#E2E8F0", "#475569"),
+            "occluded": ("不确定", "遮挡", "#FFEDD5", "#9A3412"),
+            "unknown": ("不确定", "证据不足", "#E0F2FE", "#075985"),
+        }
+        analyses = {analysis.projection.slot_key: analysis for analysis in result.slots}
+        for slot_name, row in self._slot_row_by_name.items():
+            analysis = analyses.get(slot_name)
+            if analysis is None:
+                self._set_slot_table_unavailable("槽位结果不完整")
+                return
+            state = analysis.decision.state.value
+            occupied, state_text, background_hex, foreground_hex = presentation[state]
+            offset = analysis.wafer_offset_T_mm
+            distance = analysis.wafer_offset_distance_mm
+            dx_text = "—" if offset is None else f"{offset[0]:+.2f}"
+            dy_text = "—" if offset is None else f"{offset[1]:+.2f}"
+            distance_text = "—" if distance is None else f"{distance:.2f}"
+            values = (
+                slot_name,
+                occupied,
+                dx_text,
+                dy_text,
+                distance_text,
+                state_text,
+            )
+            flags = list(analysis.decision.flags) + list(analysis.wafer.flags)
+            tooltip_lines = [analysis.decision.reason]
+            if flags:
+                tooltip_lines.append("flags: " + ", ".join(dict.fromkeys(flags)))
+            if analysis.wafer.found:
+                tooltip_lines.append(
+                    f"wafer confidence: {analysis.wafer.confidence:.3f}"
+                )
+            tooltip = "\n".join(tooltip_lines)
+            background = QColor(background_hex)
+            foreground = QColor(foreground_hex)
+            for column, value in enumerate(values):
+                item = self.slot_table.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.slot_table.setItem(row, column, item)
+                item.setText(value)
+                item.setToolTip(tooltip)
+                item.setBackground(background)
+                item.setForeground(foreground)
+                item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+
+        summary = result.summary
+        occupied_count = sum(
+            int(summary.get(name, 0))
+            for name in (
+                "occupied",
+                "warning",
+                "stacked",
+                "outside_slot",
+                "stacked_outside_slot",
+            )
+        )
+        empty_count = int(summary.get("empty", 0)) + int(
+            summary.get("empty_unread_marker", 0)
+        )
+        uncertain_count = sum(
+            int(summary.get(name, 0))
+            for name in ("out_of_view", "occluded", "unknown")
+        )
+        stacked_count = int(summary.get("stacked", 0))
+        outside_count = int(summary.get("outside_slot", 0))
+        both_count = int(summary.get("stacked_outside_slot", 0))
+        self.tray_summary.setText(
+            "槽状态：Stage3 PASS　"
+            f"占用={occupied_count}（叠片={stacked_count}、槽外={outside_count}、"
+            f"叠片且槽外={both_count}）　空槽={empty_count}　"
+            f"不确定={uncertain_count}　已分析={summary.get('analyzed', 0)}"
+        )
+
+    def _on_exposure_slider_changed(self, slider_step: int) -> None:
+        exposure = int(slider_step)
+        self.exposure_value_label.setText(str(exposure))
+        requester = getattr(self.camera, "request_exposure_value", None)
+        if not callable(requester):
+            self.exposure_status_label.setText("当前相机接口不支持硬件曝光控制")
+            return
+        self._exposure_was_adjusted = True
+        try:
+            queued = bool(requester(exposure))
+        except Exception as exc:
+            self.exposure_status_label.setText(f"硬件曝光请求失败：{exc}")
+            return
+        self.exposure_status_label.setText(
+            f"正在应用相机硬件整数曝光 {exposure}……"
+            if queued
+            else "相机线程未运行，硬件曝光未改变"
+        )
+
+    def _on_hardware_exposure_applied(
+        self,
+        exposure: int,
+        success: bool,
+        message: str,
+    ) -> None:
+        exposure = int(exposure)
+        if exposure < 0 and exposure != int(self.exposure_slider.value()):
+            return
+        if exposure == 0:
+            self.exposure_value_label.setText(
+                "AUTO（已确认）" if success else "AUTO（未确认）"
+            )
+        elif success:
+            self.exposure_value_label.setText(f"{exposure}（已确认）")
+        else:
+            self.exposure_value_label.setText(f"{exposure}（未应用）")
+        prefix = "已应用" if success else "未应用"
+        self.exposure_status_label.setText(f"{prefix}：{message}")
+
+    def _on_auto_exposure_recovery_requested(self) -> None:
+        requester = getattr(
+            self.camera, "request_auto_exposure_recovery", None
+        )
+        if not callable(requester):
+            self.exposure_status_label.setText("当前相机接口不支持自动曝光恢复")
+            return
+        self.exposure_value_label.setText("AUTO（恢复中）")
+        self._exposure_was_adjusted = False
+        try:
+            queued = bool(requester())
+        except Exception as exc:
+            self.exposure_status_label.setText(f"自动曝光恢复请求失败：{exc}")
+            return
+        self.exposure_status_label.setText(
+            "正在强制恢复相机硬件自动曝光……"
+            if queued
+            else "相机线程未运行，自动曝光尚未恢复"
+        )
 
     def _reload_jacobian(self) -> Optional[dict[str, Any]]:
         self.jacobian_payload = load_local_xy_jacobian(
@@ -1208,6 +1910,17 @@ class HandEyeDemoDialog(QDialog):
                     "后台Stage3计算尚未安全退出，请稍候再关闭窗口"
                 )
                 return
+        if self._exposure_was_adjusted:
+            restore_exposure = getattr(
+                self.camera,
+                "restore_original_exposure",
+                None,
+            )
+            if callable(restore_exposure):
+                try:
+                    restore_exposure()
+                except Exception:
+                    pass
         super().closeEvent(event)
 
 

@@ -9,7 +9,7 @@ fails its existing reprojection quality gates.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional, Sequence
 
 import cv2
@@ -40,6 +40,7 @@ from .tray_pose_estimator import (
     TrayBoardPoseEstimator,
     TrayPoseEstimate,
 )
+from .tray_pose_tracker import TrackedTrayPose
 from .wafer_shape_quality import (
     DEFAULT_WAFER_QUALITY,
     WaferObservation,
@@ -66,6 +67,11 @@ class SlotAnalysis:
     wafer: WaferObservation
     decision: SlotDecision
     wafer_box_image_px: tuple[tuple[float, float], ...]
+    wafer_secondary_boxes_image_px: tuple[tuple[tuple[float, float], ...], ...]
+    wafer_center_image_px: Optional[tuple[float, float]]
+    wafer_center_T_mm: Optional[tuple[float, float, float]]
+    wafer_offset_T_mm: Optional[tuple[float, float]]
+    wafer_offset_distance_mm: Optional[float]
     explicit_occlusion_ratio: float
 
     def to_json(self) -> dict[str, Any]:
@@ -76,6 +82,26 @@ class SlotAnalysis:
             "wafer": self.wafer.to_json(),
             "decision": self.decision.to_json(),
             "wafer_box_image_px": [list(point) for point in self.wafer_box_image_px],
+            "wafer_secondary_boxes_image_px": [
+                [list(point) for point in box]
+                for box in self.wafer_secondary_boxes_image_px
+            ],
+            "wafer_center_image_px": (
+                None
+                if self.wafer_center_image_px is None
+                else list(self.wafer_center_image_px)
+            ),
+            "wafer_center_T_mm": (
+                None
+                if self.wafer_center_T_mm is None
+                else list(self.wafer_center_T_mm)
+            ),
+            "wafer_offset_T_mm": (
+                None
+                if self.wafer_offset_T_mm is None
+                else list(self.wafer_offset_T_mm)
+            ),
+            "wafer_offset_distance_mm": self.wafer_offset_distance_mm,
             "explicit_occlusion_ratio": self.explicit_occlusion_ratio,
         }
 
@@ -179,6 +205,93 @@ def nearest_metric_slot(
     return best_key, best_distance
 
 
+def wafer_patch_center_to_tray(
+    center_patch_px: Sequence[float],
+    projection: SlotProjection,
+    *,
+    output_size: int = DEFAULT_CANONICAL_PATCH_SIZE,
+    half_extent_mm: float = DEFAULT_SLOT_HALF_EXTENT_MM,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Convert a normalized slot-patch centre into metric Tray coordinates.
+
+    Canonical patch ``u`` follows decreasing Tray Y and patch ``v`` follows
+    decreasing Tray X.  The conversion therefore preserves the fixed slot
+    orientation used by :func:`warp_slot_patch` instead of estimating a
+    pixel-to-millimetre scale from the current perspective image.
+    """
+    center = np.asarray(center_patch_px, dtype=np.float64).reshape(-1)
+    if center.size != 2 or not np.all(np.isfinite(center)):
+        raise ValueError("wafer patch centre must contain two finite values")
+    if output_size < 2:
+        raise ValueError("canonical patch size must be at least two pixels")
+    half = float(half_extent_mm)
+    if not math.isfinite(half) or half <= 0.0:
+        raise ValueError("slot half extent must be positive and finite")
+    edge = float(output_size - 1)
+    u, v = float(center[0]), float(center[1])
+    offset = np.array(
+        [
+            half * (1.0 - 2.0 * v / edge),
+            half * (1.0 - 2.0 * u / edge),
+        ],
+        dtype=np.float64,
+    )
+    slot_center = np.asarray(projection.center_T_mm, dtype=np.float64).reshape(3)
+    center_T = slot_center.copy()
+    center_T[:2] += offset
+    return center_T, offset, float(np.linalg.norm(offset))
+
+
+def tracked_pose_estimate(tracked: TrackedTrayPose) -> TrayPoseEstimate:
+    """Build a self-consistent pose estimate from an accepted filtered pose.
+
+    A tracker rejection is authoritative even when its raw Stage-3 estimate
+    passed.  Accepted results receive rvec/tvec values derived from the same
+    filtered transform used by the hand-eye overlay, keeping all 36 slot
+    projections in the same coordinate state.
+    """
+    raw = tracked.raw
+    if (
+        not tracked.accepted_by_tracker
+        or tracked.filtered_T_C_T is None
+        or tracked.filtered_T_T_C is None
+    ):
+        return replace(
+            raw,
+            success=False,
+            quality_passed=False,
+            failure_reason=(
+                tracked.tracker_reason
+                or raw.failure_reason
+                or "tray pose rejected by temporal tracker"
+            ),
+            rvec_C_T=None,
+            tvec_C_T_mm=None,
+            T_C_T=None,
+            T_T_C=None,
+            camera_position_T_mm=None,
+        )
+    transform_C_T = np.asarray(
+        tracked.filtered_T_C_T, dtype=np.float64
+    ).reshape(4, 4)
+    transform_T_C = np.asarray(
+        tracked.filtered_T_T_C, dtype=np.float64
+    ).reshape(4, 4)
+    rvec, _ = cv2.Rodrigues(transform_C_T[:3, :3])
+    tvec = transform_C_T[:3, 3].reshape(3, 1)
+    return replace(
+        raw,
+        success=True,
+        quality_passed=True,
+        failure_reason=None,
+        rvec_C_T=rvec,
+        tvec_C_T_mm=tvec,
+        T_C_T=transform_C_T.copy(),
+        T_T_C=transform_T_C.copy(),
+        camera_position_T_mm=transform_T_C[:3, 3].copy(),
+    )
+
+
 class TrayVisionAnalyzer:
     """Run the layered, camera-1 tray overview analysis for one frame."""
 
@@ -219,7 +332,9 @@ class TrayVisionAnalyzer:
             SlotState.EMPTY_UNREAD_MARKER: (120, 210, 150),
             SlotState.OCCUPIED: (255, 0, 255),
             SlotState.WARNING: (0, 165, 255),
-            SlotState.ABNORMAL: (0, 0, 255),
+            SlotState.STACKED: (0, 0, 255),
+            SlotState.OUTSIDE_SLOT: (0, 80, 255),
+            SlotState.STACKED_OUTSIDE_SLOT: (80, 0, 180),
             SlotState.OUT_OF_VIEW: (160, 160, 160),
             SlotState.OCCLUDED: (0, 210, 255),
             SlotState.UNKNOWN: (255, 180, 0),
@@ -229,7 +344,22 @@ class TrayVisionAnalyzer:
         cv2.polylines(canvas, [polygon], True, color, 2, cv2.LINE_AA)
         center = tuple(np.round(analysis.projection.center_px).astype(int))
         cv2.circle(canvas, center, 5, color, -1, cv2.LINE_AA)
-        label = f"{analysis.projection.slot_key} {analysis.decision.state.value}"
+        state_codes = {
+            SlotState.EMPTY: "EMPTY",
+            SlotState.EMPTY_UNREAD_MARKER: "EMPTY?",
+            SlotState.OCCUPIED: "OCC",
+            SlotState.WARNING: "WARN",
+            SlotState.STACKED: "STACK",
+            SlotState.OUTSIDE_SLOT: "OUT",
+            SlotState.STACKED_OUTSIDE_SLOT: "STACK+OUT",
+            SlotState.OUT_OF_VIEW: "OOV",
+            SlotState.OCCLUDED: "OCCL",
+            SlotState.UNKNOWN: "UNK",
+        }
+        label = (
+            f"{analysis.projection.slot_key} "
+            f"{state_codes[analysis.decision.state]}"
+        )
         scale = max(0.50, min(0.82, math.sqrt(max(analysis.projection.projected_area_px, 1.0)) / 115.0))
         cv2.putText(
             canvas,
@@ -244,6 +374,59 @@ class TrayVisionAnalyzer:
         if analysis.wafer_box_image_px:
             wafer_box = np.asarray(analysis.wafer_box_image_px, dtype=np.int32).reshape(4, 2)
             cv2.polylines(canvas, [wafer_box], True, color, 3, cv2.LINE_AA)
+            if analysis.wafer_secondary_boxes_image_px:
+                cv2.putText(
+                    canvas,
+                    "W1",
+                    tuple(wafer_box[0]),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+        for index, secondary_box_raw in enumerate(
+            analysis.wafer_secondary_boxes_image_px,
+            start=2,
+        ):
+            secondary_box = np.asarray(secondary_box_raw, dtype=np.int32).reshape(4, 2)
+            secondary_color = (255, 255, 0)
+            cv2.polylines(
+                canvas,
+                [secondary_box],
+                True,
+                secondary_color,
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                canvas,
+                f"W{index}",
+                tuple(secondary_box[0]),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                secondary_color,
+                2,
+                cv2.LINE_AA,
+            )
+        if analysis.wafer_center_image_px is not None:
+            wafer_center = tuple(
+                np.round(analysis.wafer_center_image_px).astype(int)
+            )
+            cv2.line(canvas, center, wafer_center, color, 2, cv2.LINE_AA)
+            cv2.circle(canvas, wafer_center, 6, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(canvas, wafer_center, 3, color, -1, cv2.LINE_AA)
+            if analysis.wafer_offset_distance_mm is not None:
+                cv2.putText(
+                    canvas,
+                    f"d={analysis.wafer_offset_distance_mm:.1f}mm",
+                    (wafer_center[0] + 8, wafer_center[1] + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
 
     def analyze(
         self,
@@ -298,17 +481,57 @@ class TrayVisionAnalyzer:
                 config=self.config.slot_decision,
             )
             wafer_box_image: tuple[tuple[float, float], ...] = ()
+            wafer_secondary_boxes_image: tuple[
+                tuple[tuple[float, float], ...], ...
+            ] = ()
+            wafer_center_image: Optional[tuple[float, float]] = None
+            wafer_center_T: Optional[tuple[float, float, float]] = None
+            wafer_offset_T: Optional[tuple[float, float]] = None
+            wafer_offset_distance: Optional[float] = None
             if wafer.found and wafer.box_patch_px:
                 mapped = patch_points_to_image(
                     np.asarray(wafer.box_patch_px, dtype=np.float32), image_to_patch
                 )
                 wafer_box_image = tuple(tuple(float(value) for value in point) for point in mapped)
+            if wafer.found and wafer.secondary_boxes_patch_px:
+                mapped_secondary_boxes = []
+                for secondary_box in wafer.secondary_boxes_patch_px:
+                    mapped = patch_points_to_image(
+                        np.asarray(secondary_box, dtype=np.float32),
+                        image_to_patch,
+                    )
+                    mapped_secondary_boxes.append(
+                        tuple(tuple(float(value) for value in point) for point in mapped)
+                    )
+                wafer_secondary_boxes_image = tuple(mapped_secondary_boxes)
+            if wafer.found and wafer.center_patch_px is not None:
+                mapped_center = patch_points_to_image(
+                    np.asarray([wafer.center_patch_px], dtype=np.float32),
+                    image_to_patch,
+                )[0]
+                wafer_center_image = tuple(
+                    float(value) for value in mapped_center
+                )
+                center_T, offset_T, offset_distance = wafer_patch_center_to_tray(
+                    wafer.center_patch_px,
+                    projection,
+                    output_size=self.config.canonical_patch_size,
+                    half_extent_mm=self.config.slot_half_extent_mm,
+                )
+                wafer_center_T = tuple(float(value) for value in center_T)
+                wafer_offset_T = tuple(float(value) for value in offset_T)
+                wafer_offset_distance = float(offset_distance)
             analysis = SlotAnalysis(
                 projection=projection,
                 marker=marker,
                 wafer=wafer,
                 decision=decision,
                 wafer_box_image_px=wafer_box_image,
+                wafer_secondary_boxes_image_px=wafer_secondary_boxes_image,
+                wafer_center_image_px=wafer_center_image,
+                wafer_center_T_mm=wafer_center_T,
+                wafer_offset_T_mm=wafer_offset_T,
+                wafer_offset_distance_mm=wafer_offset_distance,
                 explicit_occlusion_ratio=occlusion_ratio,
             )
             analyses.append(analysis)
@@ -322,7 +545,8 @@ class TrayVisionAnalyzer:
             f"pose PASS | RMS={pose_result.reprojection_rms_px:.3f}px | "
             f"empty={summary['empty'] + summary['empty_unread_marker']} | "
             f"occupied={summary['occupied']} | warn={summary['warning']} | "
-            f"abnormal={summary['abnormal']} | unknown={summary['unknown']}"
+            f"stacked={summary['stacked']} | outside={summary['outside_slot']} | "
+            f"stacked+outside={summary['stacked_outside_slot']} | unknown={summary['unknown']}"
         )
         cv2.rectangle(canvas, (8, 8), (min(canvas.shape[1] - 8, 1040), 48), (0, 0, 0), -1)
         cv2.putText(
@@ -348,6 +572,20 @@ class TrayVisionAnalyzer:
             slots=tuple(analyses),
             summary=summary,
             annotated_image=canvas,
+        )
+
+    def analyze_tracked(
+        self,
+        image: np.ndarray,
+        tracked_pose: TrackedTrayPose,
+        *,
+        explicit_occlusion_mask: Optional[np.ndarray] = None,
+    ) -> TrayVisionResult:
+        """Analyze one frame with the same filtered pose as the live UI."""
+        return self.analyze(
+            image,
+            pose=tracked_pose_estimate(tracked_pose),
+            explicit_occlusion_mask=explicit_occlusion_mask,
         )
 
     def map_pixel_to_tray(
@@ -378,4 +616,6 @@ __all__ = [
     "TrayVisionResult",
     "image_pixel_to_tray_plane",
     "nearest_metric_slot",
+    "tracked_pose_estimate",
+    "wafer_patch_center_to_tray",
 ]

@@ -34,7 +34,6 @@ SUPPORTED_ACTION_TYPES = {
     "record_point",
     "operator_checkpoint",
 }
-
 # ``runtime_move_joints`` is intentionally much narrower than an ordinary
 # imported ``move_joints`` step.  These are engine-enforced Stage-7A ceilings,
 # not defaults that an imported task may relax.
@@ -145,6 +144,35 @@ def _json_safe_mapping(
     if not isinstance(decoded, dict):  # pragma: no cover - guarded above
         raise ValueError(f"{label} 必须是JSON对象")
     return decoded
+
+
+def _normalize_camera_capture_settings(value: object) -> dict[int, dict[str, object]]:
+    """Allow tasks to request auto mode, never a task-owned fixed exposure."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("camera_capture_settings 必须是按相机源编号索引的字典")
+    normalized: dict[int, dict[str, object]] = {}
+    for raw_source, raw_setting in value.items():
+        if isinstance(raw_source, bool):
+            raise ValueError("camera_capture_settings 的相机源必须是 0 到 8 的整数")
+        try:
+            source = int(raw_source)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("camera_capture_settings 的相机源必须是 0 到 8 的整数") from exc
+        if source < 0 or source > 8 or str(raw_source).strip() not in {str(source), f"{source}.0"}:
+            raise ValueError("camera_capture_settings 的相机源必须是 0 到 8 的整数")
+        if not isinstance(raw_setting, dict) or set(raw_setting) != {"auto_exposure"}:
+            raise ValueError(
+                f"camera_capture_settings[{source}] 只能指定 auto_exposure=true；"
+                "固定曝光只允许由动态演示UI中的人工操作临时设置"
+            )
+        if raw_setting["auto_exposure"] is not True:
+            raise ValueError(
+                f"camera_capture_settings[{source}].auto_exposure 必须为 true"
+            )
+        normalized[source] = {"auto_exposure": True}
+    return normalized
 
 
 def normalize_action_task(raw_task: object) -> dict:
@@ -581,11 +609,25 @@ def normalize_action_task(raw_task: object) -> dict:
         sources = ", ".join(f"#{source}" for source in sorted(active_video_sources))
         raise ValueError(f"录像步骤缺少 stop_video：相机源 {sources}")
 
+    camera_capture_settings = _normalize_camera_capture_settings(
+        raw_task.get("camera_capture_settings")
+    )
+    used_camera_sources = {
+        int(step["source"])
+        for step in actions
+        if step["type"] in {"capture", "start_video", "stop_video"}
+    }
+    unused_settings = sorted(set(camera_capture_settings) - used_camera_sources)
+    if unused_settings:
+        sources = ", ".join(f"#{source}" for source in unused_settings)
+        raise ValueError(f"camera_capture_settings 指定了任务未使用的相机源：{sources}")
+
     return {
         "api_version": ACTION_API_VERSION,
         "name": task_name,
         "description": str(raw_task.get("description") or "").strip(),
         "camera_model": camera_model,
+        "camera_capture_settings": camera_capture_settings,
         "actions": actions,
     }
 
@@ -632,11 +674,120 @@ class CameraSourcePool:
         self._height = int(height)
         self._captures: dict[int, object] = {}
         self._cv2 = None
+        self._capture_setting_reports: dict[int, dict] = {}
         self._video_sessions: dict[int, dict] = {}
         self._video_error_lock = threading.Lock()
         self._video_error: Optional[str] = None
 
-    def open_sources(self, sources: Sequence[int]) -> tuple[bool, str]:
+    @staticmethod
+    def _auto_exposure_enabled(actual: float) -> Optional[bool]:
+        """Normalize DirectShow 0.25/0.75 and UVC 0/1 mode readbacks."""
+
+        raw = float(actual)
+        if not math.isfinite(raw) or raw < 0.0:
+            return None
+        if abs(raw - 0.75) <= 0.13 or abs(raw - 1.0) <= 0.13:
+            return True
+        if abs(raw - 0.25) <= 0.13 or abs(raw) <= 0.13:
+            return False
+        return None
+
+    def _restore_default_auto_exposure(self, source: int) -> None:
+        """Restore the application policy default: automatic exposure.
+
+        Fixed exposure is deliberately not restored across task/camera
+        lifetimes.  It is a temporary, operator-owned setting in the hand-eye
+        UI only.
+        """
+        cap = self._captures.get(int(source))
+        if cap is None or self._cv2 is None:
+            return
+        try:
+            for requested_mode in (0.75, 1.0):
+                accepted = bool(
+                    cap.set(self._cv2.CAP_PROP_AUTO_EXPOSURE, requested_mode)
+                )
+                readback = float(cap.get(self._cv2.CAP_PROP_AUTO_EXPOSURE))
+                state = self._auto_exposure_enabled(readback)
+                if accepted and state is not False:
+                    break
+        except Exception:
+            pass
+
+    def _apply_capture_setting(self, source: int, setting: dict[str, object]) -> tuple[bool, str]:
+        cap = self._captures[int(source)]
+        cv2 = self._cv2
+        assert cv2 is not None
+        original_exposure = float(cap.get(cv2.CAP_PROP_EXPOSURE))
+        original_auto_exposure = float(cap.get(cv2.CAP_PROP_AUTO_EXPOSURE))
+        if setting.get("auto_exposure") is not True:
+            return False, (
+                f"相机源#{source}拒绝任务固定曝光；"
+                "固定曝光只允许由动态演示UI中的人工操作临时设置"
+            )
+        report = {
+            "source": int(source),
+            "requested": {"auto_exposure": True},
+            "original": {
+                "exposure": (
+                    original_exposure if math.isfinite(original_exposure) else None
+                ),
+                "auto_exposure": (
+                    original_auto_exposure
+                    if math.isfinite(original_auto_exposure)
+                    else None
+                ),
+            },
+            "auto_mode_requests": [],
+            "applied": None,
+        }
+        self._capture_setting_reports[int(source)] = report
+        for requested_mode in (0.75, 1.0):
+            accepted = bool(
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, requested_mode)
+            )
+            readback = float(cap.get(cv2.CAP_PROP_AUTO_EXPOSURE))
+            state = self._auto_exposure_enabled(readback)
+            report["auto_mode_requests"].append(
+                {
+                    "requested": requested_mode,
+                    "accepted": accepted,
+                    "readback": readback if math.isfinite(readback) else None,
+                    "normalized_state": state,
+                }
+            )
+            if not accepted or state is False:
+                continue
+            exposure_readback = float(cap.get(cv2.CAP_PROP_EXPOSURE))
+            report["applied"] = {
+                "auto_mode_request_accepted": True,
+                "auto_mode_confirmed": state is True,
+                "auto_mode_effective": True,
+                "auto_mode_readback_is_advisory": state is None,
+                "auto_mode_immediate_readback": (
+                    readback if math.isfinite(readback) else None
+                ),
+                "exposure_immediate_readback": (
+                    exposure_readback if math.isfinite(exposure_readback) else None
+                ),
+            }
+            return True, ""
+        # Never switch to manual exposure as a rollback.  One last auto request
+        # is harmless and close() will repeat it before releasing the device.
+        self._restore_default_auto_exposure(source)
+        return False, f"相机源#{source}驱动拒绝自动曝光请求"
+
+    def capture_settings_report(self) -> dict[str, dict]:
+        return {
+            str(source): json.loads(json.dumps(report, allow_nan=False))
+            for source, report in sorted(self._capture_setting_reports.items())
+        }
+
+    def open_sources(
+        self,
+        sources: Sequence[int],
+        camera_capture_settings: Optional[dict[int, dict[str, object]]] = None,
+    ) -> tuple[bool, str]:
         try:
             import cv2
         except Exception as exc:
@@ -651,6 +802,13 @@ class CameraSourcePool:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
             self._captures[source] = cap
+            setting = (camera_capture_settings or {}).get(
+                source, {"auto_exposure": True}
+            )
+            applied, reason = self._apply_capture_setting(source, setting)
+            if not applied:
+                self.close()
+                return False, reason
 
         # Opening a DirectShow device does not guarantee that it can already
         # return frames.  Validate every required source before the first robot
@@ -660,6 +818,38 @@ class CameraSourcePool:
             if self._read_fresh_frame(source, attempts=12) is None:
                 self.close()
                 return False, f"相机源#{source}已打开，但预热后仍无法取帧"
+            assert self._capture_setting_reports[source]["applied"] is not None
+            settled_mode = float(
+                self._captures[source].get(cv2.CAP_PROP_AUTO_EXPOSURE)
+            )
+            settled_state = self._auto_exposure_enabled(settled_mode)
+            if settled_state is False:
+                self._restore_default_auto_exposure(source)
+                self.close()
+                return False, (
+                    f"相机源#{source}预热后明确处于手动曝光模式："
+                    f"读回 {settled_mode:.3f}"
+                )
+            settled_exposure = float(
+                self._captures[source].get(cv2.CAP_PROP_EXPOSURE)
+            )
+            self._capture_setting_reports[source]["applied"].update(
+                {
+                    "auto_mode_settled_confirmed": settled_state is True,
+                    "auto_mode_settled_effective": True,
+                    "auto_mode_settled_readback_is_advisory": (
+                        settled_state is None
+                    ),
+                    "auto_mode_settled_readback": (
+                        settled_mode if math.isfinite(settled_mode) else None
+                    ),
+                    "exposure_settled_readback": (
+                        settled_exposure
+                        if math.isfinite(settled_exposure)
+                        else None
+                    ),
+                }
+            )
         return True, ""
 
     def _read_fresh_frame(self, source: int, *, attempts: int = 8):
@@ -800,6 +990,8 @@ class CameraSourcePool:
                         session["writer"].release()
                     except Exception:
                         pass
+        for source in list(self._capture_setting_reports):
+            self._restore_default_auto_exposure(source)
         for cap in self._captures.values():
             try:
                 cap.release()
@@ -1840,6 +2032,12 @@ class ActionWorker(QThread):
                     "positive_rotation": "从上方看逆时针（从世界 -Y 转向 +X）",
                 },
                 "camera_model": dict(self._task["camera_model"]),
+                "camera_capture_settings_requested": {
+                    str(source): dict(setting)
+                    for source, setting in sorted(
+                        self._task["camera_capture_settings"].items()
+                    )
+                },
                 "points": [],
                 "photos": [],
                 "videos": [],
@@ -1864,9 +2062,34 @@ class ActionWorker(QThread):
             pool_sources = sorted(
                 video_sources | (capture_sources if self._snapshot_source is None else set())
             )
+            if self._task["camera_capture_settings"] and self._snapshot_source is not None:
+                raise RuntimeError(
+                    "任务要求硬件相机设置，但当前使用外部 snapshot_source，无法在运动前验证曝光"
+                )
             if pool_sources:
+                # Application-wide policy: every task-owned camera starts in
+                # automatic exposure.  Imported tasks cannot opt into a fixed
+                # value; the only manual path is the hand-eye UI slider.
+                effective_capture_settings = {
+                    source: {"auto_exposure": True} for source in pool_sources
+                }
+                self._manifest["camera_capture_settings_requested"] = {
+                    str(source): dict(setting)
+                    for source, setting in sorted(effective_capture_settings.items())
+                }
+                self._save_manifest()
                 self._camera_pool = CameraSourcePool()
-                opened, error = self._camera_pool.open_sources(pool_sources)
+                opened, error = self._camera_pool.open_sources(
+                    pool_sources,
+                    effective_capture_settings,
+                )
+                # Persist attempted mode writes even when a driver explicitly
+                # rejects auto mode, so a stopped run contains the exact
+                # request/readback evidence instead of only a generic error.
+                self._manifest["camera_capture_settings_applied"] = (
+                    self._camera_pool.capture_settings_report()
+                )
+                self._save_manifest()
                 if not opened:
                     raise RuntimeError(error)
             self.progress.emit(

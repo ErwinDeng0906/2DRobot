@@ -17,6 +17,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from scara.vision.slot_marker_observation import load_slot_marker_layout
+from scara.vision.silicon_detection_config import load_silicon_detection_config
 from scara.vision.tray_pose_estimator import (
     TrayBoardPoseEstimator,
     load_camera_intrinsics,
@@ -48,6 +49,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=PROJECT_ROOT / "tools/tray_marker_detector_v2/tray_marker_layout.json",
     )
+    parser.add_argument(
+        "--silicon-config",
+        type=Path,
+        default=PROJECT_ROOT / "src/scara/calib/silicon_detection_0818.json",
+        help="complete silicon-detection and slot-state JSON profile",
+    )
     parser.add_argument("--output-json", type=Path, default=Path("layered_tray_result.json"))
     parser.add_argument("--output-image", type=Path, default=Path("layered_tray_annotated.png"))
     parser.add_argument(
@@ -68,13 +75,20 @@ def main() -> int:
     geometry = load_tray_board_geometry(args.geometry)
     intrinsics = load_camera_intrinsics(args.intrinsics)
     estimator = TrayBoardPoseEstimator(geometry, intrinsics)
+    silicon_config = load_silicon_detection_config(args.silicon_config)
     analyzer = TrayVisionAnalyzer(
         estimator,
         geometry,
         load_slot_marker_layout(args.slot_layout),
+        config=silicon_config.fusion_config,
     )
     result = analyzer.analyze(image)
     payload = result.to_json()
+    payload["silicon_detection_config"] = {
+        "path": str(silicon_config.source_path),
+        "profile_name": silicon_config.profile_name,
+        "sha256": silicon_config.source_sha256,
+    }
     if args.click is not None and result.coordinate_mapping_allowed:
         point_T, slot_key, distance_mm = analyzer.map_pixel_to_tray(args.click, result)
         payload["click"] = {
