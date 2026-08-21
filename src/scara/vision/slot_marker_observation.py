@@ -24,7 +24,7 @@ from .tray_pose_estimator import TrayBoardPoseEstimator, TrayPoseEstimate
 
 
 LEGACY_SLOT_DICTIONARY = "DICT_4X4_50"
-DEFAULT_SLOT_HALF_EXTENT_MM = 11.5
+DEFAULT_SLOT_HALF_EXTENT_MM = 15.5
 DEFAULT_CANONICAL_PATCH_SIZE = 192
 
 

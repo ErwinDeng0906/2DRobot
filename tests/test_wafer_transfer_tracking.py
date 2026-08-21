@@ -35,6 +35,7 @@ from scara.vision.wafer_transfer_tracking import (  # noqa: E402
     TransferPhase,
     WaferTransferSession,
 )
+from scara.vision.wafer_transfer_runtime import LiveWaferTransferRuntime  # noqa: E402
 
 
 def geometry() -> dict:
@@ -84,7 +85,13 @@ def analysis(slot: str, state: SlotState) -> SlotAnalysis:
         image_coverage_ratio=1.0,
         projected_area_px=1600.0,
     )
-    occupied = state in {SlotState.OCCUPIED, SlotState.WARNING, SlotState.ABNORMAL}
+    occupied = state in {
+        SlotState.OCCUPIED,
+        SlotState.WARNING,
+        SlotState.STACKED,
+        SlotState.OUTSIDE_SLOT,
+        SlotState.STACKED_OUTSIDE_SLOT,
+    }
     safe_empty = state in {SlotState.EMPTY, SlotState.EMPTY_UNREAD_MARKER}
     decision = SlotDecision(
         slot,
@@ -113,7 +120,19 @@ def analysis(slot: str, state: SlotState) -> SlotAnalysis:
         detection_quality=1.0 if safe_empty else None,
         pattern_features={},
     )
-    return SlotAnalysis(projection, marker, wafer, decision, (), 0.0)
+    return SlotAnalysis(
+        projection=projection,
+        marker=marker,
+        wafer=wafer,
+        decision=decision,
+        wafer_box_image_px=(),
+        wafer_secondary_boxes_image_px=(),
+        wafer_center_image_px=None,
+        wafer_center_T_mm=None,
+        wafer_offset_T_mm=None,
+        wafer_offset_distance_mm=None,
+        explicit_occlusion_ratio=0.0,
+    )
 
 
 def result(source_state: SlotState = SlotState.OCCUPIED) -> TrayVisionResult:
@@ -229,15 +248,33 @@ def place_observation(
 
 
 class WaferTransferSessionTests(unittest.TestCase):
+    @staticmethod
+    def _update_overview_frames(
+        session: WaferTransferSession,
+        *,
+        state: SlotState = SlotState.OCCUPIED,
+        count: int = 3,
+        x: float = 120.0,
+        y: float = 220.0,
+        robot_captured_offset_s: float = 0.0,
+    ) -> None:
+        start_sequence = int(session.latest_frame_sequence or 0) + 1
+        for sequence in range(start_sequence, start_sequence + count):
+            captured = time.monotonic()
+            session.update_overview(
+                result(state),
+                frame_sequence=sequence,
+                frame_captured_monotonic_s=captured,
+                robot_state=robot_state(
+                    x,
+                    y,
+                    captured=captured + robot_captured_offset_s,
+                ),
+            )
+
     def _ready_session(self) -> WaferTransferSession:
         session = WaferTransferSession(geometry())
-        now = time.monotonic()
-        session.update_overview(
-            result(),
-            frame_sequence=1,
-            frame_captured_monotonic_s=now,
-            robot_state=robot_state(120.0, 220.0, captured=now),
-        )
+        self._update_overview_frames(session)
         session.select_source("P11")
         session.select_destination("P22")
         session.set_registration(registration())
@@ -255,12 +292,7 @@ class WaferTransferSessionTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             session.select_source("P11")
-        session.update_overview(
-            result(),
-            frame_sequence=2,
-            frame_captured_monotonic_s=now,
-            robot_state=robot_state(0.0, 0.0, captured=now),
-        )
+        self._update_overview_frames(session, x=0.0, y=0.0)
         session.select_source("P11")
         with self.assertRaises(ValueError):
             session.select_destination("P11")
@@ -279,6 +311,46 @@ class WaferTransferSessionTests(unittest.TestCase):
         )
         np.testing.assert_allclose(session.active_delta_world_xy(), [0.5, 0.5])
         self.assertEqual(session.phase, TransferPhase.WAITING_PICK_ALIGNMENT)
+
+    def test_source_only_click_can_start_pickup_navigation(self) -> None:
+        session = WaferTransferSession(geometry())
+        self._update_overview_frames(session)
+        session.select_source("P11")
+        session.set_registration(registration())
+        snapshot = session.snapshot()
+        self.assertEqual(TransferPhase.SOURCE_READY, session.phase)
+        self.assertTrue(snapshot["tracking_ready"])
+        self.assertFalse(snapshot["route_ready"])
+        session.start_tracking()
+        self.assertEqual(TransferPhase.TRACKING_PICK, session.phase)
+        np.testing.assert_allclose(session.active_delta_world_xy(), [5.0, 5.0])
+
+    def test_source_selection_requires_three_of_five_current_normal_frames(self) -> None:
+        session = WaferTransferSession(geometry())
+        self._update_overview_frames(session, count=2)
+        with self.assertRaisesRegex(ValueError, "temporally stable"):
+            session.select_source("P11")
+        self._update_overview_frames(session, count=1)
+        session.select_source("P11")
+        consensus = session.snapshot()["source_consensus"]
+        self.assertEqual(3, consensus["occupied_frame_count"])
+        self.assertTrue(consensus["passed"])
+
+    def test_repeated_frame_sequence_cannot_satisfy_consensus(self) -> None:
+        session = WaferTransferSession(geometry())
+        captured = time.monotonic()
+        for _ in range(5):
+            session.update_overview(
+                result(),
+                frame_sequence=7,
+                frame_captured_monotonic_s=captured,
+                robot_state=robot_state(120.0, 220.0, captured=captured),
+            )
+        consensus = session.source_consensus("P11")
+        self.assertEqual(1, consensus["observed_frame_count"])
+        self.assertFalse(consensus["passed"])
+        with self.assertRaisesRegex(ValueError, "temporally stable"):
+            session.select_source("P11")
 
     def test_close_range_contract_blocks_until_real_evidence_arrives(self) -> None:
         session = self._ready_session()
@@ -395,12 +467,9 @@ class WaferTransferSessionTests(unittest.TestCase):
 
     def test_stale_or_unsynchronised_robot_state_disables_tracking(self) -> None:
         session = WaferTransferSession(geometry())
-        now = time.monotonic()
-        session.update_overview(
-            result(),
-            frame_sequence=1,
-            frame_captured_monotonic_s=now,
-            robot_state=robot_state(120.0, 220.0, captured=now - 2.0),
+        self._update_overview_frames(
+            session,
+            robot_captured_offset_s=-2.0,
         )
         session.select_source("P11")
         session.select_destination("P22")
@@ -410,6 +479,30 @@ class WaferTransferSessionTests(unittest.TestCase):
         self.assertIsNone(snapshot["active_delta_world_xy_mm"])
         with self.assertRaises(RuntimeError):
             session.start_tracking()
+
+    def test_camera1_invalidation_discards_stale_pass_and_blocks_active_lock(
+        self,
+    ) -> None:
+        session = self._ready_session()
+        session.start_tracking()
+        session.invalidate_overview("synthetic camera timeout")
+        snapshot = session.snapshot()
+        self.assertEqual(TransferPhase.BLOCKED, session.phase)
+        self.assertFalse(snapshot["tracking_ready"])
+        self.assertIsNone(snapshot["source_state"])
+        self.assertIsNone(snapshot["robot_state"])
+        self.assertEqual([], snapshot["source_consensus"]["states"])
+        self.assertIn("camera1 overview invalidated", snapshot["block_reason"])
+
+    def test_runtime_camera1_invalidation_clears_registration(self) -> None:
+        runtime = LiveWaferTransferRuntime(PROJECT_ROOT)
+        runtime.session.set_registration(registration())
+        runtime.invalidate_camera1("synthetic stale frame")
+        snapshot = runtime.snapshot()
+        self.assertIsNone(snapshot["registration"])
+        self.assertFalse(snapshot["coordinate_ready"])
+        self.assertFalse(snapshot["tracking_ready"])
+        self.assertFalse(snapshot["robot_motion_authorized"])
 
     def test_close_range_requires_fresh_timestamp_and_matching_j3(self) -> None:
         session = self._ready_session()
@@ -438,6 +531,21 @@ class WaferTransferSessionTests(unittest.TestCase):
         self.assertEqual(session.phase, TransferPhase.WAITING_PICK_ALIGNMENT)
         self.assertFalse(
             session.close_range_gates["close_range_j3_consistency"]["passed"]
+        )
+
+    def test_live_runtime_uses_checked_silicon_profile_and_never_authorizes_motion(
+        self,
+    ) -> None:
+        runtime = LiveWaferTransferRuntime(PROJECT_ROOT)
+        self.assertEqual(
+            "silicon_detection_0820_geometry_robust",
+            runtime.silicon_detection_config.profile_name,
+        )
+        snapshot = runtime.snapshot()
+        self.assertFalse(snapshot["robot_motion_authorized"])
+        self.assertEqual(
+            "silicon_detection_0820_geometry_robust",
+            snapshot["locked_inputs"]["silicon_detection_profile"],
         )
 
 

@@ -139,7 +139,7 @@ class SuctionFitTests(unittest.TestCase):
 class Task8ActionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        path = PROJECT_ROOT / "Preset Trajectories" / "task8_suction calib.py"
+        path = PROJECT_ROOT / "Tasks" / "task8_suction calib.py"
         spec = importlib.util.spec_from_file_location("task8_test_module", path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)

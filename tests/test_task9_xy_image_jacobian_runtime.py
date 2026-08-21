@@ -47,7 +47,7 @@ def _os_error_with_winerror(code: int) -> OSError:
 
 
 def _load_task9_module():
-    path = PROJECT_ROOT / "Preset Trajectories/task9_jacobiantest.py"
+    path = PROJECT_ROOT / "Tasks/task9_jacobiantest.py"
     spec = importlib.util.spec_from_file_location("_task9_contract_test", path)
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load task9")

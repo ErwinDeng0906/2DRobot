@@ -43,7 +43,7 @@ tools/fit_planar_handeye.py
 
 ## Task13（不依赖Task12）
 
-文件：`Preset Trajectories/task13_planar handeye.py`
+文件：`Tasks/task13_planar handeye.py`
 
 Task13严格从`scara_presets.json`中的`P22 float`开始并最终返回同一个预设点。其余15个观察姿态由固定的槽位集合、刚体Tray geometry以及`P22 float`实时生成；Task13不读取Task12报告、Task12图片或Task12记录的机器人姿态。每姿态采集10张相机1照片，至少8张有效帧才形成一个独立姿态；槽间路线拆成≤0.60 mm端点步，固定J3和绝对Rz。
 

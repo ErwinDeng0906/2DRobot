@@ -19,7 +19,7 @@ from scara.vision.planar_handeye_runtime import Task13PlanarHandEyeRuntime
 
 
 def _load_task13_module():
-    path = ROOT / "Preset Trajectories" / "task13_planar handeye.py"
+    path = ROOT / "Tasks" / "task13_planar handeye.py"
     spec = importlib.util.spec_from_file_location("task13_planar_handeye_test", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

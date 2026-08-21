@@ -21,24 +21,25 @@ import numpy as np
 
 @dataclass(frozen=True)
 class WaferQualityConfig:
-    lower_hsv: tuple[int, int, int] = (110, 20, 20)
-    upper_hsv: tuple[int, int, int] = (165, 255, 255)
+    lower_hsv: tuple[int, int, int] = (105, 25, 8)
+    upper_hsv: tuple[int, int, int] = (175, 255, 255)
     dark_value_max: int = 155
     dark_saturation_min: int = 28
-    minimum_area_ratio: float = 0.075
+    minimum_area_ratio: float = 0.055
     maximum_area_ratio: float = 0.82
-    minimum_chromatic_fraction: float = 0.62
-    normal_max_aspect_ratio: float = 1.20
-    warning_max_aspect_ratio: float = 1.38
-    normal_min_rectangularity: float = 0.80
-    warning_min_rectangularity: float = 0.64
-    normal_min_solidity: float = 0.90
-    warning_min_solidity: float = 0.82
+    minimum_chromatic_fraction: float = 0.12
+    normal_max_aspect_ratio: float = 1.35
+    warning_max_aspect_ratio: float = 1.60
+    boundary_max_aspect_ratio: float = 1.20
+    normal_min_rectangularity: float = 0.78
+    warning_min_rectangularity: float = 0.55
+    normal_min_solidity: float = 0.62
+    warning_min_solidity: float = 0.50
     normal_max_center_offset_ratio: float = 0.18
     warning_max_center_offset_ratio: float = 0.32
     normal_max_yaw_deg: float = 8.0
     warning_max_yaw_deg: float = 15.0
-    maximum_normal_side_ratio: float = 0.86
+    maximum_normal_side_ratio: float = 0.62
     stacked_second_component_ratio: float = 0.10
     stacked_internal_line_count: int = 2
     stacked_internal_line_score: float = 0.45
@@ -50,7 +51,7 @@ class WaferQualityConfig:
     stacked_quadrilateral_min_solidity: float = 0.86
     stacked_l_min_leg_ratio: float = 0.22
     stacked_l_angle_tolerance_deg: float = 20.0
-    slot_boundary_margin_ratio: float = 0.010
+    slot_boundary_margin_ratio: float = 0.161
 
 
 DEFAULT_WAFER_QUALITY = WaferQualityConfig()
@@ -78,6 +79,7 @@ class WaferObservation:
     confidence: float
     flags: tuple[str, ...]
     outside_slot: bool
+    minimum_slot_clearance_ratio: Optional[float]
     secondary_boxes_patch_px: tuple[tuple[tuple[float, float], ...], ...]
 
     @classmethod
@@ -105,6 +107,7 @@ class WaferObservation:
             confidence=0.0,
             flags=tuple(flags),
             outside_slot=False,
+            minimum_slot_clearance_ratio=None,
             secondary_boxes_patch_px=(),
         )
 
@@ -130,6 +133,7 @@ class WaferObservation:
             "confidence": self.confidence,
             "flags": list(self.flags),
             "outside_slot": self.outside_slot,
+            "minimum_slot_clearance_ratio": self.minimum_slot_clearance_ratio,
             "secondary_boxes_patch_px": [
                 [list(point) for point in box]
                 for box in self.secondary_boxes_patch_px
@@ -150,23 +154,44 @@ def _wafer_mask(patch: np.ndarray, config: WaferQualityConfig) -> tuple[np.ndarr
     else:
         bgr = patch
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    purple = cv2.inRange(
+    preferred_colour = cv2.inRange(
         hsv,
         np.asarray(config.lower_hsv, dtype=np.uint8),
         np.asarray(config.upper_hsv, dtype=np.uint8),
+    )
+    saturation = hsv[:, :, 1]
+    strongly_chromatic = cv2.inRange(
+        saturation,
+        max(45, int(config.dark_saturation_min)),
+        255,
     )
     dark_chromatic = cv2.inRange(
         hsv,
         np.asarray((0, config.dark_saturation_min, 0), dtype=np.uint8),
         np.asarray((179, 255, config.dark_value_max), dtype=np.uint8),
     )
-    mask = cv2.bitwise_or(purple, dark_chromatic)
+    # Preferred purple pixels are the geometry seed. Strong saturation is a
+    # fallback for bright reflections whose hue shifts under auto exposure;
+    # the low-value branch keeps genuinely dark wafer areas. Black/white
+    # ArUco patterns are rejected later by colour support and size gates.
+    mask = cv2.bitwise_or(preferred_colour, strongly_chromatic)
+    mask = cv2.bitwise_or(mask, dark_chromatic)
     scale = max(1.0, min(mask.shape[:2]) / 192.0)
     open_size = max(3, int(round(3.0 * scale)) | 1)
-    close_size = max(5, int(round(7.0 * scale)) | 1)
+    close_size = max(7, int(round(9.0 * scale)) | 1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((open_size, open_size), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close_size, close_size), np.uint8))
-    return mask, purple
+    preferred_colour = cv2.morphologyEx(
+        preferred_colour,
+        cv2.MORPH_OPEN,
+        np.ones((open_size, open_size), np.uint8),
+    )
+    preferred_colour = cv2.morphologyEx(
+        preferred_colour,
+        cv2.MORPH_CLOSE,
+        np.ones((close_size, close_size), np.uint8),
+    )
+    return mask, preferred_colour
 
 
 def _select_components(mask: np.ndarray) -> tuple[np.ndarray, list[tuple[float, np.ndarray]]]:
@@ -191,6 +216,160 @@ def _select_components(mask: np.ndarray) -> tuple[np.ndarray, list[tuple[float, 
     primary_mask = np.where(labels == primary_label, 255, 0).astype(np.uint8)
     details = [(area, np.asarray(centroids[label], dtype=np.float64)) for _score, area, label in components]
     return primary_mask, details
+
+
+def _robust_oriented_box(
+    object_mask: np.ndarray,
+    contour: np.ndarray,
+) -> tuple[np.ndarray, tuple[float, float], tuple[float, float], float, float]:
+    """Fit a trimmed rectangle to colour support instead of contour outliers."""
+
+    ys, xs = np.where(object_mask > 0)
+    if xs.size < 4:
+        rect = cv2.minAreaRect(contour)
+        box = cv2.boxPoints(rect).astype(np.float64)
+        raw_width, raw_height = (float(value) for value in rect[1])
+        edge = box[1] - box[0]
+        angle = normalize_square_angle_deg(
+            math.degrees(math.atan2(float(edge[1]), float(edge[0])))
+        )
+        return (
+            box,
+            (float(rect[0][0]), float(rect[0][1])),
+            (raw_width, raw_height),
+            float(angle),
+            0.0,
+        )
+
+    points = np.column_stack((xs, ys)).astype(np.float64)
+    edge_angle, edge_confidence = _edge_axis_angle(contour)
+    if edge_angle is None or edge_confidence < 0.42:
+        initial_box = cv2.boxPoints(cv2.minAreaRect(contour)).astype(np.float64)
+        edge = initial_box[1] - initial_box[0]
+        edge_angle = normalize_square_angle_deg(
+            math.degrees(math.atan2(float(edge[1]), float(edge[0])))
+        )
+    origin = np.median(points, axis=0)
+    radians = math.radians(float(edge_angle))
+    image_to_local = np.asarray(
+        [
+            [math.cos(radians), math.sin(radians)],
+            [-math.sin(radians), math.cos(radians)],
+        ],
+        dtype=np.float64,
+    )
+    local = (points - origin) @ image_to_local.T
+    low = np.quantile(local, 0.02, axis=0)
+    high = np.quantile(local, 0.98, axis=0)
+    local_box = np.asarray(
+        [
+            [low[0], low[1]],
+            [high[0], low[1]],
+            [high[0], high[1]],
+            [low[0], high[1]],
+        ],
+        dtype=np.float64,
+    )
+    box = local_box @ image_to_local + origin
+    center = np.mean(box, axis=0)
+    size = high - low
+    return (
+        box,
+        (float(center[0]), float(center[1])),
+        (float(size[0]), float(size[1])),
+        float(normalize_square_angle_deg(float(edge_angle))),
+        float(edge_confidence),
+    )
+
+
+def _bridge_split_geometry_mask(
+    primary_mask: np.ndarray,
+    *,
+    patch_area: float,
+    config: WaferQualityConfig,
+) -> tuple[np.ndarray, bool]:
+    """Break a thin colour bridge only when square geometry clearly improves."""
+
+    contours, _ = cv2.findContours(
+        primary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return primary_mask, False
+    original_contour = max(contours, key=cv2.contourArea)
+    original_area = float(cv2.contourArea(original_contour))
+    original_box = _robust_oriented_box(
+        primary_mask, original_contour
+    )[0:3]
+    _box, original_center, original_size = original_box
+    original_short = min(original_size)
+    original_long = max(original_size)
+    if original_short <= 1.0:
+        return primary_mask, False
+
+    scale = max(1.0, min(primary_mask.shape[:2]) / 192.0)
+    split_size = max(7, int(round(9.0 * scale)) | 1)
+    opened = cv2.morphologyEx(
+        primary_mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (split_size, split_size)),
+    )
+    candidate_mask, _candidate_components = _select_components(opened)
+    candidate_contours, _ = cv2.findContours(
+        candidate_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not candidate_contours:
+        return primary_mask, False
+    candidate_contour = max(candidate_contours, key=cv2.contourArea)
+    candidate_area = float(cv2.contourArea(candidate_contour))
+    if (
+        candidate_area < float(config.minimum_area_ratio) * patch_area
+        or candidate_area < 0.45 * max(original_area, 1.0)
+    ):
+        return primary_mask, False
+    _candidate_box, candidate_center, candidate_size, _yaw, _confidence = (
+        _robust_oriented_box(candidate_mask, candidate_contour)
+    )
+    candidate_short = min(candidate_size)
+    candidate_long = max(candidate_size)
+    if candidate_short <= 1.0:
+        return primary_mask, False
+    original_aspect = original_long / original_short
+    candidate_aspect = candidate_long / candidate_short
+    patch_center = np.asarray(
+        [
+            0.5 * (primary_mask.shape[1] - 1),
+            0.5 * (primary_mask.shape[0] - 1),
+        ],
+        dtype=np.float64,
+    )
+    original_offset = float(
+        np.linalg.norm(np.asarray(original_center) - patch_center)
+    ) / max(min(primary_mask.shape[:2]), 1.0)
+    candidate_offset = float(
+        np.linalg.norm(np.asarray(candidate_center) - patch_center)
+    ) / max(min(primary_mask.shape[:2]), 1.0)
+    geometry_improved = bool(
+        candidate_aspect + 0.12 < original_aspect
+        and candidate_offset <= original_offset + 0.03
+    )
+    return (candidate_mask, True) if geometry_improved else (primary_mask, False)
+
+
+def _marker_like_black_white_pattern(
+    bgr: np.ndarray,
+    footprint_mask: np.ndarray,
+) -> bool:
+    """Reject a black/white square whose camera tint happens to be saturated."""
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    pixels = footprint_mask > 0
+    if not np.any(pixels):
+        return False
+    saturation = hsv[:, :, 1][pixels]
+    value = hsv[:, :, 2][pixels]
+    black_fraction = float(np.mean((value <= 72) & (saturation <= 70)))
+    white_fraction = float(np.mean((value >= 155) & (saturation <= 45)))
+    return black_fraction >= 0.16 and white_fraction >= 0.06
 
 
 def _edge_axis_angle(contour: np.ndarray, reference_deg: float = 0.0) -> tuple[Optional[float], float]:
@@ -420,10 +599,28 @@ def analyze_wafer_patch(
     bgr = patch if patch.ndim == 3 else cv2.cvtColor(patch, cv2.COLOR_GRAY2BGR)
     height, width = bgr.shape[:2]
     patch_area = float(height * width)
-    mask, purple_mask = _wafer_mask(bgr, config)
+    mask, preferred_colour_mask = _wafer_mask(bgr, config)
     primary_mask, components = _select_components(mask)
     if not components:
         return WaferObservation.not_found("no_chromatic_candidate")
+    preferred_primary, preferred_components = _select_components(
+        preferred_colour_mask
+    )
+    preferred_area = float(cv2.countNonZero(preferred_primary))
+    minimum_preferred_seed_area = max(
+        24.0,
+        0.40 * float(config.minimum_area_ratio) * patch_area,
+    )
+    if preferred_components and preferred_area >= minimum_preferred_seed_area:
+        # Fit the wafer from its narrow colour seed. The broader mask remains
+        # available for low-light fallback and overlap diagnostics.
+        primary_mask = preferred_primary
+    diagnostic_primary_mask = primary_mask.copy()
+    primary_mask, thin_bridge_removed = _bridge_split_geometry_mask(
+        primary_mask,
+        patch_area=patch_area,
+        config=config,
+    )
     contours, _ = cv2.findContours(primary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return WaferObservation.not_found("no_candidate_contour")
@@ -436,34 +633,55 @@ def analyze_wafer_patch(
             area_ratio=float(area_ratio),
         )
 
-    rect = cv2.minAreaRect(contour)
-    (cx, cy), (raw_width, raw_height), _rect_angle = rect
+    box, (cx, cy), (raw_width, raw_height), yaw, _edge_confidence = (
+        _robust_oriented_box(primary_mask, contour)
+    )
     short_side = min(float(raw_width), float(raw_height))
     long_side = max(float(raw_width), float(raw_height))
     if short_side <= 1.0:
         return WaferObservation.not_found("candidate_too_thin")
-    box = cv2.boxPoints(rect).astype(np.float64)
     rect_area = max(short_side * long_side, 1.0)
-    rectangularity = area / rect_area
     hull_area = max(abs(float(cv2.contourArea(cv2.convexHull(contour)))), 1.0)
+    # The hull measures the outer silhouette and ignores internal dark
+    # reflection bands. Percentile trimming can make the fitted rectangle a
+    # fraction smaller than the hull, hence the intentional clipping at 1.
+    rectangularity = min(1.0, hull_area / rect_area)
     solidity = area / hull_area
     aspect_ratio = long_side / short_side
-    side_ratio = math.sqrt(max(area, 1.0)) / max(min(height, width), 1.0)
+    side_ratio = math.sqrt(max(rect_area, 1.0)) / max(min(height, width), 1.0)
     patch_center = np.array([0.5 * (width - 1), 0.5 * (height - 1)], dtype=np.float64)
     center_offset_ratio = float(np.linalg.norm(np.array([cx, cy]) - patch_center)) / max(min(height, width), 1.0)
+    if (
+        center_offset_ratio > config.warning_max_center_offset_ratio
+        and aspect_ratio > config.warning_max_aspect_ratio
+    ):
+        # A wide context intentionally overlaps neighbouring cells. A thin,
+        # remote fragment belongs to that neighbour and must not create a
+        # duplicate outside-slot wafer in this cell.
+        return WaferObservation.not_found("neighbour_fragment_rejected")
     perimeter = float(cv2.arcLength(contour, True))
     polygon = cv2.approxPolyDP(contour, max(1.0, 0.010 * perimeter), True)
-    edge_angle, edge_confidence = _edge_axis_angle(contour)
-    if edge_angle is None or edge_confidence < 0.42:
-        edge = box[1] - box[0]
-        edge_angle = normalize_square_angle_deg(math.degrees(math.atan2(float(edge[1]), float(edge[0]))))
-    yaw = normalize_square_angle_deg(edge_angle)
-
     contour_mask = np.zeros((height, width), dtype=np.uint8)
     cv2.drawContours(contour_mask, [contour], -1, 255, -1)
-    contour_pixels = contour_mask > 0
-    chromatic_fraction = float(np.mean(purple_mask[contour_pixels] > 0)) if np.any(contour_pixels) else 0.0
+    footprint_mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(
+        footprint_mask,
+        np.round(box).astype(np.int32),
+        255,
+        lineType=cv2.LINE_AA,
+    )
+    footprint_pixels = footprint_mask > 0
+    chromatic_fraction = (
+        float(np.mean(preferred_colour_mask[footprint_pixels] > 0))
+        if np.any(footprint_pixels)
+        else 0.0
+    )
     if chromatic_fraction < config.minimum_chromatic_fraction:
+        return WaferObservation.not_found("marker_artifact_rejected")
+    if (
+        chromatic_fraction < 0.30
+        and _marker_like_black_white_pattern(bgr, footprint_mask)
+    ):
         return WaferObservation.not_found("marker_artifact_rejected")
 
     second_component_ratio = (
@@ -480,7 +698,7 @@ def analyze_wafer_patch(
     )
     second_quadrilateral_box = _second_quadrilateral_box(
         mask,
-        primary_mask,
+        diagnostic_primary_mask,
         area,
         max(short_side, long_side),
         config,
@@ -494,17 +712,40 @@ def analyze_wafer_patch(
         1.0,
         float(config.slot_boundary_margin_ratio) * float(min(height, width)),
     )
-    contour_points = contour.reshape(-1, 2).astype(np.float64)
-    outside_slot = bool(
-        np.min(contour_points[:, 0]) <= boundary_margin
-        or np.max(contour_points[:, 0]) >= float(width - 1) - boundary_margin
-        or np.min(contour_points[:, 1]) <= boundary_margin
-        or np.max(contour_points[:, 1]) >= float(height - 1) - boundary_margin
+    lower_bound = boundary_margin
+    upper_x = float(width - 1) - boundary_margin
+    upper_y = float(height - 1) - boundary_margin
+    clearances = np.asarray(
+        [
+            np.min(box[:, 0]) - lower_bound,
+            upper_x - np.max(box[:, 0]),
+            np.min(box[:, 1]) - lower_bound,
+            upper_y - np.max(box[:, 1]),
+        ],
+        dtype=np.float64,
     )
+    minimum_slot_clearance_ratio = float(
+        np.min(clearances) / max(float(min(height, width)), 1.0)
+    )
+    boundary_crossing_observed = bool(minimum_slot_clearance_ratio < 0.0)
+    # A partial reflection blob can cross the boundary even though it is not a
+    # trustworthy estimate of the square's four corners. Such a frame remains
+    # a warning and cannot be selected for pickup, but it is not promoted to a
+    # confident outside-slot label. Clear boundary decisions require the
+    # fitted footprint itself to remain square-like.
+    boundary_fit_reliable = bool(
+        aspect_ratio <= config.boundary_max_aspect_ratio
+        and rectangularity >= config.warning_min_rectangularity
+        and solidity >= config.warning_min_solidity
+        and side_ratio <= config.maximum_normal_side_ratio
+    )
+    outside_slot = bool(boundary_crossing_observed and boundary_fit_reliable)
 
     flags: list[str] = []
     severe = False
     warning = False
+    if thin_bridge_removed:
+        flags.append("thin_bridge_removed")
     if aspect_ratio > config.warning_max_aspect_ratio:
         flags.append("non_square_aspect")
         severe = True
@@ -540,10 +781,8 @@ def analyze_wafer_patch(
         severe = True
     if second_component_ratio >= config.stacked_second_component_ratio:
         flags.append("multiple_components")
-        warning = True
     if internal_count >= config.stacked_internal_line_count and internal_score >= config.stacked_internal_line_score:
         flags.append("internal_overlap_edges")
-        warning = True
     if l_shaped_box is not None:
         flags.append("l_shaped_overlap_corner")
     if second_quadrilateral_box is not None:
@@ -556,7 +795,13 @@ def analyze_wafer_patch(
         and solidity < config.irregular_outline_max_solidity
     ):
         flags.append("irregular_outline")
-        severe = True
+        # Auto-exposure highlights and cable shadows make a colour contour
+        # jagged even when the robust square footprint is valid. Complexity is
+        # retained as diagnostic evidence; only independently confirmed
+        # second-wafer geometry may turn it into a stacking failure.
+    if boundary_crossing_observed and not boundary_fit_reliable:
+        flags.append("boundary_crossing_unconfirmed")
+        warning = True
     if outside_slot:
         flags.append("outside_slot")
         severe = True
@@ -586,7 +831,179 @@ def analyze_wafer_patch(
         confidence=float(max(0.0, min(1.0, confidence))),
         flags=tuple(flags),
         outside_slot=outside_slot,
+        minimum_slot_clearance_ratio=minimum_slot_clearance_ratio,
         secondary_boxes_patch_px=secondary_boxes,
+    )
+
+
+def analyze_dark_wafer_patch(
+    patch: np.ndarray,
+    config: WaferQualityConfig = DEFAULT_WAFER_QUALITY,
+) -> WaferObservation:
+    """Conservative fallback for a low-chroma, nearly black wafer.
+
+    This is intentionally not called when the expected ArUco marker decoded.
+    It accepts only one square-like dark component near the slot centre and
+    rejects a footprint containing the black/white module pattern of a marker.
+    """
+
+    if patch is None or patch.size == 0:
+        return WaferObservation.not_found("empty_patch")
+    bgr = patch if patch.ndim == 3 else cv2.cvtColor(patch, cv2.COLOR_GRAY2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape[:2]
+    patch_area = float(height * width)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    otsu_threshold, _ = cv2.threshold(
+        blurred, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+    )
+    dark_limit = int(max(45, min(132, round(float(otsu_threshold)))))
+    dark = cv2.inRange(blurred, 0, dark_limit)
+    scale = max(1.0, min(height, width) / 192.0)
+    open_size = max(3, int(round(3.0 * scale)) | 1)
+    close_size = max(5, int(round(7.0 * scale)) | 1)
+    dark = cv2.morphologyEx(
+        dark,
+        cv2.MORPH_OPEN,
+        np.ones((open_size, open_size), np.uint8),
+    )
+    dark = cv2.morphologyEx(
+        dark,
+        cv2.MORPH_CLOSE,
+        np.ones((close_size, close_size), np.uint8),
+    )
+    primary_mask, components = _select_components(dark)
+    if not components:
+        return WaferObservation.not_found("no_dark_square_candidate")
+    contours, _ = cv2.findContours(
+        primary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return WaferObservation.not_found("no_dark_square_contour")
+    contour = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(contour))
+    area_ratio = area / max(patch_area, 1.0)
+    if area_ratio < config.minimum_area_ratio or area_ratio > 0.52:
+        return WaferObservation.not_found(
+            "dark_square_area_out_of_range", area_ratio=area_ratio
+        )
+    box, (cx, cy), (raw_width, raw_height), yaw, _edge_confidence = (
+        _robust_oriented_box(primary_mask, contour)
+    )
+    short_side = min(float(raw_width), float(raw_height))
+    long_side = max(float(raw_width), float(raw_height))
+    if short_side <= 1.0:
+        return WaferObservation.not_found("dark_square_too_thin")
+    aspect_ratio = long_side / short_side
+    rect_area = max(short_side * long_side, 1.0)
+    hull_area = max(
+        abs(float(cv2.contourArea(cv2.convexHull(contour)))), 1.0
+    )
+    rectangularity = min(1.0, hull_area / rect_area)
+    solidity = area / hull_area
+    side_ratio = math.sqrt(rect_area) / max(min(height, width), 1.0)
+    patch_center = np.asarray(
+        [0.5 * (width - 1), 0.5 * (height - 1)], dtype=np.float64
+    )
+    center_offset_ratio = float(
+        np.linalg.norm(np.asarray([cx, cy]) - patch_center)
+    ) / max(min(height, width), 1.0)
+    if (
+        aspect_ratio > config.normal_max_aspect_ratio
+        or rectangularity < config.normal_min_rectangularity
+        or solidity < config.normal_min_solidity
+        or side_ratio > config.maximum_normal_side_ratio
+        or center_offset_ratio > config.warning_max_center_offset_ratio
+    ):
+        return WaferObservation.not_found("dark_square_geometry_rejected")
+    footprint_mask = np.zeros_like(gray)
+    cv2.fillConvexPoly(
+        footprint_mask,
+        np.round(box).astype(np.int32),
+        255,
+        lineType=cv2.LINE_AA,
+    )
+    pixels = footprint_mask > 0
+    white_fraction = float(np.mean(gray[pixels] >= 150)) if np.any(pixels) else 1.0
+    if white_fraction >= 0.14:
+        return WaferObservation.not_found("dark_square_marker_pattern_rejected")
+    perimeter = float(cv2.arcLength(contour, True))
+    polygon = cv2.approxPolyDP(
+        contour, max(1.0, 0.010 * perimeter), True
+    )
+    boundary_margin = max(
+        1.0,
+        float(config.slot_boundary_margin_ratio) * float(min(height, width)),
+    )
+    clearances = np.asarray(
+        [
+            np.min(box[:, 0]) - boundary_margin,
+            float(width - 1) - boundary_margin - np.max(box[:, 0]),
+            np.min(box[:, 1]) - boundary_margin,
+            float(height - 1) - boundary_margin - np.max(box[:, 1]),
+        ],
+        dtype=np.float64,
+    )
+    minimum_clearance = float(
+        np.min(clearances) / max(float(min(height, width)), 1.0)
+    )
+    # Otsu edges on a nearly black wafer move by a few pixels with exposure.
+    # Keep a 0.8 mm uncertainty band (0.025 of the 31 mm context) so this
+    # fallback cannot turn that segmentation jitter into a certain violation.
+    outside_slot = bool(minimum_clearance < -0.025)
+    flags = ["dark_low_chroma_fallback"]
+    severe = False
+    warning = False
+    if center_offset_ratio > config.normal_max_center_offset_ratio:
+        flags.append("center_offset_borderline")
+        warning = True
+    if abs(yaw) > config.warning_max_yaw_deg:
+        flags.append("crooked")
+        severe = True
+    elif abs(yaw) > config.normal_max_yaw_deg:
+        flags.append("yaw_borderline")
+        warning = True
+    if outside_slot:
+        flags.append("outside_slot")
+        severe = True
+    elif minimum_clearance < 0.0:
+        flags.append("boundary_clearance_uncertain")
+        warning = True
+    quality = "abnormal" if severe else "warning" if warning else "normal"
+    confidence = max(
+        0.0,
+        min(
+            0.72,
+            0.55 * rectangularity
+            + 0.25 * solidity
+            + 0.20 * (1.0 - white_fraction),
+        ),
+    )
+    return WaferObservation(
+        found=True,
+        quality=quality,
+        center_patch_px=(float(cx), float(cy)),
+        box_patch_px=tuple(
+            tuple(float(value) for value in point) for point in box
+        ),
+        area_ratio=float(area_ratio),
+        side_ratio=float(side_ratio),
+        aspect_ratio=float(aspect_ratio),
+        rectangularity=float(rectangularity),
+        solidity=float(solidity),
+        center_offset_ratio=float(center_offset_ratio),
+        yaw_relative_to_tray_deg=float(yaw),
+        polygon_vertices=int(len(polygon)),
+        component_count=int(len(components)),
+        second_component_area_ratio=0.0,
+        internal_line_count=0,
+        internal_line_score=0.0,
+        chromatic_fraction=0.0,
+        confidence=float(confidence),
+        flags=tuple(flags),
+        outside_slot=outside_slot,
+        minimum_slot_clearance_ratio=minimum_clearance,
+        secondary_boxes_patch_px=(),
     )
 
 
@@ -594,6 +1011,7 @@ __all__ = [
     "DEFAULT_WAFER_QUALITY",
     "WaferObservation",
     "WaferQualityConfig",
+    "analyze_dark_wafer_patch",
     "analyze_wafer_patch",
     "normalize_square_angle_deg",
 ]

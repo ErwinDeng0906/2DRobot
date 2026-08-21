@@ -13,6 +13,7 @@ from PyQt6.QtGui import QCloseEvent, QImage, QMouseEvent, QPixmap, QResizeEvent
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -30,19 +31,19 @@ from scara.vision.wafer_transfer_runtime import (
 
 _STYLE = """
 QDialog { background:#FFFFFF; color:#111827; }
-QLabel { color:#111827; font-size:14px; }
+QLabel { color:#111827; font-size:16px; }
 QLabel#transferPreview { background:#111827; border:1px solid #94A3B8; }
 QLabel#transferBanner {
     background:#EFF6FF; color:#1E3A8A; border:1px solid #93C5FD;
-    border-radius:5px; padding:8px; font-size:15px; font-weight:700;
+    border-radius:5px; padding:9px; font-size:17px; font-weight:700;
 }
 QPlainTextEdit {
     background:#F8FAFC; color:#111827; border:1px solid #CBD5E1;
-    border-radius:5px; padding:8px; font:14px Consolas, "Microsoft YaHei";
+    border-radius:5px; padding:10px; font:16px Consolas, "Microsoft YaHei";
 }
 QPushButton {
     background:#F3F4F6; color:#111827; border:1px solid #94A3B8;
-    border-radius:4px; padding:7px 14px; min-width:96px; font-size:14px;
+    border-radius:4px; padding:8px 14px; min-width:104px; font-size:16px;
 }
 QPushButton:hover { background:#E2E8F0; }
 QPushButton:checked { color:#FFFFFF; background:#2563EB; border-color:#2563EB; }
@@ -65,6 +66,12 @@ class ClickableImageLabel(QLabel):
     def set_image(self, image: QImage) -> None:
         self._image = image.copy()
         self._render()
+
+    def clear_image(self, message: str) -> None:
+        self._image = None
+        self._displayed_size = (0, 0)
+        self.clear()
+        self.setText(str(message))
 
     def _render(self) -> None:
         if self._image is None:
@@ -135,7 +142,9 @@ class WaferTransferMonitorThread(QThread):
             packet = self.camera.latest_frame_packet(max_age_s=1.0)
             if packet is None:
                 if not invalidated and time.monotonic() - stale_since > 1.0:
-                    self.frame_invalidated.emit("相机1没有新鲜画面")
+                    message = "相机1没有新鲜画面"
+                    self.runtime.invalidate_camera1(message)
+                    self.frame_invalidated.emit(message)
                     invalidated = True
                 self.msleep(60)
                 continue
@@ -173,6 +182,7 @@ class WaferTransferMonitorThread(QThread):
             except Exception as exc:  # noqa: BLE001 - live display remains fail-closed
                 message = f"转移视觉分析失败：{exc}"
                 if message != last_error:
+                    self.runtime.invalidate_camera1(message)
                     self.monitor_error.emit(message)
                     last_error = message
             self.msleep(70)
@@ -199,6 +209,8 @@ class WaferTransferDialog(QDialog):
         self.runtime = LiveWaferTransferRuntime(self.project_root)
         self._last_frame: Optional[WaferTransferFrame] = None
         self._selection_role = "source"
+        self._last_interaction_text = ""
+        self._stream_invalidated = False
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("Wafer Transfer Vision")
         self.resize(1500, 920)
@@ -208,7 +220,7 @@ class WaferTransferDialog(QDialog):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(9)
         banner = QLabel(
-            "OBSERVATION ONLY · robot motion authorization remains in ActionWorker"
+            "只读导航：点击不会驱动机械臂；运动仍须由 ActionWorker 单独审核和执行"
         )
         banner.setObjectName("transferBanner")
         root.addWidget(banner)
@@ -223,10 +235,11 @@ class WaferTransferDialog(QDialog):
         group.setExclusive(True)
         group.addButton(self.source_button)
         group.addButton(self.destination_button)
-        self.track_button = QPushButton("开始跟踪")
+        self.track_button = QPushButton("锁定拾取导航")
         self.track_button.setObjectName("trackButton")
         self.reset_button = QPushButton("清除选择")
         self.registration_button = QPushButton("重建 W←T")
+        self.report_button = QPushButton("保存导航报告")
         self.close_button = QPushButton("关闭")
         for widget in (
             self.source_button,
@@ -234,6 +247,7 @@ class WaferTransferDialog(QDialog):
             self.track_button,
             self.reset_button,
             self.registration_button,
+            self.report_button,
             self.close_button,
         ):
             controls.addWidget(widget)
@@ -245,7 +259,7 @@ class WaferTransferDialog(QDialog):
         self.preview.setText("等待相机1画面")
         self.status = QPlainTextEdit()
         self.status.setReadOnly(True)
-        self.status.setMinimumWidth(390)
+        self.status.setMinimumWidth(500)
         splitter.addWidget(self.preview)
         splitter.addWidget(self.status)
         splitter.setStretchFactor(0, 4)
@@ -260,6 +274,7 @@ class WaferTransferDialog(QDialog):
         self.track_button.clicked.connect(self._start_tracking)
         self.reset_button.clicked.connect(self._reset_selection)
         self.registration_button.clicked.connect(self._reset_registration)
+        self.report_button.clicked.connect(self._save_report)
         self.close_button.clicked.connect(self.close)
 
         self.monitor = WaferTransferMonitorThread(
@@ -269,8 +284,8 @@ class WaferTransferDialog(QDialog):
             self,
         )
         self.monitor.frame_ready.connect(self._on_frame)
-        self.monitor.monitor_error.connect(self._show_error)
-        self.monitor.frame_invalidated.connect(self._show_error)
+        self.monitor.monitor_error.connect(self._invalidate_current)
+        self.monitor.frame_invalidated.connect(self._invalidate_current)
         self.monitor.start()
         self._refresh_status(self.runtime.snapshot())
 
@@ -284,24 +299,22 @@ class WaferTransferDialog(QDialog):
                 (x, y),
                 role=self._selection_role,
             )
-            self._refresh_status(
-                self.runtime.snapshot(),
-                extra=(
-                    f"点击像素=({x:.1f},{y:.1f})\n"
-                    f"托盘坐标=({point_T[0]:+.3f},{point_T[1]:+.3f},{point_T[2]:+.3f}) mm\n"
-                    f"选择={slot}，距槽中心={distance:.3f} mm"
-                ),
+            self._last_interaction_text = (
+                f"最近点击：像素=({x:.1f},{y:.1f})\n"
+                f"托盘坐标=({point_T[0]:+.3f},{point_T[1]:+.3f},{point_T[2]:+.3f}) mm\n"
+                f"已选择 {slot}，点击点距槽中心={distance:.3f} mm"
             )
+            self._refresh_status(self.runtime.snapshot())
         except Exception as exc:  # noqa: BLE001 - selection remains unchanged
             self._show_error(str(exc))
 
     def _start_tracking(self) -> None:
         try:
             self.runtime.start_tracking()
-            self._refresh_status(
-                self.runtime.snapshot(),
-                extra="目标已锁定，开始随机械臂状态更新吸盘距离。",
+            self._last_interaction_text = (
+                "拾取目标已锁定；画面与右侧面板将随机械臂状态更新吸盘距离。"
             )
+            self._refresh_status(self.runtime.snapshot())
         except Exception as exc:  # noqa: BLE001
             self._show_error(str(exc))
 
@@ -309,17 +322,38 @@ class WaferTransferDialog(QDialog):
         self.runtime.reset_selection()
         self.source_button.setChecked(True)
         self._selection_role = "source"
-        self._refresh_status(self.runtime.snapshot(), extra="已清除拾取槽和放置槽。")
+        self._last_interaction_text = "已清除拾取槽和放置槽。"
+        self._refresh_status(self.runtime.snapshot())
 
     def _reset_registration(self) -> None:
         self.runtime.reset_registration()
-        self._refresh_status(
-            self.runtime.snapshot(),
-            extra="W←T已清除，等待5张机械臂静止且时间同步的合格帧。",
+        self._last_interaction_text = (
+            "W←T已清除，等待5张机械臂静止且时间同步的合格帧。"
         )
+        self._refresh_status(self.runtime.snapshot())
+
+    def _save_report(self) -> None:
+        default_path = self.project_root / "wafer_pick_navigation.json"
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存只读导航报告",
+            str(default_path),
+            "JSON (*.json)",
+        )
+        if not selected:
+            return
+        try:
+            saved = self.runtime.save_report(Path(selected))
+            self._last_interaction_text = f"只读导航报告已保存：{saved}"
+            self._refresh_status(self.runtime.snapshot())
+        except Exception as exc:  # noqa: BLE001
+            self._show_error(str(exc))
 
     def _on_frame(self, image: QImage, frame: WaferTransferFrame) -> None:
         self._last_frame = frame
+        if self._stream_invalidated:
+            self._last_interaction_text = ""
+            self._stream_invalidated = False
         self.preview.set_image(image)
         self._refresh_status(frame.session_snapshot)
 
@@ -339,6 +373,7 @@ class WaferTransferDialog(QDialog):
         delta = snapshot.get("active_delta_world_xy_mm")
         distance = snapshot.get("active_distance_mm")
         registration = snapshot.get("registration") or {}
+        consensus = snapshot.get("source_consensus") or {}
         origin = registration.get("origin_world_xy_mm")
         if delta is None:
             delta_text = "不可用"
@@ -355,11 +390,18 @@ class WaferTransferDialog(QDialog):
                 f"yaw={float(registration.get('yaw_world_from_tray_deg')):+.3f}°"
             )
         lines = [
+            extra or self._last_interaction_text or "点击画面中的正常硅片选择拾取目标。",
+            "",
             f"选择模式：{'拾取槽' if self._selection_role == 'source' else '放置槽'}",
             f"阶段：{snapshot.get('phase')}",
             f"拾取槽：{snapshot.get('source_slot') or '—'} · {source.get('state', '—')}",
             f"放置槽：{snapshot.get('destination_slot') or '—'} · {destination.get('state', '—')}",
             f"当前目标：{snapshot.get('active_target_slot') or '—'}",
+            (
+                "拾取稳定证据："
+                f"{consensus.get('occupied_frame_count', 0)}/"
+                f"{consensus.get('window_frame_count', 5)} 帧正常"
+            ),
             f"W←T：{registration_text}",
             f"吸盘到当前目标：{delta_text}",
             f"相机2近距：{(snapshot.get('close_range') or {}).get('state', 'unavailable')}",
@@ -374,7 +416,7 @@ class WaferTransferDialog(QDialog):
             ),
             "",
             "机械臂运动授权：NO",
-            "P22运动仍由现有ActionWorker安全链独立复核。",
+            "本窗口不会发送运动、Z、J4、真空或DO指令。",
         ]
         registration_error = snapshot.get("registration_error")
         sync_error = snapshot.get("robot_state_sync_error")
@@ -382,14 +424,21 @@ class WaferTransferDialog(QDialog):
             lines.extend(["", f"W←T状态：{registration_error}"])
         if sync_error:
             lines.extend(["", f"时间同步：{sync_error}"])
-        if extra:
-            lines.extend(["", extra])
         self.status.setPlainText("\n".join(lines))
+        self.status.verticalScrollBar().setValue(0)
         self.track_button.setEnabled(bool(snapshot.get("tracking_ready")))
 
     def _show_error(self, message: str) -> None:
         snapshot = self.runtime.snapshot()
-        self._refresh_status(snapshot, extra=f"当前操作未接受：{message}")
+        self._last_interaction_text = f"当前操作未接受：{message}"
+        self._refresh_status(snapshot)
+
+    def _invalidate_current(self, message: str) -> None:
+        self._last_frame = None
+        self._stream_invalidated = True
+        self.preview.clear_image("当前没有可用的新鲜相机1画面")
+        self._last_interaction_text = f"当前判断已失效：{message}"
+        self._refresh_status(self.runtime.snapshot())
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.monitor.isRunning() and not self.monitor.stop(5000):

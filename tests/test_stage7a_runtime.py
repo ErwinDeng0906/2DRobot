@@ -328,7 +328,7 @@ def _runtime_fixture(run_dir: Path, *, approved: bool):
 
 
 def _load_task10_module():
-    path = PROJECT_ROOT / "Preset Trajectories" / "task10.py"
+    path = PROJECT_ROOT / "Tasks" / "task10.py"
     spec = importlib.util.spec_from_file_location("task10_stage7a_contract_test", path)
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load task10.py")

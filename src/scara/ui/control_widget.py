@@ -572,7 +572,7 @@ class ScaraControlWidget(QWidget):
     def _choose_action_file(self) -> None:
         """选择并校验只描述步骤、导入时绝不访问硬件的动作插件。"""
         project_root = Path(__file__).resolve().parents[3]
-        initial_dir = project_root / "Preset Trajectories"
+        initial_dir = project_root / "Tasks"
         if not initial_dir.is_dir():
             initial_dir = project_root
         selected, _ = QFileDialog.getOpenFileName(
@@ -1213,7 +1213,7 @@ class ScaraControlWidget(QWidget):
             return
 
         project_root = Path(__file__).resolve().parents[3]
-        task9_path = project_root / "Preset Trajectories" / "task9_jacobiantest.py"
+        task9_path = project_root / "Tasks" / "task9_jacobiantest.py"
         try:
             module_name = (
                 f"_scara_local_task9_{target_name}_"

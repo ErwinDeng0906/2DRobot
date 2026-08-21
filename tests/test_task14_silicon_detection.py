@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
-TASK14_PATH = ROOT / "Preset Trajectories" / "task14.py"
+TASK14_PATH = ROOT / "Tasks" / "task14_silicon test.py"
 
 
 def _load_task14():
@@ -494,7 +494,7 @@ class Task14ReportTests(unittest.TestCase):
             )
             self.assertEqual("raw_task14", report["artifacts"]["raw_directory"])
             self.assertEqual(
-                "silicon_detection_0818",
+                "silicon_detection_0820_geometry_robust",
                 report["locked_inputs"]["silicon_detection_profile_name"],
             )
             self.assertEqual(

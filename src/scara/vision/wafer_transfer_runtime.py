@@ -33,6 +33,10 @@ from .runtime_tray_registration import (
     build_runtime_tray_registration,
     load_planar_handeye,
 )
+from .silicon_detection_config import (
+    load_silicon_detection_config,
+    preferred_silicon_detection_config_path,
+)
 from .slot_marker_observation import load_slot_marker_layout
 from .tray_pose_estimator import (
     TrayBoardPoseEstimator,
@@ -72,12 +76,19 @@ class LiveWaferTransferRuntime:
         )
         self.geometry = load_tray_board_geometry(self.geometry_path)
         self.intrinsics = load_camera_intrinsics(self.intrinsics_path)
+        self.silicon_detection_config_path = (
+            preferred_silicon_detection_config_path(self.project_root)
+        )
+        self.silicon_detection_config = load_silicon_detection_config(
+            self.silicon_detection_config_path
+        )
         self.estimator = TrayBoardPoseEstimator(self.geometry, self.intrinsics)
         self.tracker = TrayPoseTracker(self.estimator)
         self.analyzer = TrayVisionAnalyzer(
             self.estimator,
             self.geometry,
             load_slot_marker_layout(self.slot_layout_path),
+            self.silicon_detection_config.fusion_config,
         )
         self.session = WaferTransferSession(self.geometry)
         self.close_range_observer = (
@@ -112,6 +123,21 @@ class LiveWaferTransferRuntime:
             self._registration_candidate = None
             self._registration_error = self._calibration_error
             self.session.clear_registration()
+            self.session.clear_overview_history("runtime registration reset")
+
+    def invalidate_camera1(self, reason: str) -> None:
+        """Invalidate every coordinate-bearing value after a stale/bad stream."""
+
+        with self._lock:
+            message = str(reason)
+            self._registration_samples.clear()
+            self._registration_candidate = None
+            self._registration_error = message
+            self._last_result = None
+            self._last_frame = None
+            self.tracker.reset()
+            self.session.clear_registration()
+            self.session.invalidate_overview(message)
 
     @staticmethod
     def _robot_state_for_frame(
@@ -223,6 +249,7 @@ class LiveWaferTransferRuntime:
                     active_phase = self.session.phase.value not in {
                         "idle",
                         "source_selected",
+                        "source_ready",
                         "route_ready",
                     }
                     if active_phase and (translation_drift > 0.75 or yaw_drift > 0.25):
@@ -234,6 +261,12 @@ class LiveWaferTransferRuntime:
                         self._registration_error = reason
                         self.session.block(reason)
                         return
+                    if not active_phase and (
+                        translation_drift > 0.75 or yaw_drift > 0.25
+                    ):
+                        self.session.clear_overview_history(
+                            "runtime tray registration changed before target lock"
+                        )
                 self.session.set_registration(candidate)
                 self._registration_error = ""
             else:
@@ -401,6 +434,7 @@ class LiveWaferTransferRuntime:
                 3,
                 cv2.LINE_AA,
             )
+        self._draw_suction_navigation(canvas, result, snapshot)
         lines = [
             f"transfer: {snapshot.get('phase', 'unknown')}",
             f"source={snapshot.get('source_slot') or '--'}  destination={snapshot.get('destination_slot') or '--'}",
@@ -442,6 +476,67 @@ class LiveWaferTransferRuntime:
                 cv2.LINE_AA,
             )
         return canvas
+
+    def _draw_suction_navigation(
+        self,
+        canvas: np.ndarray,
+        result: TrayVisionResult,
+        snapshot: Mapping[str, Any],
+    ) -> None:
+        """Draw the current suction XY and locked target in the tray image."""
+
+        registration = snapshot.get("registration")
+        robot_state = snapshot.get("robot_state")
+        target_slot = snapshot.get("active_target_slot")
+        target = self._selected_analysis(result, target_slot)
+        if (
+            not isinstance(registration, Mapping)
+            or not isinstance(robot_state, Mapping)
+            or target is None
+            or not result.quality_passed
+        ):
+            return
+        try:
+            transform_W_T = np.asarray(
+                registration.get("transform_W_T"), dtype=np.float64
+            ).reshape(4, 4)
+            pose = np.asarray(robot_state.get("pose"), dtype=np.float64).reshape(6)
+            if not np.all(np.isfinite(transform_W_T)) or not np.all(np.isfinite(pose)):
+                return
+            transform_T_W = np.linalg.inv(transform_W_T)
+            suction_T = transform_T_W @ np.asarray(
+                [float(pose[0]), float(pose[1]), 0.0, 1.0], dtype=np.float64
+            )
+            target_z = float(target.projection.center_T_mm[2])
+            projected = self.estimator.project_tray_points(
+                np.asarray([[suction_T[0], suction_T[1], target_z]], dtype=np.float64),
+                result.pose,
+            )[0]
+        except (TypeError, ValueError, np.linalg.LinAlgError):
+            return
+        suction_px = tuple(np.round(projected).astype(int))
+        target_px = tuple(np.round(target.projection.center_px).astype(int))
+        colour = (255, 255, 0)
+        cv2.circle(canvas, suction_px, 12, colour, 4, cv2.LINE_AA)
+        cv2.arrowedLine(
+            canvas,
+            suction_px,
+            target_px,
+            colour,
+            4,
+            cv2.LINE_AA,
+            tipLength=0.08,
+        )
+        cv2.putText(
+            canvas,
+            "SUCTION XY",
+            (suction_px[0] + 14, suction_px[1] - 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.82,
+            colour,
+            3,
+            cv2.LINE_AA,
+        )
 
     def select_pixel(
         self, pixel: Sequence[float], *, role: str
@@ -532,6 +627,15 @@ class LiveWaferTransferRuntime:
                 "camera1_intrinsics": str(self.intrinsics_path),
                 "tray_geometry": str(self.geometry_path),
                 "slot_marker_layout": str(self.slot_layout_path),
+                "silicon_detection_config": str(
+                    self.silicon_detection_config.source_path
+                ),
+                "silicon_detection_profile": (
+                    self.silicon_detection_config.profile_name
+                ),
+                "silicon_detection_sha256": (
+                    self.silicon_detection_config.source_sha256
+                ),
             }
             return payload
 

@@ -28,6 +28,7 @@ from .tray_vision_fusion import TrayVisionResult
 class TransferPhase(str, Enum):
     IDLE = "idle"
     SOURCE_SELECTED = "source_selected"
+    SOURCE_READY = "source_ready"
     ROUTE_READY = "route_ready"
     TRACKING_PICK = "tracking_pick"
     WAITING_PICK_ALIGNMENT = "waiting_pick_alignment"
@@ -50,6 +51,8 @@ class WaferTransferConfig:
     maximum_close_range_j3_disagreement_mm: float = 0.15
     click_maximum_slot_distance_mm: float = 12.5
     coarse_arrival_distance_mm: float = 2.0
+    source_consensus_window_frames: int = 5
+    source_consensus_minimum_occupied_frames: int = 3
     pick_requires_close_range_alignment: bool = True
     place_requires_close_range_insertability: bool = True
 
@@ -143,6 +146,16 @@ class WaferTransferSession:
         self.slot_names = frozenset(str(key) for key in self.geometry.get("slots", {}))
         if len(self.slot_names) != 36:
             raise ValueError("wafer transfer requires exactly 36 metric tray slots")
+        if config.source_consensus_window_frames < 1:
+            raise ValueError("source consensus window must contain at least one frame")
+        if not (
+            1
+            <= config.source_consensus_minimum_occupied_frames
+            <= config.source_consensus_window_frames
+        ):
+            raise ValueError(
+                "source consensus minimum must be within the configured frame window"
+            )
         self.phase = TransferPhase.IDLE
         self.source_slot: Optional[str] = None
         self.destination_slot: Optional[str] = None
@@ -155,6 +168,10 @@ class WaferTransferSession:
         self.block_reason = ""
         self.close_range_gates: dict[str, dict[str, Any]] = {}
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
+        self._slot_state_history = {
+            slot: deque(maxlen=config.source_consensus_window_frames)
+            for slot in self.slot_names
+        }
 
     def _event(self, name: str, **details: Any) -> None:
         self.events.append(
@@ -199,6 +216,39 @@ class WaferTransferSession:
         self._event("runtime_registration_cleared")
         self._refresh_ready_phase()
 
+    def clear_overview_history(self, reason: str) -> None:
+        for history in self._slot_state_history.values():
+            history.clear()
+        self._event("overview_history_cleared", reason=str(reason))
+        self._refresh_ready_phase()
+
+    def invalidate_overview(self, reason: str) -> None:
+        """Discard stale camera/robot evidence and block any active lock."""
+
+        self.latest_result = None
+        self.latest_frame_sequence = None
+        self.latest_frame_captured_monotonic_s = None
+        self.latest_robot_state = None
+        for history in self._slot_state_history.values():
+            history.clear()
+        self.close_range = None
+        self.close_range_gates = {}
+        active = self.phase in {
+            TransferPhase.TRACKING_PICK,
+            TransferPhase.WAITING_PICK_ALIGNMENT,
+            TransferPhase.VERIFYING_PICK,
+            TransferPhase.PICKED,
+            TransferPhase.TRACKING_PLACE,
+            TransferPhase.WAITING_PLACE_ALIGNMENT,
+            TransferPhase.READY_TO_PLACE,
+            TransferPhase.VERIFYING_PLACE,
+        }
+        self._event("overview_invalidated", reason=str(reason))
+        if active:
+            self.block(f"camera1 overview invalidated: {reason}")
+        else:
+            self._refresh_ready_phase()
+
     def update_overview(
         self,
         result: TrayVisionResult,
@@ -207,6 +257,7 @@ class WaferTransferSession:
         frame_captured_monotonic_s: float,
         robot_state: Optional[Mapping[str, Any]],
     ) -> None:
+        is_new_frame = self.latest_frame_sequence != int(frame_sequence)
         self.latest_result = result
         self.latest_frame_sequence = int(frame_sequence)
         self.latest_frame_captured_monotonic_s = float(frame_captured_monotonic_s)
@@ -227,8 +278,45 @@ class WaferTransferSession:
                     self.latest_robot_state = state
             except (TypeError, ValueError, OverflowError):
                 self.latest_robot_state = None
+        if (
+            is_new_frame
+            and result.quality_passed
+            and result.coordinate_mapping_allowed
+        ):
+            for slot, state in _slot_states(result).items():
+                history = self._slot_state_history.get(slot)
+                if history is not None:
+                    history.append(str(state["state"]))
         self._refresh_ready_phase()
         self._advance_tracking_phase()
+
+    def source_consensus(self, slot_name: Optional[str] = None) -> dict[str, Any]:
+        """Return the recent independent evidence used to accept a source."""
+
+        slot = self.source_slot if slot_name is None else str(slot_name)
+        history = list(self._slot_state_history.get(slot or "", ()))
+        occupied_count = sum(
+            state == SlotState.OCCUPIED.value for state in history
+        )
+        latest_occupied = bool(
+            history and history[-1] == SlotState.OCCUPIED.value
+        )
+        return {
+            "slot": slot,
+            "states": history,
+            "observed_frame_count": len(history),
+            "occupied_frame_count": int(occupied_count),
+            "required_occupied_frame_count": int(
+                self.config.source_consensus_minimum_occupied_frames
+            ),
+            "window_frame_count": int(self.config.source_consensus_window_frames),
+            "latest_is_occupied": latest_occupied,
+            "passed": bool(
+                latest_occupied
+                and occupied_count
+                >= self.config.source_consensus_minimum_occupied_frames
+            ),
+        }
 
     def select_source(self, slot_name: str) -> None:
         slot = str(slot_name)
@@ -242,6 +330,14 @@ class WaferTransferSession:
         if state["state"] != SlotState.OCCUPIED.value:
             raise ValueError(
                 f"source {slot} must be a normal occupied slot; current state={state['state']}"
+            )
+        consensus = self.source_consensus(slot)
+        if consensus["passed"] is not True:
+            raise ValueError(
+                f"source {slot} is not temporally stable: "
+                f"{consensus['occupied_frame_count']}/"
+                f"{consensus['window_frame_count']} recent frames are normal occupied; "
+                f"at least {consensus['required_occupied_frame_count']} are required"
             )
         self.source_slot = slot
         if self.destination_slot == slot:
@@ -273,10 +369,10 @@ class WaferTransferSession:
         self._event("destination_selected", slot=slot, state=state)
         self._refresh_ready_phase()
 
-    def _selection_gates(self) -> dict[str, dict[str, Any]]:
+    def _source_tracking_gates(self) -> dict[str, dict[str, Any]]:
         states = _slot_states(self.latest_result)
         source = states.get(self.source_slot or "")
-        destination = states.get(self.destination_slot or "")
+        consensus = self.source_consensus()
         pose_passed = bool(
             self.latest_result is not None
             and self.latest_result.quality_passed
@@ -294,20 +390,22 @@ class WaferTransferSession:
                 ),
                 "limit": "existing Tray pose quality gates",
             },
-            "source_normal_occupied": {
+            "source_normal_occupied_consensus": {
                 "passed": bool(
-                    source is not None and source["state"] == SlotState.OCCUPIED.value
+                    source is not None
+                    and source["state"] == SlotState.OCCUPIED.value
+                    and consensus["passed"] is True
                 ),
-                "actual": None if source is None else source["state"],
-                "limit": SlotState.OCCUPIED.value,
-            },
-            "destination_proven_empty": {
-                "passed": bool(
-                    destination is not None
-                    and destination["safe_to_use_as_empty"] is True
+                "actual": {
+                    "latest_state": None if source is None else source["state"],
+                    "occupied_frames": consensus["occupied_frame_count"],
+                    "observed_frames": consensus["observed_frame_count"],
+                },
+                "limit": (
+                    f"latest={SlotState.OCCUPIED.value} and at least "
+                    f"{self.config.source_consensus_minimum_occupied_frames}/"
+                    f"{self.config.source_consensus_window_frames} recent frames occupied"
                 ),
-                "actual": None if destination is None else destination["state"],
-                "limit": "safe_to_use_as_empty=true",
             },
             "runtime_registration": {
                 "passed": transform is not None,
@@ -332,6 +430,26 @@ class WaferTransferSession:
             },
         }
 
+    def _route_gates(self) -> dict[str, dict[str, Any]]:
+        gates = self._source_tracking_gates()
+        destination = _slot_states(self.latest_result).get(
+            self.destination_slot or ""
+        )
+        gates["destination_proven_empty"] = {
+            "passed": bool(
+                destination is not None
+                and destination["safe_to_use_as_empty"] is True
+            ),
+            "actual": None if destination is None else destination["state"],
+            "limit": "safe_to_use_as_empty=true",
+        }
+        return gates
+
+    def _selection_gates(self) -> dict[str, dict[str, Any]]:
+        """Compatibility alias for the source-only pickup navigation gates."""
+
+        return self._source_tracking_gates()
+
     def _refresh_ready_phase(self) -> None:
         if self.phase in {
             TransferPhase.TRACKING_PICK,
@@ -349,21 +467,25 @@ class WaferTransferSession:
         if self.source_slot is None:
             self.phase = TransferPhase.IDLE
             return
-        if self.destination_slot is None:
-            self.phase = TransferPhase.SOURCE_SELECTED
-            return
-        gates = self._selection_gates()
-        self.phase = (
-            TransferPhase.ROUTE_READY
-            if all(gate["passed"] for gate in gates.values())
-            else TransferPhase.SOURCE_SELECTED
+        source_ready = all(
+            gate["passed"] for gate in self._source_tracking_gates().values()
         )
+        route_ready = bool(
+            self.destination_slot is not None
+            and all(gate["passed"] for gate in self._route_gates().values())
+        )
+        if route_ready:
+            self.phase = TransferPhase.ROUTE_READY
+        elif source_ready:
+            self.phase = TransferPhase.SOURCE_READY
+        else:
+            self.phase = TransferPhase.SOURCE_SELECTED
 
     def start_tracking(self) -> None:
-        gates = self._selection_gates()
+        gates = self._source_tracking_gates()
         failed = [name for name, gate in gates.items() if gate["passed"] is not True]
         if failed:
-            raise RuntimeError("transfer route is not ready: " + ", ".join(failed))
+            raise RuntimeError("pickup navigation is not ready: " + ", ".join(failed))
         self.phase = TransferPhase.TRACKING_PICK
         self.block_reason = ""
         self._event(
@@ -558,6 +680,11 @@ class WaferTransferSession:
     def start_place_tracking(self) -> None:
         if self.phase is not TransferPhase.PICKED:
             raise RuntimeError("placement tracking requires a verified picked wafer")
+        if self.destination_slot is None:
+            raise RuntimeError("select a proven-empty destination before placement tracking")
+        destination = _slot_states(self.latest_result).get(self.destination_slot)
+        if destination is None or destination["safe_to_use_as_empty"] is not True:
+            raise RuntimeError("the selected destination is no longer proven empty")
         self.phase = TransferPhase.TRACKING_PLACE
         self.close_range = None
         self.close_range_gates = {}
@@ -606,7 +733,9 @@ class WaferTransferSession:
         destination_world = self.slot_world_xy(self.destination_slot)
         delta = self.active_delta_world_xy()
         distance = None if delta is None else float(np.linalg.norm(delta))
-        gates = self._selection_gates()
+        navigation_gates = self._source_tracking_gates()
+        route_gates = self._route_gates()
+        consensus = self.source_consensus()
         return {
             "schema_version": 1,
             "phase": self.phase.value,
@@ -635,9 +764,18 @@ class WaferTransferSession:
                 None if delta is None else delta.astype(float).tolist()
             ),
             "active_distance_mm": distance,
-            "selection_gates": gates,
+            "source_consensus": consensus,
+            "selection_gates": navigation_gates,
+            "navigation_gates": navigation_gates,
+            "route_gates": route_gates,
             "coordinate_ready": _validated_transform_W_T(self.registration) is not None,
-            "tracking_ready": all(gate["passed"] for gate in gates.values()),
+            "tracking_ready": all(
+                gate["passed"] for gate in navigation_gates.values()
+            ),
+            "route_ready": bool(
+                self.destination_slot is not None
+                and all(gate["passed"] for gate in route_gates.values())
+            ),
             "robot_motion_authorized": False,
             "motion_authorization_note": (
                 "This session is observation-only. Existing ActionWorker P22 safety paths remain authoritative."

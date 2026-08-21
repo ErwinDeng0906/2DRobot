@@ -1,6 +1,6 @@
 # 阶段 5：机械臂 XY 命令到图像误差的局部 Jacobian
 
-本文是 `Preset Trajectories/task9_jacobiantest.py` 与
+本文是 `Tasks/task9_jacobiantest.py` 与
 `src/scara/vision/xy_image_jacobian_runtime.py` 的算法和安全约定。阶段 5 的目的，是在
 固定观察高度和固定吸盘朝向下，测量机械臂世界坐标 XY 小命令会怎样改变相机1中的槽位误差。
 

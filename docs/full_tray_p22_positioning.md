@@ -101,7 +101,7 @@ e_T={}^T p_{P22}-{}^T p_S,
 - `src/scara/calib/camera1_forearm_planar_handeye.json`：一次性固定高度平面手眼；质量门全部通过才安装。
 - `runtime_tray_registration.json`：本次会话的W←T、相对Stage2变化、5帧或三姿态证据。
 - `full_tray_positioning.json`：粗定位、每轮毫米误差/命令/实际改善、最终hold和安全门。
-- `Preset Trajectories/task13_planar handeye.py`：从预设点`P22 float`开始，以Tray geometry生成其余观察姿态；后处理用Task8+Task13验证，不依赖Task12。
+- `Tasks/task13_planar handeye.py`：从预设点`P22 float`开始，以Tray geometry生成其余观察姿态；后处理用Task8+Task13验证，不依赖Task12。
 
 ## 明确不做的事
 

@@ -13,7 +13,7 @@ Task9 的 (2\times2) Jacobian 只在 P22 每轴 ±2 mm 内通过了实测。Task
 
 ## 2. Task11 只声明采集动作
 
-`Preset Trajectories/task11.py` 只包含固定 J3/Rz 的关节运动、等待、途径点
+`Tasks/task11.py` 只包含固定 J3/Rz 的关节运动、等待、途径点
 记录和相机1拍照。它不包含拟合方程，也没有 Z、DO、真空或接触动作。
 
 采集设计为：
