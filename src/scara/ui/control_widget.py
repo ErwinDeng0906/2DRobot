@@ -45,6 +45,18 @@ JOINT_RANGE = [(-132, 132), (-141, 141), (-150, 10), (-360, 360)]
 POSE_LABELS = ["X", "Y", "Z", "Rx", "Ry", "Rz"]
 POSE_UNIT = ["mm", "mm", "mm", "°", "°", "°"]
 
+
+def _wafer_correction_output_dir(
+    project_root: Path, at: Optional[datetime] = None
+) -> Path:
+    """Return a collision-resistant evidence directory for one correction."""
+
+    stamp = (datetime.now() if at is None else at).strftime(
+        "%y%m%d%H%M%S_%f"
+    )
+    return Path(project_root) / "Trajectory Photos" / stamp
+
+
 _CHK = Path(__file__).parent.joinpath("check.svg").as_posix()
 
 # SCARA 页局部深色色板（不改全局 design_system，DUCO 页保持浅色）
@@ -630,6 +642,7 @@ class ScaraControlWidget(QWidget):
             point_count = sum(step["type"] == "record_point" for step in task["actions"])
             photo_count = sum(step["type"] == "capture" for step in task["actions"])
             video_count = sum(step["type"] == "start_video" for step in task["actions"])
+            do_count = sum(step["type"] == "set_do" for step in task["actions"])
             self._action_file = path
             self._action_builder = build
             self._action_camera_calculator = camera_calculator
@@ -639,7 +652,8 @@ class ScaraControlWidget(QWidget):
             self._btn_import_action.setToolTip(str(path))
             self._btn_run_action.setEnabled(True)
             self._action_label.setText(
-                f"{path.name} · {point_count} 点/{photo_count} 照片/{video_count} 录像"
+                f"{path.name} · {point_count} 点/{photo_count} 照片/"
+                f"{video_count} 录像/{do_count} DO"
             )
             self._append(
                 "动作",
@@ -728,6 +742,8 @@ class ScaraControlWidget(QWidget):
         runtime_move_count = sum(
             step["type"] == "runtime_move_joints" for step in task["actions"]
         )
+        do_steps = [step for step in task["actions"] if step["type"] == "set_do"]
+        do_channels = sorted({int(step["channel"]) for step in do_steps})
         confirmation = QMessageBox(self)
         confirmation.setIcon(QMessageBox.Icon.Warning)
         confirmation.setWindowTitle("确认执行动作")
@@ -736,8 +752,10 @@ class ScaraControlWidget(QWidget):
             f"相机源：{', '.join(f'#{source}' for source in sources) or '无'}\n"
             f"记录点：{point_count}；照片：{photo_count}；录像：{video_count}\n"
             f"运行时人工确认关节运动：{runtime_move_count}\n"
+            f"DO写入：{len(do_steps)}次；通道："
+            f"{', '.join(f'DO{channel}' for channel in do_channels) or '无'}\n"
             "相机坐标：旋转相机按 Rz 计算；源1按 J1+J2 计算\n\n"
-            "动作会按脚本自动运动并直接打开所需相机源。\n"
+            "动作会按脚本自动运动、打开所需相机源并切换列出的DO。\n"
             f"输出：{output_dir}\n\n"
             "请确认机械臂位于脚本要求的起点、工作区无障碍物、速度较低，"
             "且物理急停可用。"
@@ -1091,6 +1109,12 @@ class ScaraControlWidget(QWidget):
                 self._start_full_tray_positioning
             )
             dialog.full_tray_stop_requested.connect(self._stop_stage7b)
+            dialog.wafer_correction_start_requested.connect(
+                self._start_wafer_correction
+            )
+            dialog.wafer_correction_stop_requested.connect(
+                self._stop_stage7b
+            )
             dialog.show()
             self._append(
                 "手眼交互",
@@ -1332,6 +1356,78 @@ class ScaraControlWidget(QWidget):
         )
         worker.start()
 
+    def _start_wafer_correction(self) -> None:
+        """Start nearest-P00 outside-wafer correction via ActionWorker."""
+
+        dialog = self._handeye_dialog
+        if dialog is None:
+            return
+        if self._action_worker is not None and self._action_worker.isRunning():
+            self._append(
+                "硅片纠错", "已有任务或XY定位会话运行中", _D["warning"]
+            )
+            return
+        if (
+            self._cam is None
+            or self._cam.source_index != 1
+            or not self._cam.isRunning()
+        ):
+            self._append(
+                "硅片纠错", "相机1未运行，已拒绝启动", _D["error"]
+            )
+            return
+        if not self._ctrl.motion_ready():
+            return
+        project_root = Path(__file__).resolve().parents[3]
+        output_dir = _wafer_correction_output_dir(project_root)
+        try:
+            task = normalize_action_task(
+                dialog.prepare_wafer_correction_session(output_dir)
+            )
+        except Exception as exc:
+            if getattr(dialog, "stage7b_active", False):
+                try:
+                    dialog.finish_stage7b_session(False, f"准备失败：{exc}")
+                except Exception:
+                    pass
+            QMessageBox.critical(self, "硅片纠错准备失败", str(exc))
+            self._append("硅片纠错", f"准备失败：{exc}", _D["error"])
+            return
+
+        worker = ActionWorker(
+            self._ctrl,
+            task,
+            output_dir,
+            camera_position_calculator=self._action_camera_calculator,
+            source_position_calculators=(
+                self._action_source_position_calculators
+            ),
+            parent=self,
+        )
+        self._action_task = task
+        self._action_worker = worker
+        self._handeye_motion_mode = "wafer_correction"
+        worker.progress.connect(
+            lambda message: self._append(
+                "硅片纠错", message, _D["accent"]
+            )
+        )
+        worker.runtime_move_joints_requested.connect(
+            self._on_stage7b_runtime_move_joints
+        )
+        worker.run_finished.connect(self._on_stage7b_finished)
+        self._set_action_controls_locked(True)
+        self._btn_run_action.setEnabled(False)
+        self._btn_cam.setEnabled(False)
+        self._cam_idx.setEnabled(False)
+        self._btn_snap.setEnabled(False)
+        self._append(
+            "硅片纠错",
+            f"槽外硅片XY纠错已启动；输出文件夹 {output_dir}",
+            _D["warning"],
+        )
+        worker.start()
+
     def _on_stage7b_runtime_move_joints(self, request: dict) -> None:
         worker = self._action_worker
         dialog = self._handeye_dialog
@@ -1358,11 +1454,11 @@ class ScaraControlWidget(QWidget):
         worker = self._action_worker
         if worker is not None and worker.isRunning():
             worker.request_stop()
-            label = (
-                "全盘定位"
-                if self._handeye_motion_mode == "full_tray"
-                else "单点有限闭环"
-            )
+            label = {
+                "full_tray": "全盘定位",
+                "wafer_correction": "硅片纠错",
+                "single_loop": "单点有限闭环",
+            }.get(self._handeye_motion_mode, "XY定位")
             self._append(
                 label,
                 "已请求安全停止；不会再授权新的XY修正",
@@ -1371,7 +1467,11 @@ class ScaraControlWidget(QWidget):
 
     def _on_stage7b_finished(self, ok: bool, message: str, output_dir: str) -> None:
         mode = self._handeye_motion_mode
-        label = "全盘定位" if mode == "full_tray" else "单点有限闭环"
+        label = {
+            "full_tray": "全盘定位",
+            "wafer_correction": "硅片纠错",
+            "single_loop": "单点有限闭环",
+        }.get(mode, "XY定位")
         dialog = self._handeye_dialog
         if dialog is not None:
             try:

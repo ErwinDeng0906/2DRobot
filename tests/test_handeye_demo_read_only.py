@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1019,6 +1020,9 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                 )
                 self.assertEqual(dialog.stage7b_button.text(), "单点有限闭环")
                 self.assertEqual(dialog.full_tray_button.text(), "全盘定位")
+                self.assertEqual(
+                    dialog.wafer_correction_button.text(), "硅片纠错"
+                )
                 controls = None
                 root_layout = dialog.content_layout
                 for index in range(root_layout.count()):
@@ -1041,6 +1045,10 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                 self.assertEqual(
                     control_widgets.index(dialog.full_tray_button),
                     control_widgets.index(dialog.stage7b_button) + 1,
+                )
+                self.assertEqual(
+                    control_widgets.index(dialog.wafer_correction_button),
+                    control_widgets.index(dialog.full_tray_button) + 1,
                 )
                 safety_text = "\n".join(safety_labels)
                 self.assertIn("确认左侧选取的是P22", safety_text)
@@ -1066,6 +1074,37 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                     dialog.full_tray_button.click()
                 self.assertEqual(emitted, [True])
 
+                wafer_emitted: list[bool] = []
+                dialog.wafer_correction_start_requested.connect(
+                    lambda: wafer_emitted.append(True)
+                )
+                dialog._last_evaluation = SimpleNamespace(accepted=True)
+                dialog._last_tray_result = SimpleNamespace(
+                    success=True,
+                    quality_passed=True,
+                    coordinate_mapping_allowed=True,
+                )
+                dialog._last_evaluation_at = time.monotonic()
+                preview_candidate = {
+                    "slot_key": "P01",
+                    "center_T_mm": [-0.5, -24.8, -2.0],
+                    "distance_to_p00_mm": 24.805,
+                }
+                with (
+                    patch.object(
+                        QMessageBox,
+                        "exec",
+                        return_value=QMessageBox.StandardButton.Yes,
+                    ),
+                    patch(
+                        "scara.ui.handeye_demo_dialog."
+                        "extract_outside_wafer_candidates",
+                        return_value=[preview_candidate],
+                    ),
+                ):
+                    dialog.wafer_correction_button.click()
+                self.assertEqual(wafer_emitted, [True])
+
                 # A stale PASS image/result must be explicitly discarded.
                 dialog._last_image = QImage(8, 8, QImage.Format.Format_RGB888)
                 dialog._last_evaluation = object()  # type: ignore[assignment]
@@ -1088,6 +1127,186 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                 self.app.processEvents()
                 if dialog.monitor.isRunning():
                     self.assertTrue(dialog.monitor.stop())
+
+    def test_wafer_window_skips_transient_candidate_dropout(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls: list[tuple[dict, list[dict]]] = []
+
+            def build_response(self, request, samples):
+                self.calls.append((dict(request), list(samples)))
+                return {
+                    "request_id": request["request_id"],
+                    "decision": "complete",
+                    "reason": "synthetic complete",
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._temporary_project(root)
+            camera = FakeCamera(running=True)
+            dialog = HandEyeDemoDialog(root, camera)
+            dialog.monitor.stop()
+            session = FakeSession()
+            dialog._stage7b_active = True
+            dialog._positioning_mode = "wafer_correction"
+            dialog._stage7b_session = session
+            responses: list[dict] = []
+            requested = time.monotonic()
+            request = {
+                "request_id": "wafer-transient",
+                "requested_monotonic_s": requested,
+            }
+
+            def wafer_sample(index: int, *, valid: bool) -> dict:
+                return {
+                    "measurement_id": f"wafer-{index}",
+                    "captured_monotonic_s": requested + 0.01 * index,
+                    "accepted": True,
+                    "target_name": "P13",
+                    "outside_wafer_candidates": (
+                        [{"slot_key": "P00", "center_T_mm": [1.0, 2.0, -2.0]}]
+                        if valid
+                        else []
+                    ),
+                    "outside_wafer_candidate_error": (
+                        None
+                        if valid
+                        else "expanded ROI touches image boundary"
+                    ),
+                }
+
+            try:
+                dialog.begin_stage7b_request(request, responses.append)
+                dialog._stage7b_samples.append(
+                    wafer_sample(1, valid=False)
+                )
+                for index in range(2, 6):
+                    dialog._stage7b_samples.append(
+                        wafer_sample(index, valid=True)
+                    )
+                dialog._try_stage7b_response()
+                self.assertEqual([], responses)
+                self.assertEqual([], session.calls)
+                self.assertIn("4/5", dialog.stage7b_status.toPlainText())
+                self.assertIn(
+                    "expanded ROI touches image boundary",
+                    dialog.stage7b_status.toPlainText(),
+                )
+
+                dialog._stage7b_samples.append(
+                    wafer_sample(6, valid=True)
+                )
+                dialog._try_stage7b_response()
+                self.assertEqual(1, len(responses))
+                self.assertEqual(1, len(session.calls))
+                used_samples = session.calls[0][1]
+                self.assertEqual(5, len(used_samples))
+                self.assertTrue(
+                    all(row["outside_wafer_candidates"] for row in used_samples)
+                )
+                self.assertTrue(
+                    all(
+                        not row["outside_wafer_candidate_error"]
+                        for row in used_samples
+                    )
+                )
+            finally:
+                dialog._stage7b_active = False
+                camera.running = False
+                dialog.close()
+
+    def test_wafer_timeout_reports_latest_candidate_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._temporary_project(root)
+            camera = FakeCamera(running=True)
+            dialog = HandEyeDemoDialog(root, camera)
+            dialog.monitor.stop()
+            dialog._stage7b_active = True
+            dialog._positioning_mode = "wafer_correction"
+            dialog._stage7b_session = SimpleNamespace()
+            responses: list[dict] = []
+            requested = time.monotonic()
+            request = {
+                "request_id": "wafer-timeout",
+                "requested_monotonic_s": requested,
+            }
+            try:
+                dialog.begin_stage7b_request(request, responses.append)
+                dialog._stage7b_samples.append(
+                    {
+                        "measurement_id": "wafer-bad",
+                        "captured_monotonic_s": requested + 0.01,
+                        "accepted": True,
+                        "target_name": "P00",
+                        "outside_wafer_candidates": [],
+                        "outside_wafer_candidate_error": (
+                            "full contour refinement failed: seed too far"
+                        ),
+                    }
+                )
+                dialog._stage7b_timeout("wafer-timeout")
+                self.assertEqual(1, len(responses))
+                self.assertEqual("abort", responses[0]["decision"])
+                self.assertIn("seed too far", responses[0]["reason"])
+                self.assertIn(
+                    "seed too far", dialog.stage7b_status.toPlainText()
+                )
+            finally:
+                dialog._stage7b_active = False
+                camera.running = False
+                dialog.close()
+
+    def test_finish_releases_dialog_when_report_save_raises(self) -> None:
+        class FailingSession:
+            status = "converged"
+
+            @staticmethod
+            def finish(_ok: bool, _message: str) -> None:
+                raise OSError("synthetic disk full")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._temporary_project(root)
+            camera = FakeCamera(running=True)
+            dialog = HandEyeDemoDialog(root, camera)
+            dialog.monitor.stop()
+            dialog._stage7b_active = True
+            dialog._positioning_mode = "wafer_correction"
+            dialog._stage7b_session = FailingSession()
+            dialog.target_combo.setEnabled(False)
+            dialog.stage7b_button.setEnabled(False)
+            dialog.full_tray_button.setEnabled(False)
+            dialog.wafer_correction_button.setText("停止硅片纠错")
+            try:
+                ok, message = dialog.finish_stage7b_session(
+                    True, "worker completed"
+                )
+                self.assertFalse(ok)
+                self.assertIn("报告收尾失败", message)
+                self.assertIn("synthetic disk full", message)
+                self.assertFalse(dialog.stage7b_active)
+                self.assertIsNone(dialog._stage7b_session)
+                self.assertIsNone(dialog._positioning_mode)
+                self.assertTrue(dialog.target_combo.isEnabled())
+                self.assertTrue(dialog.stage7b_button.isEnabled())
+                self.assertTrue(dialog.full_tray_button.isEnabled())
+                self.assertTrue(dialog.wafer_correction_button.isEnabled())
+                self.assertEqual("硅片纠错", dialog.wafer_correction_button.text())
+            finally:
+                camera.running = False
+                dialog.close()
+
+    def test_wafer_output_directory_contains_microseconds(self) -> None:
+        from scara.ui.control_widget import _wafer_correction_output_dir
+
+        output = _wafer_correction_output_dir(
+            Path("C:/synthetic-project"),
+            datetime(2026, 8, 20, 12, 34, 56, 123456),
+        )
+        self.assertEqual("260820123456_123456", output.name)
+        self.assertEqual("Trajectory Photos", output.parent.name)
 
     def test_hardware_exposure_slider_uses_integer_directshow_stops_and_restores(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1337,7 +1556,7 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                 dialog.close()
                 self.app.processEvents()
 
-    def test_slot_table_distinguishes_stacked_outside_and_both(self) -> None:
+    def test_slot_table_hides_dormant_stacking_states(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self._temporary_project(root)
@@ -1347,9 +1566,9 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                 self.assertTrue(dialog.monitor.stop())
                 result = self._tray_result_for_table()
                 expected = {
-                    "P02": ("stacked", "叠片"),
+                    "P02": ("stacked", "警告"),
                     "P03": ("outside_slot", "槽外"),
-                    "P04": ("stacked_outside_slot", "叠片且槽外"),
+                    "P04": ("stacked_outside_slot", "槽外"),
                 }
                 result.summary["empty"] -= len(expected)
                 for slot_name, (state, _text) in expected.items():
@@ -1366,7 +1585,9 @@ class HandEyeDialogOfflineTests(unittest.TestCase):
                     self.assertEqual(dialog.slot_table.item(row, 1).text(), "是")
                     self.assertEqual(dialog.slot_table.item(row, 5).text(), text)
                 self.assertIn("占用=4", dialog.tray_summary.text())
-                self.assertIn("叠片=1、槽外=1、叠片且槽外=1", dialog.tray_summary.text())
+                self.assertIn("槽外=2", dialog.tray_summary.text())
+                self.assertNotIn("叠片", dialog.tray_summary.text())
+                self.assertNotIn("STACK", dialog.tray_legend.text())
             finally:
                 camera.running = False
                 dialog.close()

@@ -69,7 +69,21 @@ class SiliconDetectionConfigTests(unittest.TestCase):
         self.assertEqual(192, loaded.fusion_config.canonical_patch_size)
         self.assertAlmostEqual(11.5, loaded.fusion_config.slot_half_extent_mm)
         self.assertAlmostEqual(
+            19.9, loaded.fusion_config.physical_slot_side_length_mm
+        )
+        self.assertAlmostEqual(
+            0.75,
+            loaded.fusion_config.physical_slot_boundary_uncertainty_mm,
+        )
+        self.assertAlmostEqual(
+            1.5,
+            loaded.fusion_config.unregistered_slot_boundary_uncertainty_mm,
+        )
+        self.assertAlmostEqual(
             0.86, loaded.fusion_config.wafer_quality.maximum_normal_side_ratio
+        )
+        self.assertFalse(
+            loaded.fusion_config.wafer_quality.stacking_detection_enabled
         )
         self.assertEqual(64, len(loaded.source_sha256))
 
@@ -84,6 +98,17 @@ class SiliconDetectionConfigTests(unittest.TestCase):
         self.assertEqual("alternate", loaded.profile_name)
         self.assertAlmostEqual(
             0.55, loaded.fusion_config.wafer_quality.minimum_chromatic_fraction
+        )
+
+    def test_legacy_profile_without_stacking_switch_defaults_to_disabled(self) -> None:
+        payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
+        payload["wafer_quality"].pop("stacking_detection_enabled")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "legacy.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = load_silicon_detection_config(path)
+        self.assertFalse(
+            loaded.fusion_config.wafer_quality.stacking_detection_enabled
         )
 
     def test_partial_unknown_and_fractional_integer_fields_fail_closed(self) -> None:

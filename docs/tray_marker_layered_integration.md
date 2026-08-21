@@ -20,12 +20,15 @@
 2. `wafer_shape_quality.py`
    - 在透视校正后的单槽小图中检测紫色/深色高饱和度硅片。
    - 使用面积、边长、长宽比、矩形度、实心度、中心偏移、相对角度、轮廓顶点、连通块和内部边线判断正常、警告或异常。
-   - 单独的内部直线和第二颜色连通块只作为警告证据；只有内部边形成有效L角，或检测到第二个方形轮廓，才确认叠片。
+   - 叠片检测函数（内部边、L角和第二四边形）仍保留；正式配置当前以
+     `stacking_detection_enabled=false` 临时跳过这些调用，避免反光造成叠片误判。
    - 要求候选区域具有足够的紫色色彩比例，避免把黑白 ArUco marker 当成硅片。
 
 3. `tray_occupancy.py`
-   - 状态包括 `empty`、`empty_unread_marker`、`occupied`、`warning`、`stacked`、`outside_slot`、`stacked_outside_slot`、`out_of_view`、`occluded` 和 `unknown`。
-   - 原来的笼统 `abnormal` 已拆分：只有 `stacked_geometry_confirmed` 才显示“叠片”；轮廓接触或越过槽边界时显示“槽外”；两类证据同时成立时显示“叠片且槽外”。其他槽内严重形状异常降为“警告”，不再冒充叠片。
+   - 当前展示状态包括 `empty`、`empty_unread_marker`、`occupied`、`warning`、
+     `outside_slot`、`out_of_view`、`occluded` 和 `unknown`。
+   - 休眠的叠片枚举和融合分支没有删除；检测开关关闭时，旧记录中的对应状态也只按
+     `warning` 或 `outside_slot` 展示。
    - 画面不完整时标为 `out_of_view`，不会标为 missing。
    - 只有显式传入遮挡 mask 时才使用 `occluded`；新相机默认没有固定机械臂 mask。
    - 没有 marker、没有可靠硅片、也没有明确遮挡时标为 `unknown`，不猜测为空槽。
@@ -59,8 +62,7 @@ metric_slot_transform = rot270
 
 1. 槽投影覆盖率不足 `slot_decision.minimum_image_coverage_ratio`：`out_of_view`。
 2. 显式遮挡 mask 覆盖率达到 `slot_decision.explicit_occlusion_ratio`：`occluded`。
-3. 找到硅片候选：按形状与边界证据给出 `occupied`、`warning`、`stacked`、
-   `outside_slot` 或 `stacked_outside_slot`。
+3. 找到硅片候选：按形状与边界证据给出 `occupied`、`warning` 或 `outside_slot`。
 4. 识别到该槽配置的 marker ID：`empty`。
 5. 能看到黑白 marker 图案但 ID 未解码：`empty_unread_marker`。
 6. 以上证据都不足：`unknown`。
@@ -131,12 +133,12 @@ python3 -m unittest tests.test_tray_marker_layered_integration -v
 动态画面下方新增36行槽状态表，固定按 `P00...P55` 排列，显示占用三态、
 Tray Frame 中的 `ΔX_T`、`ΔY_T`、平面距离和中文硅片状态。占用三态规则为：
 
-- `occupied/warning/stacked/outside_slot/stacked_outside_slot`：是；
+- `occupied/warning/outside_slot`：是；
 - `empty/empty_unread_marker`：否；
 - `out_of_view/occluded/unknown`：不确定。
 
-叠片几何确认后，相机1动态图用状态色绘制主轮廓并标注 `W1`，用青色绘制
-推断或检测到的第二硅片四边形并标注 `W2`；相同轮廓同时写入离线 JSON。
+当前动态图只显示主硅片轮廓和 `EMPTY/OCC/WARN/OUT/OOV/UNK` 等状态。
+第二硅片轮廓绘制代码仍保留在休眠分支中，只有以后重新打开配置开关才会恢复。
 
 UI相机和任务相机每次打开时都默认请求自动曝光。手眼动态UI另提供“相机1硬件曝光”
 整数滑杆，范围 `-13...-1`、步进 `1`，显示初值为 `-6` 但不会自动写入。只有操作者

@@ -69,6 +69,10 @@ from scara.vision.tray_vision_fusion import (
     TrayVisionFusionConfig,
     TrayVisionResult,
 )
+from scara.vision.wafer_correction_target import (
+    SLOT_QUADRILATERAL_CENTER_SOURCE,
+    extract_outside_wafer_candidates,
+)
 from scara.vision.xy_image_jacobian import REQUIRED_XY_JACOBIAN_QUALITY_GATES
 
 
@@ -131,6 +135,10 @@ QPushButton#fullTrayButton {
     color:#FFFFFF; background-color:#047857; border-color:#047857;
 }
 QPushButton#fullTrayButton:hover { background-color:#065F46; }
+QPushButton#waferCorrectionButton {
+    color:#FFFFFF; background-color:#7C3AED; border-color:#7C3AED;
+}
+QPushButton#waferCorrectionButton:hover { background-color:#6D28D9; }
 """
 
 
@@ -529,6 +537,8 @@ class HandEyeDemoDialog(QDialog):
     stage7b_stop_requested = pyqtSignal()
     full_tray_start_requested = pyqtSignal()
     full_tray_stop_requested = pyqtSignal()
+    wafer_correction_start_requested = pyqtSignal()
+    wafer_correction_stop_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -565,6 +575,7 @@ class HandEyeDemoDialog(QDialog):
         geometry = load_tray_board_geometry(
             self.project_root / "src/scara/calib/tray_board_geometry.json"
         )
+        self.geometry = geometry
         self._last_image: Optional[QImage] = None
         self._last_evaluation: Optional[HandEyeEvaluation] = None
         self._last_tray_result: Optional[TrayVisionResult] = None
@@ -583,7 +594,7 @@ class HandEyeDemoDialog(QDialog):
                 f"当前为源#{camera.source_index}"
             )
 
-        self.setWindowTitle("手眼交互 · 动态演示（只计算 / 两种XY定位模式需ARM）")
+        self.setWindowTitle("手眼交互 · 动态演示（只计算 / XY运动模式需ARM）")
         self.resize(1200, 960)
         self.setMinimumSize(900, 760)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -609,8 +620,10 @@ class HandEyeDemoDialog(QDialog):
         safety = QLabel(
             "默认动态演示只计算，机械臂不会移动。"
             "“local Jacobian标定”会对左侧所选槽运行Task9真实小幅XY采集；"
-            "“单点有限闭环”和“全盘定位”是独立的已确认XY运动模式；"
+            "“单点有限闭环”“全盘定位”和“硅片纠错”是独立的已确认XY运动模式；"
             "当前全盘定位只授权P22，启动前必须确认左侧选取的是P22。"
+            "硅片纠错只接受几何中心有效的OUT目标；优先使用完整轮廓中心，"
+            "明确OUT时允许用拟合四边形对角线交点；"
             "任何模式都不会下降或操作DO/真空。"
         )
         safety.setObjectName("safetyBanner")
@@ -641,6 +654,9 @@ class HandEyeDemoDialog(QDialog):
         self.full_tray_button = QPushButton("全盘定位")
         self.full_tray_button.setObjectName("fullTrayButton")
         controls.addWidget(self.full_tray_button)
+        self.wafer_correction_button = QPushButton("硅片纠错")
+        self.wafer_correction_button.setObjectName("waferCorrectionButton")
+        controls.addWidget(self.wafer_correction_button)
         close_button = QPushButton("关闭")
         close_button.clicked.connect(self.close)
         controls.addWidget(close_button)
@@ -734,15 +750,10 @@ class HandEyeDemoDialog(QDialog):
         )
         layout.addLayout(silicon_parameter_controls)
 
-        legend = QLabel(
-            "绿色十字＝指定槽中心　红色十字＝suction target　黄色箭头＝当前图像误差（红→绿）　"
-            "青色圆点＝A–H重投影角点　T-X/T-Y/T-Z＝托盘坐标轴\n"
-            "槽框状态：EMPTY空槽、OCC占用、WARN警告、STACK叠片、OUT槽外、"
-            "STACK+OUT叠片且槽外、OOV画面外、UNK证据不足；"
-            "白圈彩心＝硅片中心，连线表示相对槽中心偏差"
-        )
-        legend.setWordWrap(True)
-        layout.addWidget(legend)
+        self.tray_legend = QLabel()
+        self.tray_legend.setWordWrap(True)
+        self._update_tray_legend()
+        layout.addWidget(self.tray_legend)
 
         preview_controls = QHBoxLayout()
         preview_controls.addWidget(QLabel("相机1动态图（保持原始宽高比）："))
@@ -843,6 +854,9 @@ class HandEyeDemoDialog(QDialog):
         )
         self.stage7b_button.clicked.connect(self._on_stage7b_button)
         self.full_tray_button.clicked.connect(self._on_full_tray_button)
+        self.wafer_correction_button.clicked.connect(
+            self._on_wafer_correction_button
+        )
         self.monitor = HandEyeMonitorThread(
             camera,
             self.project_root,
@@ -887,6 +901,22 @@ class HandEyeDemoDialog(QDialog):
         )
         self.silicon_parameter_label.setToolTip(str(config.source_path))
 
+    def _update_tray_legend(self) -> None:
+        stacking_enabled = bool(
+            self.silicon_detection_config.fusion_config.wafer_quality.stacking_detection_enabled
+        )
+        state_text = (
+            "EMPTY空槽、OCC占用、WARN警告、STACK叠片、OUT槽外、"
+            "STACK+OUT叠片且槽外、OOV画面外、UNK证据不足"
+            if stacking_enabled
+            else "EMPTY空槽、OCC占用、WARN警告、OUT槽外、OOV画面外、UNK证据不足"
+        )
+        self.tray_legend.setText(
+            "绿色十字＝指定槽中心　红色十字＝suction target　黄色箭头＝当前图像误差（红→绿）　"
+            "青色圆点＝A–H重投影角点　T-X/T-Y/T-Z＝托盘坐标轴\n"
+            f"槽框状态：{state_text}；白圈彩心＝硅片中心，连线表示相对槽中心偏差"
+        )
+
     def _on_select_silicon_detection_parameters(self) -> None:
         """Open the native Windows picker and hot-switch a complete profile."""
 
@@ -923,6 +953,7 @@ class HandEyeDemoDialog(QDialog):
         self.silicon_detection_config = loaded
         self.monitor.set_tray_vision_config(loaded.fusion_config)
         self._update_silicon_parameter_label()
+        self._update_tray_legend()
         self._invalidate_current(
             f"硅片判定参数已保存为默认并切换为 {loaded.source_path.name}，等待新鲜帧"
         )
@@ -946,6 +977,22 @@ class HandEyeDemoDialog(QDialog):
         self._last_tray_result = tray_result
         self._last_evaluation_at = time.monotonic()
         self._update_slot_table(tray_result)
+        outside_wafer_candidate_error: Optional[str] = None
+        try:
+            outside_wafer_candidates = extract_outside_wafer_candidates(
+                tray_result, self.geometry
+            )
+            if not outside_wafer_candidates:
+                outside_wafer_candidate_error = (
+                    "当前帧未检出具有有效几何中心的OUT硅片候选"
+                )
+        except Exception as exc:
+            # The live table must remain available, but a malformed candidate
+            # is never forwarded into the motion session.
+            outside_wafer_candidates = []
+            outside_wafer_candidate_error = (
+                f"{exc.__class__.__name__}: {exc}"
+            )[:500]
         self._stage7b_samples.append(
             {
                 "measurement_id": evaluation.measurement_id,
@@ -973,6 +1020,10 @@ class HandEyeDemoDialog(QDialog):
                 "used_marker_count": evaluation.used_marker_count,
                 "reprojection_rms_px": evaluation.reprojection_rms_px,
                 "annotated_bgr": evaluation.annotated_bgr.copy(),
+                "outside_wafer_candidates": outside_wafer_candidates,
+                "outside_wafer_candidate_error": (
+                    outside_wafer_candidate_error
+                ),
             }
         )
         self._try_stage7b_response()
@@ -1110,6 +1161,15 @@ class HandEyeDemoDialog(QDialog):
             "occluded": ("不确定", "遮挡", "#FFEDD5", "#9A3412"),
             "unknown": ("不确定", "证据不足", "#E0F2FE", "#075985"),
         }
+        stacking_enabled = bool(
+            self.silicon_detection_config.fusion_config.wafer_quality.stacking_detection_enabled
+        )
+        # Dormant stacking states remain readable for old records, but the
+        # current production presentation collapses them into WARN / OUT.
+        hidden_stacking_states = {
+            "stacked": "warning",
+            "stacked_outside_slot": "outside_slot",
+        }
         analyses = {analysis.projection.slot_key: analysis for analysis in result.slots}
         for slot_name, row in self._slot_row_by_name.items():
             analysis = analyses.get(slot_name)
@@ -1117,6 +1177,8 @@ class HandEyeDemoDialog(QDialog):
                 self._set_slot_table_unavailable("槽位结果不完整")
                 return
             state = analysis.decision.state.value
+            if not stacking_enabled:
+                state = hidden_stacking_states.get(state, state)
             occupied, state_text, background_hex, foreground_hex = presentation[state]
             offset = analysis.wafer_offset_T_mm
             distance = analysis.wafer_offset_distance_mm
@@ -1171,13 +1233,21 @@ class HandEyeDemoDialog(QDialog):
             int(summary.get(name, 0))
             for name in ("out_of_view", "occluded", "unknown")
         )
-        stacked_count = int(summary.get("stacked", 0))
-        outside_count = int(summary.get("outside_slot", 0))
-        both_count = int(summary.get("stacked_outside_slot", 0))
+        if stacking_enabled:
+            stacked_count = int(summary.get("stacked", 0))
+            outside_count = int(summary.get("outside_slot", 0))
+            both_count = int(summary.get("stacked_outside_slot", 0))
+            occupied_breakdown = (
+                f"叠片={stacked_count}、槽外={outside_count}、叠片且槽外={both_count}"
+            )
+        else:
+            outside_count = int(summary.get("outside_slot", 0)) + int(
+                summary.get("stacked_outside_slot", 0)
+            )
+            occupied_breakdown = f"槽外={outside_count}"
         self.tray_summary.setText(
             "槽状态：Stage3 PASS　"
-            f"占用={occupied_count}（叠片={stacked_count}、槽外={outside_count}、"
-            f"叠片且槽外={both_count}）　空槽={empty_count}　"
+            f"占用={occupied_count}（{occupied_breakdown}）　空槽={empty_count}　"
             f"不确定={uncertain_count}　已分析={summary.get('analyzed', 0)}"
         )
 
@@ -1391,6 +1461,14 @@ class HandEyeDemoDialog(QDialog):
         dialog.setText("\n".join(lines))
         dialog.exec()
 
+    def _positioning_mode_label(self, mode: Optional[str] = None) -> str:
+        selected = self._positioning_mode if mode is None else mode
+        return {
+            "single_loop": "单点有限闭环",
+            "full_tray": "全盘定位",
+            "wafer_correction": "硅片纠错",
+        }.get(selected, "XY定位")
+
     def _on_stage7b_button(self) -> None:
         if self._stage7b_active:
             warning = QMessageBox(self)
@@ -1490,6 +1568,109 @@ class HandEyeDemoDialog(QDialog):
         if confirmation.exec() == QMessageBox.StandardButton.Yes:
             self.full_tray_start_requested.emit()
 
+    def _on_wafer_correction_button(self) -> None:
+        """ARM or stop nearest-P00 outside-wafer XY correction."""
+
+        if self._stage7b_active:
+            if self._positioning_mode != "wafer_correction":
+                QMessageBox.warning(
+                    self,
+                    "硅片纠错不可启动",
+                    f"{self._positioning_mode_label()}正在运行；"
+                    "请先停止当前运动会话。",
+                )
+                return
+            warning = QMessageBox(self)
+            warning.setWindowTitle("停止硅片纠错")
+            warning.setIcon(QMessageBox.Icon.Warning)
+            warning.setText(
+                "停止会阻止后续槽外硅片XY接近；若机械臂正在运动，"
+                "执行器将使用安全停止。\n是否停止当前硅片纠错？"
+            )
+            warning.setStandardButtons(
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No
+            )
+            warning.setDefaultButton(QMessageBox.StandardButton.No)
+            warning.setStyleSheet(LIGHT_WARNING_DIALOG_STYLESHEET)
+            if warning.exec() == QMessageBox.StandardButton.Yes:
+                self.wafer_correction_stop_requested.emit()
+            return
+
+        evaluation = self._last_evaluation
+        tray_result = self._last_tray_result
+        age = (
+            math.inf
+            if self._last_evaluation_at is None
+            else time.monotonic() - self._last_evaluation_at
+        )
+        if (
+            evaluation is None
+            or tray_result is None
+            or age < 0.0
+            or age > 1.5
+            or evaluation.accepted is not True
+            or tray_result.success is not True
+            or tray_result.quality_passed is not True
+            or tray_result.coordinate_mapping_allowed is not True
+        ):
+            QMessageBox.warning(
+                self,
+                "硅片纠错不可启动",
+                "当前没有1.5秒内的新鲜合格Stage3与全盘硅片结果。",
+            )
+            return
+        try:
+            candidates = extract_outside_wafer_candidates(
+                tray_result, self.geometry
+            )
+        except Exception as exc:  # noqa: BLE001 - explain fail-closed gate
+            QMessageBox.warning(
+                self, "硅片纠错不可启动", f"槽外硅片候选无效：{exc}"
+            )
+            return
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "没有可纠错的槽外硅片",
+                "当前合格帧中没有带有效拟合几何中心的OUT硅片。",
+            )
+            return
+        target = candidates[0]
+        center = target["center_T_mm"]
+        center_method = (
+            "OUT拟合四边形对角线交点"
+            if target.get("center_source")
+            == SLOT_QUADRILATERAL_CENTER_SOURCE
+            else "扩展ROI完整轮廓中心"
+        )
+        confirmation = QMessageBox(self)
+        confirmation.setWindowTitle("确认启动槽外硅片纠错")
+        confirmation.setIcon(QMessageBox.Icon.Warning)
+        confirmation.setText(
+            "硅片纠错会实际移动机械臂XY。启动后会重新采集5张新鲜帧，"
+            "不会直接使用当前这一帧下发运动。\n\n"
+            f"当前预览最近P00候选：来源槽 {target['slot_key']}\n"
+            f"中心方法：{center_method}\n"
+            f"拟合几何中心 Tray=({float(center[0]):+.3f}, "
+            f"{float(center[1]):+.3f}, {float(center[2]):+.3f}) mm\n"
+            f"距P00中心：{float(target['distance_to_p00_mm']):.3f} mm\n\n"
+            "运行边界：只接受几何中心有效的OUT目标；完整轮廓优先，明确OUT时允许"
+            "四边形中心回退；取5张有效帧中心的算术平均位置并冻结；"
+            "本次Tray→World登记必须一次通过；目标随后冻结，"
+            "每步XY≤9.99mm并由ActionWorker再次审计。\n"
+            "全过程保持J3不变，不执行Z下降，不操作DO/真空。\n\n"
+            "请确认吸盘与硅片之间有足够竖直间隙、整个逐轴扫掠路径无障碍、"
+            "低速模式与急停可用。"
+        )
+        confirmation.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        confirmation.setDefaultButton(QMessageBox.StandardButton.No)
+        confirmation.setStyleSheet(LIGHT_WARNING_DIALOG_STYLESHEET)
+        if confirmation.exec() == QMessageBox.StandardButton.Yes:
+            self.wafer_correction_start_requested.emit()
+
     def prepare_stage7b_session(self, output_dir: Path) -> dict[str, Any]:
         """Create the calculation/evidence session; no controller call."""
 
@@ -1506,6 +1687,7 @@ class HandEyeDemoDialog(QDialog):
         self._stage7b_samples.clear()
         self.target_combo.setEnabled(False)
         self.full_tray_button.setEnabled(False)
+        self.wafer_correction_button.setEnabled(False)
         self.stage7b_button.setText("停止单点有限闭环")
         self.stage7b_status.setPlainText(
             "单点有限闭环已ARM：等待执行器请求与5张新鲜稳定帧。\n"
@@ -1547,11 +1729,55 @@ class HandEyeDemoDialog(QDialog):
         self._stage7b_samples.clear()
         self.target_combo.setEnabled(False)
         self.stage7b_button.setEnabled(False)
+        self.wafer_correction_button.setEnabled(False)
         self.full_tray_button.setText("停止全盘定位")
         self.stage7b_status.setPlainText(
             "可移动托盘P22全盘定位已ARM：先等待5张新鲜Stage3帧完成本次"
             "Tray→World登记。登记通过后才会生成≤2mm粗定位航点；随后使用"
             "Stage3+Stage4毫米闭环和独立5帧hold验收。"
+        )
+        return session.action_task()
+
+    def prepare_wafer_correction_session(
+        self, output_dir: Path
+    ) -> dict[str, Any]:
+        """Create an XY-only outside-wafer session; no controller call."""
+
+        from scara.vision.wafer_correction_session import (
+            WaferCorrectionSession,
+        )
+
+        if self._stage7b_active:
+            raise RuntimeError("已有XY定位会话正在运行")
+        if self.robot_state_provider is None:
+            raise RuntimeError("缺少机械臂只读状态，无法规划硅片纠错")
+        initial_state = self.robot_state_provider()
+        if not isinstance(initial_state, Mapping):
+            raise RuntimeError("没有可用的新鲜机械臂状态")
+        session = WaferCorrectionSession(
+            self.project_root,
+            output_dir,
+            initial_state,
+            camera_reconnected=int(
+                getattr(self.camera, "connection_generation", 1)
+            )
+            > 1,
+        )
+        self._stage7b_session = session
+        self._stage7b_active = True
+        self._positioning_mode = "wafer_correction"
+        self._stage7b_pending_request = None
+        self._stage7b_pending_responder = None
+        self._stage7b_samples.clear()
+        self.target_combo.setEnabled(False)
+        self.stage7b_button.setEnabled(False)
+        self.full_tray_button.setEnabled(False)
+        self.wafer_correction_button.setText("停止硅片纠错")
+        self.stage7b_status.setPlainText(
+            "硅片纠错已ARM：先等待5张新鲜Stage3+硅片帧，锁定离P00最近的"
+            "OUT硅片几何中心（完整轮廓优先、明确OUT可用四边形"
+            "对角线交点），取5帧算术平均位置并登记本次Tray→World。\n"
+            "登记通过后，才会提交固定J3的XY航点。"
         )
         return session.action_task()
 
@@ -1562,7 +1788,7 @@ class HandEyeDemoDialog(QDialog):
     ) -> None:
         """Begin an asynchronous five-frame window without blocking Qt."""
 
-        mode_label = "全盘定位" if self._positioning_mode == "full_tray" else "单点有限闭环"
+        mode_label = self._positioning_mode_label()
         if not self._stage7b_active or self._stage7b_session is None:
             responder(
                 {
@@ -1599,20 +1825,53 @@ class HandEyeDemoDialog(QDialog):
         rows = []
         for sample in self._stage7b_samples:
             captured = sample.get("captured_monotonic_s")
+            wafer_candidate_ok = True
+            if self._positioning_mode == "wafer_correction":
+                wafer_candidate_ok = bool(
+                    sample.get("outside_wafer_candidates")
+                ) and not bool(sample.get("outside_wafer_candidate_error"))
+            target_ok = (
+                self._positioning_mode == "wafer_correction"
+                or sample.get("target_name") == "P22"
+            )
             if (
                 sample.get("accepted") is True
-                and sample.get("target_name") == "P22"
+                and target_ok
+                and wafer_candidate_ok
                 and captured is not None
                 and float(captured) >= requested_at
             ):
                 rows.append(sample)
         return rows[-5:]
 
+    def _wafer_candidate_wait_reason(self) -> str:
+        """Return the latest concrete reason a wafer frame was ineligible."""
+
+        saw_valid_candidate = False
+        for sample in reversed(self._stage7b_samples):
+            reason = str(
+                sample.get("outside_wafer_candidate_error") or ""
+            ).strip()
+            if reason:
+                return reason
+            if sample.get("outside_wafer_candidates"):
+                saw_valid_candidate = True
+        if saw_valid_candidate:
+            return "已收到有效候选，仍在累计5张独立有效帧"
+        return "尚未收到请求之后的硅片候选帧"
+
     def _try_stage7b_response(self) -> None:
         if self._stage7b_pending_request is None:
             return
         samples = self._eligible_stage7b_samples()
         if len(samples) < 5:
+            if self._positioning_mode == "wafer_correction":
+                self.stage7b_status.setPlainText(
+                    "硅片纠错正在等待5张请求之后的Stage3+有效槽外硅片帧；"
+                    f"当前累计 {len(samples)}/5。\n"
+                    f"最近候选状态：{self._wafer_candidate_wait_reason()}\n"
+                    "尚未授权任何运动。"
+                )
             return
         request = self._stage7b_pending_request
         responder = self._stage7b_pending_responder
@@ -1679,7 +1938,14 @@ class HandEyeDemoDialog(QDialog):
         if decision == "approve":
             proposal = response.get("proposal") or {}
             proposal_phase = str(proposal.get("phase") or "")
-            if proposal_phase.startswith("moved_tray_"):
+            if proposal_phase == "wafer_center_xy_approach":
+                self.stage7b_status.setPlainText(
+                    self._wafer_correction_report_text(
+                        proposal,
+                        "候选已提交ActionWorker独立复核；尚未代表运动已下发。",
+                    )
+                )
+            elif proposal_phase.startswith("moved_tray_"):
                 self.stage7b_status.setPlainText(
                     self._moved_tray_report_text(
                         proposal,
@@ -1702,21 +1968,40 @@ class HandEyeDemoDialog(QDialog):
                 )
         elif decision == "observe":
             evaluation = response.get("evaluation") or {}
-            self.stage7b_status.setPlainText(
-                "全盘定位观察窗口完成；本窗口不运动。\n"
-                + str(response.get("reason") or "继续下一窗口")
-                + ("\n" + self._runtime_registration_text(evaluation) if evaluation else "")
-            )
+            if self._positioning_mode == "wafer_correction":
+                self.stage7b_status.setPlainText(
+                    self._wafer_correction_report_text(
+                        evaluation,
+                        str(response.get("reason") or "继续下一窗口"),
+                    )
+                )
+            else:
+                self.stage7b_status.setPlainText(
+                    f"{self._positioning_mode_label()}观察窗口完成；本窗口不运动。\n"
+                    + str(response.get("reason") or "继续下一窗口")
+                    + (
+                        "\n" + self._runtime_registration_text(evaluation)
+                        if evaluation
+                        else ""
+                    )
+                )
         elif decision == "complete":
             evaluation = response.get("evaluation") or {}
             if evaluation:
-                self.stage7b_status.setPlainText(self._stage7b_report_text(
-                    evaluation,
-                    str(
-                        response.get("reason")
-                        or "已经抵达目标终止范围；停止XY闭环，不再运动。"
-                    ),
-                ))
+                formatter = (
+                    self._wafer_correction_report_text
+                    if self._positioning_mode == "wafer_correction"
+                    else self._stage7b_report_text
+                )
+                self.stage7b_status.setPlainText(
+                    formatter(
+                        evaluation,
+                        str(
+                            response.get("reason")
+                            or "已经抵达目标终止范围；停止XY闭环，不再运动。"
+                        ),
+                    )
+                )
             else:
                 self.stage7b_status.setPlainText(
                     "XY定位已正常结束；停止XY闭环。\n"
@@ -1725,12 +2010,15 @@ class HandEyeDemoDialog(QDialog):
         else:
             evaluation = response.get("evaluation") or {}
             if evaluation:
-                formatter = (
-                    self._geometry_correction_report_text
-                    if evaluation.get("phase")
-                    == "stage3_metric_geometry_correction"
-                    else self._stage7b_report_text
-                )
+                if self._positioning_mode == "wafer_correction":
+                    formatter = self._wafer_correction_report_text
+                else:
+                    formatter = (
+                        self._geometry_correction_report_text
+                        if evaluation.get("phase")
+                        == "stage3_metric_geometry_correction"
+                        else self._stage7b_report_text
+                    )
                 self.stage7b_status.setPlainText(
                     formatter(
                         evaluation,
@@ -1738,8 +2026,70 @@ class HandEyeDemoDialog(QDialog):
                     )
                 )
             else:
-                label = "全盘定位" if self._positioning_mode == "full_tray" else "单点有限闭环"
+                label = self._positioning_mode_label()
                 self.stage7b_status.setPlainText(f"{label}已停止：{response.get('reason', '安全门拒绝')}")
+
+    @staticmethod
+    def _wafer_correction_report_text(
+        report: Mapping[str, Any], header: str
+    ) -> str:
+        target = report.get("locked_target") or {}
+        center = target.get("center_T_mm") or [float("nan")] * 3
+        world = report.get("target_world_xy_mm") or [float("nan")] * 2
+        command = report.get("commanded_correction_xy_mm")
+        endpoint = report.get("predicted_endpoint_xy_mm")
+        remaining = report.get("remaining_distance_mm")
+        source_slots = target.get("unique_source_slot_keys") or target.get(
+            "source_slot_keys"
+        ) or []
+        aggregation_method = target.get("aggregation_method")
+        stability = target.get("stability") or {}
+        gates = report.get("safety_gates") or report.get(
+            "continuity_gates"
+        ) or {}
+        lines = [
+            f"硅片纠错；阶段={report.get('phase', 'registration')}；{header}",
+            (
+                "锁定中心 Tray="
+                f"({float(center[0]):+.3f},{float(center[1]):+.3f},"
+                f"{float(center[2]):+.3f})mm；来源槽={source_slots}"
+            ),
+            (
+                "目标 world XY="
+                f"({float(world[0]):.3f},{float(world[1]):.3f})mm"
+            ),
+        ]
+        if remaining is not None:
+            lines.append(f"当前剩余XY距离={float(remaining):.3f}mm")
+        if aggregation_method:
+            maximum_residual = float(
+                stability.get(
+                    "maximum_center_residual_mm", float("nan")
+                )
+            )
+            lines.append(
+                "中心聚合=5帧算术平均；最大单帧残差="
+                f"{maximum_residual:.3f}mm"
+                "（仅记录，不拒绝运动）"
+            )
+        if command is not None:
+            lines.append(
+                f"本轮命令 ΔX={float(command[0]):+.3f}mm，"
+                f"ΔY={float(command[1]):+.3f}mm"
+            )
+        if endpoint is not None:
+            lines.append(
+                "预计终点 world XY="
+                f"({float(endpoint[0]):.3f},{float(endpoint[1]):.3f})mm"
+            )
+        if gates:
+            lines.append("本窗口安全门：")
+            lines.extend(
+                f"{'PASS' if gate.get('passed') else 'FAIL'} {name}: "
+                f"actual={gate.get('actual')} limit={gate.get('limit')}"
+                for name, gate in gates.items()
+            )
+        return "\n".join(lines)
 
     @staticmethod
     def _moved_tray_report_text(report: Mapping[str, Any], header: str) -> str:
@@ -1847,50 +2197,65 @@ class HandEyeDemoDialog(QDialog):
         responder = self._stage7b_pending_responder
         self._stage7b_pending_request = None
         self._stage7b_pending_responder = None
+        timeout_reason = "5秒内未取得5张新的合格Stage3帧"
+        if self._positioning_mode == "wafer_correction":
+            timeout_reason = (
+                "5秒内未取得5张新的Stage3+有效槽外硅片候选帧；"
+                f"最近候选状态：{self._wafer_candidate_wait_reason()}"
+            )
         if callable(responder):
             responder(
                 {
                     "request_id": request_id,
                     "decision": "abort",
-                    "reason": "5秒内未取得5张新的合格Stage3帧",
+                    "reason": timeout_reason,
                 }
             )
-        label = "全盘定位" if self._positioning_mode == "full_tray" else "单点有限闭环"
-        self.stage7b_status.setPlainText(f"{label}已停止：新鲜稳定帧超时，未授权运动。")
+        label = self._positioning_mode_label()
+        self.stage7b_status.setPlainText(
+            f"{label}已停止：{timeout_reason}；未授权运动。"
+        )
 
     def finish_stage7b_session(
         self, ok: bool, message: str
     ) -> tuple[bool, str]:
         mode = self._positioning_mode
-        if self._stage7b_session is not None:
-            self._stage7b_session.finish(ok, message)
-            if (
-                mode == "full_tray"
-                and ok
-                and getattr(self._stage7b_session, "status", "")
-                != "converged"
-            ):
-                ok = False
-                message = (
-                    "全盘定位动作序列结束，但独立5帧视觉1mm验收未通过；"
-                    "不得视为定位成功"
-                )
-        self._stage7b_active = False
-        self._stage7b_pending_request = None
-        self._stage7b_pending_responder = None
-        self._stage7b_samples.clear()
-        self.target_combo.setEnabled(True)
-        self.stage7b_button.setEnabled(True)
-        self.full_tray_button.setEnabled(True)
-        self.stage7b_button.setText("单点有限闭环")
-        self.full_tray_button.setText("全盘定位")
-        label = "全盘定位" if mode == "full_tray" else "单点有限闭环"
-        self.stage7b_status.setPlainText(
-            f"{label}{'完成' if ok else '停止'}：{message}\n"
-            "实时动态演示继续运行；未执行Z、DO或真空动作。"
-        )
-        self._stage7b_session = None
-        self._positioning_mode = None
+        session = self._stage7b_session
+        label = self._positioning_mode_label(mode)
+        try:
+            if session is not None:
+                session.finish(ok, message)
+                if (
+                    mode in {"full_tray", "wafer_correction"}
+                    and ok
+                    and getattr(session, "status", "") != "converged"
+                ):
+                    ok = False
+                    message = (
+                        f"{label}动作序列结束，"
+                        "但独立5帧验收未通过；不得视为定位成功"
+                    )
+        except Exception as exc:  # noqa: BLE001 - UI must always be released
+            ok = False
+            message = f"{message}；{label}报告收尾失败：{exc}"
+        finally:
+            self._stage7b_active = False
+            self._stage7b_pending_request = None
+            self._stage7b_pending_responder = None
+            self._stage7b_samples.clear()
+            self.target_combo.setEnabled(True)
+            self.stage7b_button.setEnabled(True)
+            self.full_tray_button.setEnabled(True)
+            self.wafer_correction_button.setEnabled(True)
+            self.stage7b_button.setText("单点有限闭环")
+            self.full_tray_button.setText("全盘定位")
+            self.wafer_correction_button.setText("硅片纠错")
+            self.stage7b_status.setPlainText(
+                f"{label}{'完成' if ok else '停止'}：{message}\n"
+                "实时动态演示继续运行；未执行Z、DO或真空动作。"
+            )
+            self._stage7b_session = None
+            self._positioning_mode = None
         return bool(ok), str(message)
 
     @property
@@ -1900,7 +2265,7 @@ class HandEyeDemoDialog(QDialog):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         if self._stage7b_active:
             event.ignore()
-            label = "全盘定位" if self._positioning_mode == "full_tray" else "单点有限闭环"
+            label = self._positioning_mode_label()
             self.stage7b_status.setPlainText(f"{label}运行期间不能关闭动态演示；请先停止会话。")
             return
         if hasattr(self, "monitor") and self.monitor.isRunning():

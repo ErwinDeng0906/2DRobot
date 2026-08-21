@@ -476,6 +476,74 @@ class ScaraController(QObject):
     def cmd_set_speed(self, pct):
         v = self._cfg.clamp_speed(pct)  # 钳到 [min,max]，防非UI/未来调用越界下发（clamp_speed 原为死代码）
         self._submit(f"速度 {v}%", f"setspeed {v}")
+
+    def set_do_sync(self, channel: int, level: int) -> Tuple[bool, str]:
+        """Synchronously write one UO/DO for an audited action sequence.
+
+        ``scara_do.exe`` needs its own controller connection.  When the normal
+        ``snrobot serve`` connection is active, pause polling and stop that
+        process first, perform the write, then restore the connection before
+        returning.  This makes a task's following wait/motion occur only after
+        the DO result is known.
+        """
+        ch = int(channel)
+        val = int(level)
+        if not 1 <= ch <= 16:
+            return False, f"DO通道必须为1到16，当前为{ch}"
+        if val not in {0, 1}:
+            return False, f"DO电平必须为0或1，当前为{val}"
+
+        with self._enable_exe_lock:
+            was_connected = self._connected
+            if was_connected:
+                self._stop_polling()
+                self._stop_proc()
+            try:
+                write_ok, write_message = do_set_uo_level(
+                    ch,
+                    val,
+                    ip=self._cfg.controller_ip,
+                    port=int(self._cfg.controller_port),
+                    sdk_dir=self._cfg.exe_dir,
+                )
+            except Exception as exc:  # noqa: BLE001 - hardware boundary
+                write_ok, write_message = False, str(exc)
+
+            reconnect_ok = True
+            reconnect_message = ""
+            if was_connected:
+                if not self._start_proc():
+                    reconnect_ok = False
+                    reconnect_message = "写DO后重新连接snrobot失败"
+                    self._connected = False
+                    if self._last_status:
+                        self._last_status = self._merge_safety(
+                            dict(self._last_status)
+                        )
+                        self.status_updated.emit(self._last_status)
+                    self.connection_changed.emit(False)
+                else:
+                    state = self.read_all_sync()
+                    if state is None:
+                        reconnect_ok = False
+                        reconnect_message = "写DO后读取机械臂状态失败"
+                    else:
+                        self._last_status = state
+                        self.status_updated.emit(state)
+                    self._start_polling()
+
+            name = f"DO[{ch}]={val}"
+            messages = [str(write_message or name)]
+            if reconnect_message:
+                messages.append(reconnect_message)
+            detail = "；".join(message for message in messages if message)
+            ok = bool(write_ok and reconnect_ok)
+            if ok:
+                self.info_occurred.emit(detail)
+            else:
+                self.error_occurred.emit(detail or f"{name}失败")
+            return ok, detail
+
     def cmd_set_do(self, i, level):
         """异步写单个 DO：走 scara_do.exe。level 为 0 或 1。
 

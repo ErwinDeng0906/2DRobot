@@ -4,6 +4,9 @@
   "description": "Camera-1 layered tray silicon detection and slot-state parameters. Production consumers load this file instead of embedding a separate parameter set.",
   "tray_vision": {
     "slot_half_extent_mm": 11.5,
+    "physical_slot_side_length_mm": 19.9,
+    "physical_slot_boundary_uncertainty_mm": 0.75,
+    "unregistered_slot_boundary_uncertainty_mm": 1.5,
     "canonical_patch_size": 192
   },
   "wafer_quality": {
@@ -11,6 +14,12 @@
     "upper_hsv": [165, 255, 255],
     "dark_value_max": 155,
     "dark_saturation_min": 28,
+    "relative_contrast_enabled": true,
+    "relative_lab_lightness_weight": 0.22,
+    "relative_lab_distance_min": 18.0,
+    "relative_lab_chroma_min": 10.0,
+    "relative_reference_max_saturation": 90,
+    "relative_reference_min_value": 45,
     "minimum_area_ratio": 0.075,
     "maximum_area_ratio": 0.82,
     "minimum_chromatic_fraction": 0.62,
@@ -25,6 +34,7 @@
     "normal_max_yaw_deg": 8.0,
     "warning_max_yaw_deg": 15.0,
     "maximum_normal_side_ratio": 0.86,
+    "stacking_detection_enabled": false,
     "stacked_second_component_ratio": 0.1,
     "stacked_internal_line_count": 2,
     "stacked_internal_line_score": 0.45,
@@ -36,7 +46,8 @@
     "stacked_quadrilateral_min_solidity": 0.86,
     "stacked_l_min_leg_ratio": 0.22,
     "stacked_l_angle_tolerance_deg": 20.0,
-    "slot_boundary_margin_ratio": 0.01
+    "slot_boundary_margin_ratio": 0.01,
+    "quadrilateral_min_mask_iou": 0.7
   },
   "slot_decision": {
     "minimum_image_coverage_ratio": 0.9,

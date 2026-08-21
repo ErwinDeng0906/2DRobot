@@ -97,14 +97,25 @@ def _hsv_triplet(value: Any, label: str) -> tuple[int, int, int]:
 
 def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
     expected = {field.name for field in fields(WaferQualityConfig)}
-    _exact_keys(payload, expected, "wafer_quality")
     values = dict(payload)
+    # Backward-compatible migration for Task14 recommendation files written
+    # before this switch existed.  They must also default to the safe OFF state.
+    values.setdefault("stacking_detection_enabled", False)
+    _exact_keys(values, expected, "wafer_quality")
     values["lower_hsv"] = _hsv_triplet(values["lower_hsv"], "wafer_quality.lower_hsv")
     values["upper_hsv"] = _hsv_triplet(values["upper_hsv"], "wafer_quality.upper_hsv")
     if any(lower > upper for lower, upper in zip(values["lower_hsv"], values["upper_hsv"])):
         raise ValueError("wafer_quality.lower_hsv不能高于upper_hsv")
 
-    for name in ("dark_value_max", "dark_saturation_min"):
+    for name in ("relative_contrast_enabled", "stacking_detection_enabled"):
+        if not isinstance(values[name], bool):
+            raise ValueError(f"wafer_quality.{name}必须是布尔值")
+    for name in (
+        "dark_value_max",
+        "dark_saturation_min",
+        "relative_reference_max_saturation",
+        "relative_reference_min_value",
+    ):
         values[name] = _integer(values[name], f"wafer_quality.{name}")
         if not 0 <= values[name] <= 255:
             raise ValueError(f"wafer_quality.{name}必须在0..255范围内")
@@ -132,6 +143,8 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         "stacked_quadrilateral_min_solidity",
         "stacked_l_min_leg_ratio",
         "slot_boundary_margin_ratio",
+        "relative_lab_lightness_weight",
+        "quadrilateral_min_mask_iou",
     }
     for name in ratio_names:
         values[name] = _ratio(values[name], f"wafer_quality.{name}")
@@ -142,6 +155,8 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         "warning_max_yaw_deg",
         "stacked_quadrilateral_max_aspect_ratio",
         "stacked_l_angle_tolerance_deg",
+        "relative_lab_distance_min",
+        "relative_lab_chroma_min",
     ):
         values[name] = _finite_number(values[name], f"wafer_quality.{name}")
         if values[name] < 0.0:
@@ -194,15 +209,58 @@ def load_silicon_detection_config(path: Path) -> LoadedSiliconDetectionConfig:
         raise ValueError("description必须是字符串")
 
     tray = _mapping(root["tray_vision"], "tray_vision")
-    _exact_keys(tray, {"slot_half_extent_mm", "canonical_patch_size"}, "tray_vision")
+    _exact_keys(
+        tray,
+        {
+            "slot_half_extent_mm",
+            "physical_slot_side_length_mm",
+            "physical_slot_boundary_uncertainty_mm",
+            "unregistered_slot_boundary_uncertainty_mm",
+            "canonical_patch_size",
+        },
+        "tray_vision",
+    )
     slot_half_extent_mm = _finite_number(
         tray["slot_half_extent_mm"], "tray_vision.slot_half_extent_mm"
     )
     canonical_patch_size = _integer(
         tray["canonical_patch_size"], "tray_vision.canonical_patch_size"
     )
+    physical_slot_side_length_mm = _finite_number(
+        tray["physical_slot_side_length_mm"],
+        "tray_vision.physical_slot_side_length_mm",
+    )
+    physical_slot_boundary_uncertainty_mm = _finite_number(
+        tray["physical_slot_boundary_uncertainty_mm"],
+        "tray_vision.physical_slot_boundary_uncertainty_mm",
+    )
+    unregistered_slot_boundary_uncertainty_mm = _finite_number(
+        tray["unregistered_slot_boundary_uncertainty_mm"],
+        "tray_vision.unregistered_slot_boundary_uncertainty_mm",
+    )
     if slot_half_extent_mm <= 0.0:
         raise ValueError("tray_vision.slot_half_extent_mm必须大于0")
+    if physical_slot_side_length_mm <= 0.0:
+        raise ValueError("tray_vision.physical_slot_side_length_mm必须大于0")
+    if physical_slot_side_length_mm >= 2.0 * slot_half_extent_mm:
+        raise ValueError(
+            "tray_vision.physical_slot_side_length_mm必须小于裁图边长"
+        )
+    if not 0.0 <= physical_slot_boundary_uncertainty_mm < (
+        0.5 * physical_slot_side_length_mm
+    ):
+        raise ValueError(
+            "tray_vision.physical_slot_boundary_uncertainty_mm必须非负且小于槽半边长"
+        )
+    if not (
+        physical_slot_boundary_uncertainty_mm
+        <= unregistered_slot_boundary_uncertainty_mm
+        < 0.5 * physical_slot_side_length_mm
+    ):
+        raise ValueError(
+            "tray_vision.unregistered_slot_boundary_uncertainty_mm必须不小于"
+            "已登记门限且小于槽半边长"
+        )
     if canonical_patch_size < 32:
         raise ValueError("tray_vision.canonical_patch_size必须至少为32")
 
@@ -226,6 +284,13 @@ def load_silicon_detection_config(path: Path) -> LoadedSiliconDetectionConfig:
 
     fusion = TrayVisionFusionConfig(
         slot_half_extent_mm=slot_half_extent_mm,
+        physical_slot_side_length_mm=physical_slot_side_length_mm,
+        physical_slot_boundary_uncertainty_mm=(
+            physical_slot_boundary_uncertainty_mm
+        ),
+        unregistered_slot_boundary_uncertainty_mm=(
+            unregistered_slot_boundary_uncertainty_mm
+        ),
         canonical_patch_size=canonical_patch_size,
         wafer_quality=wafer_quality,
         slot_decision=SlotDecisionConfig(

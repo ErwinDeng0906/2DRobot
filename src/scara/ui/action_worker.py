@@ -27,6 +27,7 @@ SUPPORTED_ACTION_TYPES = {
     "move_joints",
     "runtime_move_joints",
     "move_xyzr",
+    "set_do",
     "wait",
     "capture",
     "start_video",
@@ -78,6 +79,8 @@ MOVED_TRAY_MAXIMUM_RZ_TOLERANCE_DEG = 0.30
 MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 15.0
 MOVED_TRAY_MAXIMUM_STATE_DRIFT_XY_MM = 0.20
 MOVED_TRAY_MAXIMUM_STATE_DRIFT_JOINT = 0.20
+WAFER_CORRECTION_RUNTIME_REQUEST_KEY = "nearest_p00_outside_wafer_xy"
+WAFER_CORRECTION_TARGET_NAME = "nearest_outside_wafer"
 
 
 def _finite(value: object, label: str) -> float:
@@ -226,6 +229,7 @@ def normalize_action_task(raw_task: object) -> dict:
             "move_joints",
             "runtime_move_joints",
             "move_xyzr",
+            "set_do",
             "record_point",
             "operator_checkpoint",
         }:
@@ -259,16 +263,27 @@ def normalize_action_task(raw_task: object) -> dict:
                 raise ValueError(
                     f"第 {index} 步 runtime_move_joints.request_key 不能为空"
                 )
-            target_name = str(raw.get("target_name") or "P22").strip()
-            if target_name != "P22":
-                raise ValueError(
-                    f"第 {index} 步 runtime_move_joints目前只允许target_name=P22"
-                )
             is_stage7b = request_key == STAGE7B_RUNTIME_REQUEST_KEY
             is_full_tray_geometry = (
                 request_key == FULL_TRAY_GEOMETRY_REQUEST_KEY
             )
             is_moved_tray = request_key == MOVED_TRAY_RUNTIME_REQUEST_KEY
+            is_wafer_correction = (
+                request_key == WAFER_CORRECTION_RUNTIME_REQUEST_KEY
+            )
+            expected_target_name = (
+                WAFER_CORRECTION_TARGET_NAME
+                if is_wafer_correction
+                else "P22"
+            )
+            target_name = str(
+                raw.get("target_name") or expected_target_name
+            ).strip()
+            if target_name != expected_target_name:
+                raise ValueError(
+                    f"第 {index} 步 runtime_move_joints在request_key="
+                    f"{request_key!r}时只允许target_name={expected_target_name}"
+                )
             calibration_sha256 = str(
                 raw.get("calibration_sha256") or ""
             ).strip().upper()
@@ -294,7 +309,7 @@ def normalize_action_task(raw_task: object) -> dict:
                 if is_stage7b
                 else (
                     MOVED_TRAY_MAXIMUM_LOCAL_EXTENT_MM
-                    if is_moved_tray
+                    if is_moved_tray or is_wafer_correction
                     else (
                     FULL_TRAY_GEOMETRY_MAXIMUM_LOCAL_EXTENT_MM
                     if is_full_tray_geometry
@@ -307,7 +322,7 @@ def normalize_action_task(raw_task: object) -> dict:
                 if is_stage7b
                 else (
                     MOVED_TRAY_MAXIMUM_STEP_NORM_MM
-                    if is_moved_tray
+                    if is_moved_tray or is_wafer_correction
                     else (
                     FULL_TRAY_GEOMETRY_MAXIMUM_STEP_NORM_MM
                     if is_full_tray_geometry
@@ -320,7 +335,7 @@ def normalize_action_task(raw_task: object) -> dict:
                 if is_stage7b
                 else (
                     MOVED_TRAY_MAXIMUM_AXIS_STEP_MM
-                    if is_moved_tray
+                    if is_moved_tray or is_wafer_correction
                     else (
                     FULL_TRAY_GEOMETRY_MAXIMUM_AXIS_STEP_MM
                     if is_full_tray_geometry
@@ -333,7 +348,7 @@ def normalize_action_task(raw_task: object) -> dict:
                 if is_stage7b
                 else (
                     MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
-                    if is_moved_tray
+                    if is_moved_tray or is_wafer_correction
                     else (
                     FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
                     if is_full_tray_geometry
@@ -343,28 +358,28 @@ def normalize_action_task(raw_task: object) -> dict:
             )
             maximum_rz_tolerance = (
                 MOVED_TRAY_MAXIMUM_RZ_TOLERANCE_DEG
-                if is_moved_tray
+                if is_moved_tray or is_wafer_correction
                 else RUNTIME_MOVE_MAXIMUM_RZ_TOLERANCE_DEG
             )
             if is_full_tray_geometry:
                 maximum_rz_tolerance = FULL_TRAY_GEOMETRY_MAXIMUM_RZ_TOLERANCE_DEG
             maximum_transient_rz = (
                 MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
-                if is_moved_tray
+                if is_moved_tray or is_wafer_correction
                 else RUNTIME_MOVE_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
             )
             if is_full_tray_geometry:
                 maximum_transient_rz = FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
             maximum_state_drift_xy = (
                 MOVED_TRAY_MAXIMUM_STATE_DRIFT_XY_MM
-                if is_moved_tray
+                if is_moved_tray or is_wafer_correction
                 else RUNTIME_MOVE_MAXIMUM_STATE_DRIFT_XY_MM
             )
             if is_full_tray_geometry:
                 maximum_state_drift_xy = FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_XY_MM
             maximum_state_drift_joint = (
                 MOVED_TRAY_MAXIMUM_STATE_DRIFT_JOINT
-                if is_moved_tray
+                if is_moved_tray or is_wafer_correction
                 else RUNTIME_MOVE_MAXIMUM_STATE_DRIFT_JOINT
             )
             if is_full_tray_geometry:
@@ -468,7 +483,10 @@ def normalize_action_task(raw_task: object) -> dict:
                     # derived from the recognized request key, not trusted
                     # from an imported task field.
                     "enforce_sequential_intermediate_domain": not (
-                        is_stage7b or is_full_tray_geometry or is_moved_tray
+                        is_stage7b
+                        or is_full_tray_geometry
+                        or is_moved_tray
+                        or is_wafer_correction
                     ),
                     "max_state_drift_xy_mm": _positive_at_most(
                         raw.get(
@@ -525,6 +543,19 @@ def normalize_action_task(raw_task: object) -> dict:
                 step[key] = _finite(raw.get(key, 0.0), f"第 {index} 步 {key}")
             if not any(abs(step[key]) > 1e-12 for key in ("x_mm", "y_mm", "z_mm", "r_deg")):
                 raise ValueError(f"第 {index} 步 move_xyzr 至少要有一个非零增量")
+        elif kind == "set_do":
+            channel = raw.get("channel")
+            level = raw.get("level")
+            if (
+                isinstance(channel, bool)
+                or not isinstance(channel, int)
+                or not 1 <= channel <= 16
+            ):
+                raise ValueError(f"第 {index} 步 set_do.channel 必须是1到16的整数")
+            if isinstance(level, bool) or not isinstance(level, int) or level not in {0, 1}:
+                raise ValueError(f"第 {index} 步 set_do.level 必须是整数0或1")
+            step["channel"] = int(channel)
+            step["level"] = int(level)
         elif kind == "wait":
             step["seconds"] = _finite(raw.get("seconds"), f"第 {index} 步 seconds")
             if step["seconds"] < 0:
@@ -1044,6 +1075,16 @@ class ActionWorker(QThread):
         self._runtime_move_response: Optional[object] = None
         self._runtime_move_request_sequence = 0
         self._runtime_session_complete = False
+        self._declared_do_channels = sorted(
+            {
+                int(step["channel"])
+                for step in self._task["actions"]
+                if step["type"] == "set_do"
+            }
+        )
+        self._touched_do_channels: set[int] = set()
+        self._uncertain_do_channels: set[int] = set()
+        self._known_do_levels: dict[int, int] = {}
         self._repeatable = any(
             step["type"] == "operator_checkpoint"
             for step in self._task["actions"]
@@ -1052,7 +1093,15 @@ class ActionWorker(QThread):
 
     def request_stop(self) -> None:
         self._stop_requested.set()
-        self._controller.emergency_stop()
+        try:
+            self._controller.emergency_stop(
+                do_channels=list(self._declared_do_channels)
+            )
+        except TypeError:
+            # Preserve compatibility with old/fake controllers that expose the
+            # pre-DO emergency_stop() signature.  The worker finally block
+            # still performs synchronous output cleanup.
+            self._controller.emergency_stop()
 
     def respond_operator_checkpoint(self, continue_collection: bool) -> None:
         """Release a paused checkpoint from the Qt UI thread.
@@ -1503,6 +1552,8 @@ class ActionWorker(QThread):
             runtime_label = "单点有限闭环"
         elif step["request_key"] == MOVED_TRAY_RUNTIME_REQUEST_KEY:
             runtime_label = "可移动托盘P22全盘定位"
+        elif step["request_key"] == WAFER_CORRECTION_RUNTIME_REQUEST_KEY:
+            runtime_label = "槽外硅片纠错"
         elif step["request_key"] == FULL_TRAY_GEOMETRY_REQUEST_KEY:
             runtime_label = "全盘定位Stage3毫米几何修正"
         else:
@@ -1584,6 +1635,7 @@ class ActionWorker(QThread):
             if step["request_key"] in {
                 STAGE7B_RUNTIME_REQUEST_KEY,
                 MOVED_TRAY_RUNTIME_REQUEST_KEY,
+                WAFER_CORRECTION_RUNTIME_REQUEST_KEY,
             }:
                 allowed_decisions.update({"complete", "observe"})
             if decision not in allowed_decisions:
@@ -1592,7 +1644,10 @@ class ActionWorker(QThread):
                 )
             audit_entry["operator_decision"] = decision
             if decision == "observe":
-                if step["request_key"] != MOVED_TRAY_RUNTIME_REQUEST_KEY:
+                if step["request_key"] not in {
+                    MOVED_TRAY_RUNTIME_REQUEST_KEY,
+                    WAFER_CORRECTION_RUNTIME_REQUEST_KEY,
+                }:
                     raise RuntimeError(f"{runtime_label}不允许observe响应")
                 if str(response.get("calibration_sha256") or "").upper() != step["calibration_sha256"]:
                     raise RuntimeError(f"{runtime_label}观察响应的平面手眼hash不匹配")
@@ -1610,6 +1665,91 @@ class ActionWorker(QThread):
                     response.get("fine_calibration_sha256") or ""
                 ).upper() != step["fine_calibration_sha256"]:
                     raise RuntimeError(f"{runtime_label}完成响应的精细Jacobian hash不匹配")
+                if (
+                    step["request_key"]
+                    == WAFER_CORRECTION_RUNTIME_REQUEST_KEY
+                ):
+                    from scara.pipeline.kinematics import rz_of
+
+                    completion_state = self._read_runtime_motion_state(
+                        f"{step['name']} 硅片纠错完成前复核"
+                    )
+                    controller_gates = self._runtime_controller_gates(
+                        completion_state
+                    )
+                    controller_gates["worker_not_stopped"] = (
+                        not self._stop_requested.is_set()
+                    )
+                    joints = _joint_values(
+                        completion_state.get("joints"),
+                        f"{runtime_label} completion joints",
+                    )
+                    pose = _vector_values(
+                        completion_state.get("pose"),
+                        6,
+                        f"{runtime_label} completion pose",
+                    )
+                    j3_error = abs(
+                        joints[2] - step["required_j3_mm"]
+                    )
+                    pose_rz_error = abs(
+                        (
+                            pose[5]
+                            - step["required_rz_deg"]
+                            + 180.0
+                        )
+                        % 360.0
+                        - 180.0
+                    )
+                    joint_rz = float(
+                        rz_of(joints[0], joints[1], joints[3])
+                    )
+                    joint_rz_error = abs(
+                        (
+                            joint_rz
+                            - step["required_rz_deg"]
+                            + 180.0
+                        )
+                        % 360.0
+                        - 180.0
+                    )
+                    completion_gates: dict[str, bool] = {
+                        **controller_gates,
+                        "j3_at_required_height": (
+                            j3_error
+                            <= step["j3_tolerance_mm"] + 1e-12
+                        ),
+                        "pose_rz_matches_calibration": (
+                            pose_rz_error
+                            <= step["rz_tolerance_deg"] + 1e-12
+                        ),
+                        "joint_rz_matches_calibration": (
+                            joint_rz_error
+                            <= step["rz_tolerance_deg"] + 1e-12
+                        ),
+                    }
+                    audit_entry["completion_fresh_controller_state"] = (
+                        completion_state
+                    )
+                    audit_entry["completion_fresh_gates"] = dict(
+                        completion_gates
+                    )
+                    audit_entry["completion_fresh_measurements"] = {
+                        "j3_error_mm": j3_error,
+                        "pose_rz_error_deg": pose_rz_error,
+                        "joint_rz_deg": joint_rz,
+                        "joint_rz_error_deg": joint_rz_error,
+                    }
+                    failed_completion = [
+                        name
+                        for name, passed in completion_gates.items()
+                        if passed is not True
+                    ]
+                    if failed_completion:
+                        raise RuntimeError(
+                            f"{runtime_label}完成前控制器/J3/Rz复核失败："
+                            + ", ".join(sorted(failed_completion))
+                        )
                 audit_entry["status"] = "session_completed_no_motion"
                 audit_entry["completion_reason"] = str(
                     response.get("reason") or f"{runtime_label}达到终止条件"
@@ -1644,7 +1784,10 @@ class ActionWorker(QThread):
             if not str(proposal.get("proposal_id") or "").strip():
                 raise RuntimeError(f"{runtime_label} proposal缺少proposal_id")
             if str(proposal.get("target_name") or "") != step["target_name"]:
-                raise RuntimeError(f"{runtime_label} proposal目标不是本任务锁定的P22")
+                raise RuntimeError(
+                    f"{runtime_label} proposal目标不是本任务锁定的"
+                    f"{step['target_name']}"
+                )
             audit_step = step
             if step["request_key"] == STAGE7B_RUNTIME_REQUEST_KEY:
                 tier = str(proposal.get("model_tier") or "")
@@ -1983,6 +2126,127 @@ class ActionWorker(QThread):
         ):
             raise RuntimeError(f"移动到 {step['name']} 失败")
 
+    def _set_do(self, step: dict) -> None:
+        """Synchronously write one task-owned DO and persist the evidence.
+
+        Turning an output on is fail-closed on controller connection, enable,
+        alarm and E-stop state.  Turning it off is always attempted so a fault
+        cannot prevent the task from releasing an energized output.
+        """
+        channel = int(step["channel"])
+        level = int(step["level"])
+        event = {
+            "sequence": len(self._manifest.setdefault("do_events", [])) + 1,
+            "name": step["name"],
+            "requested_at": datetime.now().astimezone().isoformat(
+                timespec="milliseconds"
+            ),
+            "channel": channel,
+            "level": level,
+            "status": "requested",
+        }
+        self._manifest["do_events"].append(event)
+        self._touched_do_channels.add(channel)
+        self._uncertain_do_channels.add(channel)
+
+        if level == 1:
+            state = self._read_state(f"{step['name']} DO开启前安全检查")
+            safety = state["controller_safety"]
+            failed = []
+            if safety.get("connected") is not True:
+                failed.append("controller_connected")
+            if safety.get("effectively_enabled") is not True:
+                failed.append("controller_enabled")
+            if safety.get("estop") is True:
+                failed.append("estop_clear")
+            if safety.get("soft_estop") is True:
+                failed.append("soft_estop_clear")
+            if int(safety.get("warn", -1)) != 0 or safety.get("need_clear") is True:
+                failed.append("alarm_clear")
+            event["preflight"] = {
+                "passed": not failed,
+                "failed_gates": failed,
+                "controller_safety": safety,
+            }
+            if failed:
+                event["status"] = "rejected"
+                event["failure_reason"] = ", ".join(failed)
+                self._save_manifest()
+                raise RuntimeError(
+                    f"{step['name']} 被DO开启安全门拒绝：{', '.join(failed)}"
+                )
+
+        self._save_manifest()
+        writer = getattr(self._controller, "set_do_sync", None)
+        if not callable(writer):
+            event["status"] = "failed"
+            event["failure_reason"] = "控制器不支持同步set_do_sync"
+            self._save_manifest()
+            raise RuntimeError(f"{step['name']}：控制器不支持同步DO写入")
+        try:
+            ok, detail = writer(channel, level)
+        except Exception as exc:  # noqa: BLE001 - hardware error is audited
+            ok, detail = False, str(exc)
+        event["completed_at"] = datetime.now().astimezone().isoformat(
+            timespec="milliseconds"
+        )
+        event["controller_message"] = str(detail or "")[:1000]
+        if not ok:
+            event["status"] = "failed"
+            self._save_manifest()
+            raise RuntimeError(
+                f"{step['name']} 写入失败：{str(detail or '未知错误')[:200]}"
+            )
+        event["status"] = "completed"
+        self._known_do_levels[channel] = level
+        self._uncertain_do_channels.discard(channel)
+        self._save_manifest()
+
+    def _cleanup_task_outputs(self, *, task_ok: bool) -> tuple[bool, str]:
+        """Clear outputs that may remain on after an interrupted task."""
+        active = {
+            channel
+            for channel, level in self._known_do_levels.items()
+            if int(level) != 0
+        }
+        cleanup_channels = sorted(active | self._uncertain_do_channels)
+        if not task_ok:
+            cleanup_channels = sorted(
+                set(cleanup_channels) | self._touched_do_channels
+            )
+        if not cleanup_channels:
+            if self._manifest:
+                self._manifest["do_cleanup"] = {
+                    "required": False,
+                    "passed": True,
+                    "channels": [],
+                }
+            return True, "not required"
+
+        cleaner = getattr(self._controller, "zero_do_channels_sync", None)
+        if not callable(cleaner):
+            ok, detail = False, "控制器不支持zero_do_channels_sync"
+        else:
+            try:
+                ok, detail = cleaner(cleanup_channels)
+            except Exception as exc:  # noqa: BLE001 - safety cleanup is audited
+                ok, detail = False, str(exc)
+        if ok:
+            for channel in cleanup_channels:
+                self._known_do_levels[channel] = 0
+                self._uncertain_do_channels.discard(channel)
+        if self._manifest:
+            self._manifest["do_cleanup"] = {
+                "required": True,
+                "passed": bool(ok),
+                "channels": cleanup_channels,
+                "finished_at": datetime.now().astimezone().isoformat(
+                    timespec="milliseconds"
+                ),
+                "controller_message": str(detail or "")[:1000],
+            }
+        return bool(ok), str(detail or "")
+
     def _execute_step(self, step: dict) -> None:
         kind = step["type"]
         if kind == "assert_joints":
@@ -2001,6 +2265,8 @@ class ActionWorker(QThread):
                 should_stop=self._stop_requested.is_set,
             ):
                 raise RuntimeError(f"执行 {step['name']} 失败")
+        elif kind == "set_do":
+            self._set_do(step)
         elif kind == "wait":
             if not self._interruptible_wait(step["seconds"]):
                 raise RuntimeError("动作已取消")
@@ -2042,6 +2308,7 @@ class ActionWorker(QThread):
                 "photos": [],
                 "videos": [],
                 "runtime_moves": [],
+                "do_events": [],
             }
             if self._repeatable:
                 self._manifest["collection_mode"] = "operator_repeated_scan"
@@ -2124,7 +2391,8 @@ class ActionWorker(QThread):
             photo_total = sum(self._photo_counts.values())
             message = (
                 f"动作完成，共记录 {len(self._manifest['points'])} 个点、"
-                f"保存 {photo_total} 张照片、{len(self._manifest['videos'])} 段录像"
+                f"保存 {photo_total} 张照片、{len(self._manifest['videos'])} 段录像、"
+                f"执行 {len(self._manifest['do_events'])} 次DO写入"
             )
         except FileExistsError:
             message = f"输出文件夹已存在：{self._output_dir}"
@@ -2138,6 +2406,14 @@ class ActionWorker(QThread):
                     self._active_video_sources.discard(source)
             if self._camera_pool is not None:
                 self._camera_pool.close()
+            if self._manifest:
+                cleanup_ok, cleanup_detail = self._cleanup_task_outputs(task_ok=ok)
+                if not cleanup_ok:
+                    ok = False
+                    message = (
+                        f"{message}；安全清零DO失败："
+                        f"{str(cleanup_detail or '未知错误')[:200]}"
+                    )
             if self._manifest:
                 self._manifest["status"] = "completed" if ok else "stopped"
                 self._manifest["finished_at"] = datetime.now().astimezone().isoformat(

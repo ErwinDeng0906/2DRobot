@@ -9,7 +9,7 @@ fails its existing reprojection quality gates.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Optional, Sequence
 
 import cv2
@@ -22,9 +22,11 @@ from .slot_marker_observation import (
     SlotMarkerEvidence,
     SlotMarkerLayout,
     SlotProjection,
+    apply_slot_marker_registration,
     associate_marker_to_slot,
     build_slot_projections,
     detect_aruco_observations,
+    estimate_slot_marker_registration,
     patch_points_to_image,
     warp_slot_patch,
 )
@@ -47,11 +49,24 @@ from .wafer_shape_quality import (
     WaferQualityConfig,
     analyze_wafer_patch,
 )
+from .wafer_center_refinement import (
+    WaferGeometryRefinement,
+    find_boundary_wafer_fragment_seed,
+    refine_wafer_geometry_center,
+)
+
+
+OUTSIDE_WAFER_REFINEMENT_HALF_EXTENT_MM = 24.0
+OUTSIDE_WAFER_REFINEMENT_MINIMUM_IMAGE_COVERAGE = 0.995
+OUTSIDE_WAFER_REFINEMENT_MAXIMUM_SEED_SHIFT_MM = 8.0
 
 
 @dataclass(frozen=True)
 class TrayVisionFusionConfig:
     slot_half_extent_mm: float = DEFAULT_SLOT_HALF_EXTENT_MM
+    physical_slot_side_length_mm: float = 19.9
+    physical_slot_boundary_uncertainty_mm: float = 0.75
+    unregistered_slot_boundary_uncertainty_mm: float = 1.5
     canonical_patch_size: int = DEFAULT_CANONICAL_PATCH_SIZE
     wafer_quality: WaferQualityConfig = DEFAULT_WAFER_QUALITY
     slot_decision: SlotDecisionConfig = DEFAULT_SLOT_DECISION
@@ -73,6 +88,12 @@ class SlotAnalysis:
     wafer_offset_T_mm: Optional[tuple[float, float]]
     wafer_offset_distance_mm: Optional[float]
     explicit_occlusion_ratio: float
+    wafer_center_refinement: Optional[dict[str, Any]] = None
+    wafer_correction_center_valid: bool = False
+    wafer_correction_outside_slot: bool = False
+    wafer_correction_center_reason: str = "not_outside_slot"
+    slot_boundary_polygon_image_px: tuple[tuple[float, float], ...] = ()
+    slot_boundary_polygon_T_mm: tuple[tuple[float, float, float], ...] = ()
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -103,6 +124,16 @@ class SlotAnalysis:
             ),
             "wafer_offset_distance_mm": self.wafer_offset_distance_mm,
             "explicit_occlusion_ratio": self.explicit_occlusion_ratio,
+            "wafer_center_refinement": self.wafer_center_refinement,
+            "wafer_correction_center_valid": self.wafer_correction_center_valid,
+            "wafer_correction_outside_slot": self.wafer_correction_outside_slot,
+            "wafer_correction_center_reason": self.wafer_correction_center_reason,
+            "slot_boundary_polygon_image_px": [
+                list(point) for point in self.slot_boundary_polygon_image_px
+            ],
+            "slot_boundary_polygon_T_mm": [
+                list(point) for point in self.slot_boundary_polygon_T_mm
+            ],
         }
 
 
@@ -118,6 +149,7 @@ class TrayVisionResult:
     slots: tuple[SlotAnalysis, ...]
     summary: dict[str, int]
     annotated_image: np.ndarray
+    slot_projection_registration: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -133,6 +165,9 @@ class TrayVisionResult:
             },
             "slots": [slot.to_json() for slot in self.slots],
             "summary": dict(self.summary),
+            "slot_projection_registration": dict(
+                self.slot_projection_registration
+            ),
         }
 
 
@@ -242,6 +277,190 @@ def wafer_patch_center_to_tray(
     return center_T, offset, float(np.linalg.norm(offset))
 
 
+def slot_boundary_half_extent_mm(
+    geometry: Mapping[str, Any],
+    *,
+    physical_slot_side_length_mm: float,
+) -> float:
+    """Validate the physical slot side against the rigid Tray pitch."""
+
+    slot_grid = geometry.get("slot_grid")
+    if not isinstance(slot_grid, Mapping):
+        raise ValueError("Tray geometry缺少slot_grid")
+    try:
+        pitch_x = float(slot_grid["pitch_x_mm"])
+        pitch_y = float(slot_grid["pitch_y_mm"])
+        side_length = float(physical_slot_side_length_mm)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Tray刚体槽间距或视觉配置槽尺寸无效") from exc
+    if (
+        not all(math.isfinite(value) for value in (side_length, pitch_x, pitch_y))
+        or side_length <= 0.0
+        or side_length >= min(pitch_x, pitch_y)
+    ):
+        raise ValueError("Tray geometry的槽边长必须大于0且小于槽间距")
+    return 0.5 * side_length
+
+
+def _classify_patch_quadrilateral_against_physical_slot(
+    wafer: WaferObservation,
+    projection: SlotProjection,
+    *,
+    output_size: int,
+    patch_half_extent_mm: float,
+    slot_boundary_half_extent_mm: float,
+    boundary_uncertainty_mm: float,
+) -> WaferObservation:
+    """Replace the legacy crop-edge flag with the physical 19.9 mm square."""
+
+    if not wafer.found or len(wafer.box_patch_px) != 4:
+        return wafer
+    box_T = np.asarray(
+        [
+            wafer_patch_center_to_tray(
+                point,
+                projection,
+                output_size=output_size,
+                half_extent_mm=patch_half_extent_mm,
+            )[0]
+            for point in wafer.box_patch_px
+        ],
+        dtype=np.float64,
+    )
+    slot_center = np.asarray(projection.center_T_mm, dtype=np.float64).reshape(3)
+    relative_xy = box_T[:, :2] - slot_center[:2]
+    maximum_overflow_mm = float(
+        np.max(np.abs(relative_xy) - float(slot_boundary_half_extent_mm))
+    )
+    outside = bool(maximum_overflow_mm > float(boundary_uncertainty_mm))
+    flags = tuple(flag for flag in wafer.flags if flag != "outside_slot")
+    if outside:
+        flags += ("outside_slot",)
+    return replace(wafer, outside_slot=outside, flags=flags)
+
+
+def _correction_full_contour_gates(
+    refinement: WaferGeometryRefinement,
+    refined_center_T: np.ndarray,
+    expanded_projection: SlotProjection,
+    geometry: Mapping[str, Any],
+    wafer_config: WaferQualityConfig,
+    *,
+    output_size: int,
+    refinement_half_extent_mm: float,
+    patch_half_extent_mm: float,
+    slot_boundary_half_extent_mm: float,
+    minimum_boundary_uncertainty_mm: float,
+) -> dict[str, Any]:
+    """Validate full-contour physical size and out-of-slot geometry in Tray."""
+
+    edge = float(output_size - 1)
+    millimetres_per_pixel = 2.0 * float(refinement_half_extent_mm) / edge
+    short_side_mm = float(refinement.short_side_px) * millimetres_per_pixel
+    long_side_mm = float(refinement.long_side_px) * millimetres_per_pixel
+    area_mm2 = float(refinement.area_px) * millimetres_per_pixel**2
+    patch_span_mm = 2.0 * float(patch_half_extent_mm)
+    minimum_area_mm2 = float(wafer_config.minimum_area_ratio) * patch_span_mm**2
+    maximum_side_mm = (
+        float(wafer_config.maximum_normal_side_ratio) * patch_span_mm
+    )
+
+    box_T = np.asarray(
+        [
+            wafer_patch_center_to_tray(
+                point,
+                expanded_projection,
+                output_size=output_size,
+                half_extent_mm=refinement_half_extent_mm,
+            )[0]
+            for point in refinement.box_patch_px
+        ],
+        dtype=np.float64,
+    )
+    nearest_slot_key, nearest_slot_distance = nearest_metric_slot(
+        refined_center_T, geometry
+    )
+    nearest_slot_center = np.asarray(
+        (geometry.get("slots") or {})[nearest_slot_key], dtype=np.float64
+    ).reshape(3)
+    boundary_uncertainty_mm = max(
+        float(minimum_boundary_uncertainty_mm),
+        millimetres_per_pixel,
+        float(wafer_config.slot_boundary_margin_ratio)
+        * (2.0 * float(slot_boundary_half_extent_mm)),
+    )
+    relative_box_xy = box_T[:, :2] - nearest_slot_center[:2]
+    corner_overflow_mm = np.max(
+        np.abs(relative_box_xy) - float(slot_boundary_half_extent_mm), axis=1
+    )
+    maximum_corner_overflow_mm = float(np.max(corner_overflow_mm))
+    slot_polygon_xy = np.asarray(
+        [
+            [-slot_boundary_half_extent_mm, -slot_boundary_half_extent_mm],
+            [slot_boundary_half_extent_mm, -slot_boundary_half_extent_mm],
+            [slot_boundary_half_extent_mm, slot_boundary_half_extent_mm],
+            [-slot_boundary_half_extent_mm, slot_boundary_half_extent_mm],
+        ],
+        dtype=np.float32,
+    )
+    fitted_polygon_xy = relative_box_xy.astype(np.float32)
+    fitted_area_mm2 = abs(float(cv2.contourArea(fitted_polygon_xy)))
+    intersection_area_mm2, _intersection_polygon = cv2.intersectConvexConvex(
+        fitted_polygon_xy,
+        slot_polygon_xy,
+    )
+    outside_area_mm2 = max(
+        0.0, fitted_area_mm2 - float(intersection_area_mm2)
+    )
+    minimum_outside_area_mm2 = max(
+        millimetres_per_pixel**2,
+        0.5 * boundary_uncertainty_mm * max(short_side_mm, 1.0),
+    )
+    outside_nearest_slot = bool(
+        maximum_corner_overflow_mm > boundary_uncertainty_mm
+        and outside_area_mm2 > minimum_outside_area_mm2
+    )
+    inside_nearest_slot = bool(
+        maximum_corner_overflow_mm < -boundary_uncertainty_mm
+    )
+    boundary_classification = (
+        "outside"
+        if outside_nearest_slot
+        else "inside"
+        if inside_nearest_slot
+        else "ambiguous"
+    )
+    physical_size_passed = bool(
+        area_mm2 >= minimum_area_mm2
+        and short_side_mm > 0.0
+        and long_side_mm <= maximum_side_mm
+    )
+    return {
+        "passed": physical_size_passed and outside_nearest_slot,
+        "physical_size_passed": physical_size_passed,
+        "outside_nearest_slot": outside_nearest_slot,
+        "inside_nearest_slot": inside_nearest_slot,
+        "boundary_classification": boundary_classification,
+        "short_side_mm": short_side_mm,
+        "long_side_mm": long_side_mm,
+        "area_mm2": area_mm2,
+        "minimum_area_mm2": minimum_area_mm2,
+        "maximum_side_mm": maximum_side_mm,
+        "nearest_slot_key": nearest_slot_key,
+        "nearest_slot_center_distance_mm": float(nearest_slot_distance),
+        "patch_half_extent_mm": float(patch_half_extent_mm),
+        "slot_boundary_half_extent_mm": float(
+            slot_boundary_half_extent_mm
+        ),
+        "boundary_uncertainty_mm": boundary_uncertainty_mm,
+        "maximum_corner_overflow_mm": maximum_corner_overflow_mm,
+        "outside_area_mm2": outside_area_mm2,
+        "minimum_outside_area_mm2": minimum_outside_area_mm2,
+        "fitted_polygon_area_mm2": fitted_area_mm2,
+        "box_T_mm": box_T.astype(float).tolist(),
+    }
+
+
 def tracked_pose_estimate(tracked: TrackedTrayPose) -> TrayPoseEstimate:
     """Build a self-consistent pose estimate from an accepted filtered pose.
 
@@ -306,6 +525,12 @@ class TrayVisionAnalyzer:
         self.geometry = dict(geometry)
         self.slot_marker_layout = slot_marker_layout
         self.config = config
+        self.slot_boundary_half_extent_mm = slot_boundary_half_extent_mm(
+            self.geometry,
+            physical_slot_side_length_mm=(
+                self.config.physical_slot_side_length_mm
+            ),
+        )
         geometry_slots = set(str(key) for key in self.geometry.get("slots", {}))
         layout_slots = set(slot_marker_layout.marker_id_by_slot)
         if len(geometry_slots) != 36 or geometry_slots != layout_slots:
@@ -323,10 +548,25 @@ class TrayVisionAnalyzer:
             slots=(),
             summary={"analyzed": 0, "unknown": 36},
             annotated_image=pose.annotated_image.copy(),
+            slot_projection_registration={
+                "applied": False,
+                "reason": "tray_pose_not_accepted",
+            },
         )
 
     @staticmethod
-    def _draw_slot(canvas: np.ndarray, analysis: SlotAnalysis) -> None:
+    def _draw_slot(
+        canvas: np.ndarray,
+        analysis: SlotAnalysis,
+        *,
+        stacking_detection_enabled: bool = False,
+    ) -> None:
+        state = analysis.decision.state
+        if not stacking_detection_enabled:
+            state = {
+                SlotState.STACKED: SlotState.WARNING,
+                SlotState.STACKED_OUTSIDE_SLOT: SlotState.OUTSIDE_SLOT,
+            }.get(state, state)
         colors = {
             SlotState.EMPTY: (60, 180, 75),
             SlotState.EMPTY_UNREAD_MARKER: (120, 210, 150),
@@ -339,8 +579,12 @@ class TrayVisionAnalyzer:
             SlotState.OCCLUDED: (0, 210, 255),
             SlotState.UNKNOWN: (255, 180, 0),
         }
-        color = colors[analysis.decision.state]
-        polygon = np.asarray(analysis.projection.polygon_px, dtype=np.int32).reshape(4, 2)
+        color = colors[state]
+        boundary_polygon = (
+            getattr(analysis, "slot_boundary_polygon_image_px", ())
+            or analysis.projection.polygon_px
+        )
+        polygon = np.asarray(boundary_polygon, dtype=np.int32).reshape(4, 2)
         cv2.polylines(canvas, [polygon], True, color, 2, cv2.LINE_AA)
         center = tuple(np.round(analysis.projection.center_px).astype(int))
         cv2.circle(canvas, center, 5, color, -1, cv2.LINE_AA)
@@ -358,7 +602,7 @@ class TrayVisionAnalyzer:
         }
         label = (
             f"{analysis.projection.slot_key} "
-            f"{state_codes[analysis.decision.state]}"
+            f"{state_codes[state]}"
         )
         scale = max(0.50, min(0.82, math.sqrt(max(analysis.projection.projected_area_px, 1.0)) / 115.0))
         cv2.putText(
@@ -451,8 +695,58 @@ class TrayVisionAnalyzer:
             image.shape,
             half_extent_mm=self.config.slot_half_extent_mm,
         )
+        boundary_projections = build_slot_projections(
+            self.geometry,
+            self.pose_estimator,
+            pose_result,
+            image.shape,
+            half_extent_mm=self.slot_boundary_half_extent_mm,
+        )
+        refinement_half_extent = max(
+            OUTSIDE_WAFER_REFINEMENT_HALF_EXTENT_MM,
+            float(self.config.slot_half_extent_mm) * 2.0,
+        )
+        refinement_output_size = max(
+            32,
+            int(
+                round(
+                    (self.config.canonical_patch_size - 1)
+                    * refinement_half_extent
+                    / float(self.config.slot_half_extent_mm)
+                )
+            )
+            + 1,
+        )
+        refinement_projections = build_slot_projections(
+            self.geometry,
+            self.pose_estimator,
+            pose_result,
+            image.shape,
+            half_extent_mm=refinement_half_extent,
+        )
         observations = detect_aruco_observations(
             image, self.slot_marker_layout.dictionary_name
+        )
+        marker_registration, registration_diagnostics = (
+            estimate_slot_marker_registration(
+                projections,
+                self.slot_marker_layout,
+                observations,
+            )
+        )
+        projections = apply_slot_marker_registration(
+            projections, marker_registration, image.shape
+        )
+        boundary_projections = apply_slot_marker_registration(
+            boundary_projections, marker_registration, image.shape
+        )
+        refinement_projections = apply_slot_marker_registration(
+            refinement_projections, marker_registration, image.shape
+        )
+        physical_boundary_uncertainty_mm = (
+            self.config.physical_slot_boundary_uncertainty_mm
+            if registration_diagnostics.get("applied")
+            else self.config.unregistered_slot_boundary_uncertainty_mm
         )
         analyses: list[SlotAnalysis] = []
         canvas = pose_result.annotated_image.copy()
@@ -470,6 +764,14 @@ class TrayVisionAnalyzer:
                 patch,
             )
             wafer = analyze_wafer_patch(patch, self.config.wafer_quality)
+            wafer = _classify_patch_quadrilateral_against_physical_slot(
+                wafer,
+                projection,
+                output_size=self.config.canonical_patch_size,
+                patch_half_extent_mm=self.config.slot_half_extent_mm,
+                slot_boundary_half_extent_mm=self.slot_boundary_half_extent_mm,
+                boundary_uncertainty_mm=physical_boundary_uncertainty_mm,
+            )
             occlusion_ratio = _explicit_occlusion_ratio(
                 projection.polygon_px, explicit_occlusion_mask
             )
@@ -488,6 +790,13 @@ class TrayVisionAnalyzer:
             wafer_center_T: Optional[tuple[float, float, float]] = None
             wafer_offset_T: Optional[tuple[float, float]] = None
             wafer_offset_distance: Optional[float] = None
+            wafer_center_refinement: Optional[dict[str, Any]] = None
+            wafer_correction_center_valid = False
+            wafer_correction_outside_slot = False
+            wafer_correction_center_reason = "not_outside_slot"
+            correction_seed_image: Optional[tuple[float, float]] = None
+            correction_seed_T: Optional[tuple[float, float, float]] = None
+            correction_detection_source: Optional[str] = None
             if wafer.found and wafer.box_patch_px:
                 mapped = patch_points_to_image(
                     np.asarray(wafer.box_patch_px, dtype=np.float32), image_to_patch
@@ -521,6 +830,339 @@ class TrayVisionAnalyzer:
                 wafer_center_T = tuple(float(value) for value in center_T)
                 wafer_offset_T = tuple(float(value) for value in offset_T)
                 wafer_offset_distance = float(offset_distance)
+            if (
+                decision.state
+                in {SlotState.OUTSIDE_SLOT, SlotState.STACKED_OUTSIDE_SLOT}
+                and wafer.found
+                and wafer_center_image is not None
+                and wafer_center_T is not None
+            ):
+                correction_seed_image = wafer_center_image
+                correction_seed_T = wafer_center_T
+                correction_detection_source = "slot_patch_outside_decision"
+            elif (
+                wafer.found
+                and wafer_center_image is not None
+                and wafer_center_T is not None
+                and len(wafer.box_patch_px) == 4
+                and decision.state
+                not in {SlotState.OUT_OF_VIEW, SlotState.OCCLUDED}
+            ):
+                box_patch = np.asarray(
+                    wafer.box_patch_px, dtype=np.float64
+                ).reshape(4, 2)
+                patch_edge = float(self.config.canonical_patch_size - 1)
+                boundary_clearance_px = float(
+                    np.min(
+                        np.concatenate(
+                            (
+                                box_patch[:, 0],
+                                box_patch[:, 1],
+                                patch_edge - box_patch[:, 0],
+                                patch_edge - box_patch[:, 1],
+                            )
+                        )
+                    )
+                )
+                physical_boundary_inset_px = (
+                    patch_edge
+                    * (
+                        float(self.config.slot_half_extent_mm)
+                        - float(self.slot_boundary_half_extent_mm)
+                    )
+                    / (2.0 * float(self.config.slot_half_extent_mm))
+                )
+                boundary_margin_px = max(
+                    1.0,
+                    float(
+                        self.config.wafer_quality.slot_boundary_margin_ratio
+                    )
+                    * patch_edge,
+                )
+                if boundary_clearance_px <= (
+                    physical_boundary_inset_px + boundary_margin_px
+                ):
+                    correction_seed_image = wafer_center_image
+                    correction_seed_T = wafer_center_T
+                    correction_detection_source = (
+                        "slot_patch_near_boundary_quadrilateral"
+                    )
+            elif (
+                not wafer.found
+                and "candidate_area_out_of_range" in wafer.flags
+                and 0.0 < float(wafer.area_ratio)
+                < float(self.config.wafer_quality.minimum_area_ratio)
+                and decision.state
+                not in {
+                    SlotState.OUT_OF_VIEW,
+                    SlotState.OCCLUDED,
+                    SlotState.STACKED,
+                    SlotState.STACKED_OUTSIDE_SLOT,
+                }
+            ):
+                fragment_seed = find_boundary_wafer_fragment_seed(
+                    patch, self.config.wafer_quality
+                )
+                if fragment_seed is not None:
+                    mapped_seed = patch_points_to_image(
+                        np.asarray([fragment_seed], dtype=np.float32),
+                        image_to_patch,
+                    )[0]
+                    seed_T, _seed_offset, _seed_distance = (
+                        wafer_patch_center_to_tray(
+                            fragment_seed,
+                            projection,
+                            output_size=self.config.canonical_patch_size,
+                            half_extent_mm=self.config.slot_half_extent_mm,
+                        )
+                    )
+                    correction_seed_image = tuple(
+                        float(value) for value in mapped_seed
+                    )
+                    correction_seed_T = tuple(
+                        float(value) for value in seed_T
+                    )
+                    correction_detection_source = (
+                        "slot_boundary_low_area_fragment"
+                    )
+            if (
+                correction_seed_image is not None
+                and correction_seed_T is not None
+                and correction_detection_source is not None
+            ):
+                expanded_projection = refinement_projections[slot_key]
+                if (
+                    expanded_projection.image_coverage_ratio
+                    < OUTSIDE_WAFER_REFINEMENT_MINIMUM_IMAGE_COVERAGE
+                ):
+                    wafer_correction_center_reason = (
+                        "expanded_roi_not_fully_in_image"
+                    )
+                    wafer_center_refinement = {
+                        "success": False,
+                        "reason": wafer_correction_center_reason,
+                        "expanded_image_coverage_ratio": float(
+                            expanded_projection.image_coverage_ratio
+                        ),
+                        "required_image_coverage_ratio": (
+                            OUTSIDE_WAFER_REFINEMENT_MINIMUM_IMAGE_COVERAGE
+                        ),
+                        "detection_source": correction_detection_source,
+                    }
+                else:
+                    expanded_patch, image_to_expanded = warp_slot_patch(
+                        image,
+                        expanded_projection,
+                        output_size=refinement_output_size,
+                    )
+                    seed_expanded = cv2.perspectiveTransform(
+                        np.asarray(
+                            [[correction_seed_image]], dtype=np.float32
+                        ),
+                        np.asarray(image_to_expanded, dtype=np.float32),
+                    ).reshape(2)
+                    refinement = refine_wafer_geometry_center(
+                        expanded_patch,
+                        (float(seed_expanded[0]), float(seed_expanded[1])),
+                        self.config.wafer_quality,
+                    )
+                    wafer_center_refinement = refinement.to_json()
+                    wafer_center_refinement.update(
+                        {
+                            "expanded_half_extent_mm": float(
+                                refinement_half_extent
+                            ),
+                            "expanded_output_size_px": int(
+                                refinement_output_size
+                            ),
+                            "expanded_image_coverage_ratio": float(
+                                expanded_projection.image_coverage_ratio
+                            ),
+                            "detection_source": correction_detection_source,
+                            "preliminary_center_image_px": list(
+                                correction_seed_image
+                            ),
+                            "preliminary_center_T_mm": list(
+                                correction_seed_T
+                            ),
+                        }
+                    )
+                    if (
+                        refinement.success
+                        and refinement.center_patch_px is not None
+                    ):
+                        refined_center_T, refined_offset_T, refined_distance = (
+                            wafer_patch_center_to_tray(
+                                refinement.center_patch_px,
+                                expanded_projection,
+                                output_size=refinement_output_size,
+                                half_extent_mm=refinement_half_extent,
+                            )
+                        )
+                        preliminary_center_T = np.asarray(
+                            correction_seed_T, dtype=np.float64
+                        )
+                        seed_shift_mm = float(
+                            np.linalg.norm(
+                                refined_center_T[:2]
+                                - preliminary_center_T[:2]
+                            )
+                        )
+                        wafer_center_refinement["seed_shift_T_xy_mm"] = (
+                            seed_shift_mm
+                        )
+                        full_contour_gates = _correction_full_contour_gates(
+                            refinement,
+                            refined_center_T,
+                            expanded_projection,
+                            self.geometry,
+                            self.config.wafer_quality,
+                            output_size=refinement_output_size,
+                            refinement_half_extent_mm=refinement_half_extent,
+                            patch_half_extent_mm=self.config.slot_half_extent_mm,
+                            slot_boundary_half_extent_mm=(
+                                self.slot_boundary_half_extent_mm
+                            ),
+                            minimum_boundary_uncertainty_mm=(
+                                physical_boundary_uncertainty_mm
+                            ),
+                        )
+                        wafer_center_refinement["full_contour_gates"] = (
+                            full_contour_gates
+                        )
+                        if seed_shift_mm > (
+                            OUTSIDE_WAFER_REFINEMENT_MAXIMUM_SEED_SHIFT_MM
+                        ):
+                            wafer_center_refinement["success"] = False
+                            wafer_center_refinement["reason"] = (
+                                "refined_center_shift_exceeds_limit"
+                            )
+                            wafer_center_refinement[
+                                "maximum_seed_shift_T_xy_mm"
+                            ] = (
+                                OUTSIDE_WAFER_REFINEMENT_MAXIMUM_SEED_SHIFT_MM
+                            )
+                            wafer_correction_center_reason = str(
+                                wafer_center_refinement["reason"]
+                            )
+                        elif not full_contour_gates[
+                            "physical_size_passed"
+                        ]:
+                            wafer_center_refinement["success"] = False
+                            wafer_center_refinement["reason"] = (
+                                "refined_physical_size_out_of_range"
+                            )
+                            wafer_correction_center_reason = str(
+                                wafer_center_refinement["reason"]
+                            )
+                        else:
+                            mapped_center = patch_points_to_image(
+                                np.asarray(
+                                    [refinement.center_patch_px],
+                                    dtype=np.float32,
+                                ),
+                                image_to_expanded,
+                            )[0]
+                            mapped_box = patch_points_to_image(
+                                np.asarray(
+                                    refinement.box_patch_px,
+                                    dtype=np.float32,
+                                ),
+                                image_to_expanded,
+                            )
+                            wafer_center_image = tuple(
+                                float(value) for value in mapped_center
+                            )
+                            wafer_center_T = tuple(
+                                float(value) for value in refined_center_T
+                            )
+                            wafer_offset_T = tuple(
+                                float(value) for value in refined_offset_T
+                            )
+                            wafer_offset_distance = float(refined_distance)
+                            wafer_box_image = tuple(
+                                tuple(float(value) for value in point)
+                                for point in mapped_box
+                            )
+                            wafer_center_refinement[
+                                "refined_center_image_px"
+                            ] = list(wafer_center_image)
+                            wafer_center_refinement[
+                                "refined_center_T_mm"
+                            ] = list(wafer_center_T)
+                            wafer_center_refinement[
+                                "refined_box_image_px"
+                            ] = [list(point) for point in wafer_box_image]
+                            if not full_contour_gates[
+                                "outside_nearest_slot"
+                            ]:
+                                # A clipped 23 mm slot patch is only a seed.
+                                # Once the complete fitted quadrilateral is
+                                # available, its metric boundary classification
+                                # replaces the patch-edge OUT decision.
+                                wafer = replace(
+                                    wafer,
+                                    outside_slot=False,
+                                    flags=tuple(
+                                        flag
+                                        for flag in wafer.flags
+                                        if flag != "outside_slot"
+                                    ),
+                                )
+                                decision = decide_slot_state(
+                                    projection,
+                                    marker,
+                                    wafer,
+                                    occlusion_ratio=occlusion_ratio,
+                                    config=self.config.slot_decision,
+                                )
+                                boundary_classification = str(
+                                    full_contour_gates[
+                                        "boundary_classification"
+                                    ]
+                                )
+                                wafer_correction_center_reason = (
+                                    "refined_contour_inside_nearest_slot"
+                                    if boundary_classification == "inside"
+                                    else "refined_contour_boundary_ambiguous"
+                                )
+                                wafer_center_refinement[
+                                    "correction_eligible"
+                                ] = False
+                                wafer_center_refinement[
+                                    "slot_decision_overridden_from_patch_edge"
+                                ] = True
+                            else:
+                                if not wafer.outside_slot:
+                                    wafer = replace(
+                                        wafer,
+                                        outside_slot=True,
+                                        flags=tuple(wafer.flags)
+                                        + ("outside_slot",),
+                                    )
+                                    decision = decide_slot_state(
+                                        projection,
+                                        marker,
+                                        wafer,
+                                        occlusion_ratio=occlusion_ratio,
+                                        config=self.config.slot_decision,
+                                    )
+                                wafer_correction_outside_slot = True
+                                if decision.state is not SlotState.STACKED_OUTSIDE_SLOT:
+                                    wafer_correction_center_valid = True
+                                    wafer_correction_center_reason = "ok"
+                                    wafer_center_refinement[
+                                        "correction_eligible"
+                                    ] = True
+                                else:
+                                    wafer_correction_center_reason = (
+                                        "stacked_outside_not_automatic"
+                                    )
+                                    wafer_center_refinement[
+                                        "correction_eligible"
+                                    ] = False
+                    else:
+                        wafer_correction_center_reason = refinement.reason
             analysis = SlotAnalysis(
                 projection=projection,
                 marker=marker,
@@ -533,9 +1175,25 @@ class TrayVisionAnalyzer:
                 wafer_offset_T_mm=wafer_offset_T,
                 wafer_offset_distance_mm=wafer_offset_distance,
                 explicit_occlusion_ratio=occlusion_ratio,
+                wafer_center_refinement=wafer_center_refinement,
+                wafer_correction_center_valid=wafer_correction_center_valid,
+                wafer_correction_outside_slot=wafer_correction_outside_slot,
+                wafer_correction_center_reason=wafer_correction_center_reason,
+                slot_boundary_polygon_image_px=tuple(
+                    tuple(float(value) for value in point)
+                    for point in boundary_projections[slot_key].polygon_px
+                ),
+                slot_boundary_polygon_T_mm=tuple(
+                    tuple(float(value) for value in point)
+                    for point in boundary_projections[slot_key].polygon_T_mm
+                ),
             )
             analyses.append(analysis)
-            self._draw_slot(canvas, analysis)
+            self._draw_slot(
+                canvas,
+                analysis,
+                stacking_detection_enabled=self.config.wafer_quality.stacking_detection_enabled,
+            )
 
         summary = {state.value: 0 for state in SlotState}
         for analysis in analyses:
@@ -545,9 +1203,15 @@ class TrayVisionAnalyzer:
             f"pose PASS | RMS={pose_result.reprojection_rms_px:.3f}px | "
             f"empty={summary['empty'] + summary['empty_unread_marker']} | "
             f"occupied={summary['occupied']} | warn={summary['warning']} | "
-            f"stacked={summary['stacked']} | outside={summary['outside_slot']} | "
-            f"stacked+outside={summary['stacked_outside_slot']} | unknown={summary['unknown']}"
         )
+        if self.config.wafer_quality.stacking_detection_enabled:
+            status += (
+                f"stacked={summary['stacked']} | outside={summary['outside_slot']} | "
+                f"stacked+outside={summary['stacked_outside_slot']} | "
+            )
+        else:
+            status += f"outside={summary['outside_slot']} | "
+        status += f"unknown={summary['unknown']}"
         cv2.rectangle(canvas, (8, 8), (min(canvas.shape[1] - 8, 1040), 48), (0, 0, 0), -1)
         cv2.putText(
             canvas,
@@ -572,6 +1236,7 @@ class TrayVisionAnalyzer:
             slots=tuple(analyses),
             summary=summary,
             annotated_image=canvas,
+            slot_projection_registration=registration_diagnostics,
         )
 
     def analyze_tracked(

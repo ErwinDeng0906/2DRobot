@@ -317,6 +317,152 @@ def build_slot_projections(
     return result
 
 
+def estimate_slot_marker_registration(
+    projections: Mapping[str, SlotProjection],
+    layout: SlotMarkerLayout,
+    observations: Mapping[int, ArucoObservation],
+) -> tuple[Optional[np.ndarray], dict[str, Any]]:
+    """Fit a guarded image-plane correction from decoded slot-marker centres.
+
+    The metric slot centres remain fixed by the calibrated Tray rigid body.
+    This homography only removes residual image-plane projection error for the
+    current frame.  It is accepted only with at least six spatially distributed
+    decoded slot IDs and a low inlier residual; otherwise callers retain the
+    original Stage-3 projection.
+    """
+
+    source_points: list[tuple[float, float]] = []
+    target_points: list[tuple[float, float]] = []
+    slot_keys: list[str] = []
+    for slot_key in sorted(projections):
+        marker_id = layout.marker_id_by_slot.get(slot_key)
+        observation = observations.get(marker_id) if marker_id is not None else None
+        if observation is None:
+            continue
+        source_points.append(projections[slot_key].center_px)
+        target_points.append(observation.center_px)
+        slot_keys.append(slot_key)
+
+    diagnostics: dict[str, Any] = {
+        "applied": False,
+        "reason": "insufficient_decoded_slot_markers",
+        "pair_count": len(source_points),
+        "required_pair_count": 6,
+        "slot_keys": slot_keys,
+    }
+    if len(source_points) < 6:
+        return None, diagnostics
+
+    source = np.asarray(source_points, dtype=np.float32)
+    target = np.asarray(target_points, dtype=np.float32)
+    singular_values = np.linalg.svd(
+        source.astype(np.float64) - np.mean(source, axis=0),
+        compute_uv=False,
+    )
+    spatial_ratio = float(
+        singular_values[-1] / max(float(singular_values[0]), 1e-9)
+    )
+    diagnostics["source_spatial_singular_value_ratio"] = spatial_ratio
+    if spatial_ratio < 0.08:
+        diagnostics["reason"] = "decoded_slot_markers_not_spatially_distributed"
+        return None, diagnostics
+
+    homography, inlier_mask = cv2.findHomography(
+        source,
+        target,
+        cv2.RANSAC,
+        2.5,
+        maxIters=3000,
+        confidence=0.995,
+    )
+    if homography is None or inlier_mask is None or not np.all(np.isfinite(homography)):
+        diagnostics["reason"] = "slot_marker_homography_fit_failed"
+        return None, diagnostics
+    inliers = inlier_mask.reshape(-1).astype(bool)
+    inlier_count = int(np.count_nonzero(inliers))
+    inlier_ratio = float(inlier_count / len(source))
+    diagnostics["inlier_count"] = inlier_count
+    diagnostics["inlier_ratio"] = inlier_ratio
+    diagnostics["inlier_slot_keys"] = [
+        slot_key for slot_key, is_inlier in zip(slot_keys, inliers) if is_inlier
+    ]
+    if inlier_count < 6 or inlier_ratio < 0.65:
+        diagnostics["reason"] = "slot_marker_homography_has_too_few_inliers"
+        return None, diagnostics
+
+    registered = cv2.perspectiveTransform(
+        source.reshape(1, -1, 2), homography.astype(np.float64)
+    ).reshape(-1, 2)
+    residuals = np.linalg.norm(registered - target, axis=1)
+    inlier_residuals = residuals[inliers]
+    inlier_rms = float(np.sqrt(np.mean(np.square(inlier_residuals))))
+    inlier_max = float(np.max(inlier_residuals))
+    displacement = np.linalg.norm(registered - source, axis=1)
+    diagnostics.update(
+        {
+            "raw_center_error_median_px": float(
+                np.median(np.linalg.norm(source - target, axis=1))
+            ),
+            "inlier_residual_rms_px": inlier_rms,
+            "inlier_residual_max_px": inlier_max,
+            "projection_shift_median_px": float(np.median(displacement)),
+            "projection_shift_max_px": float(np.max(displacement)),
+        }
+    )
+    if inlier_rms > 1.75 or inlier_max > 3.0:
+        diagnostics["reason"] = "slot_marker_homography_residual_too_large"
+        return None, diagnostics
+    if float(np.median(displacement)) > 20.0 or float(np.max(displacement)) > 35.0:
+        diagnostics["reason"] = "slot_marker_homography_shift_too_large"
+        return None, diagnostics
+
+    diagnostics["applied"] = True
+    diagnostics["reason"] = "ok"
+    diagnostics["image_homography"] = homography.astype(float).tolist()
+    return homography.astype(np.float64), diagnostics
+
+
+def apply_slot_marker_registration(
+    projections: Mapping[str, SlotProjection],
+    image_homography: Optional[np.ndarray],
+    image_shape: tuple[int, ...],
+) -> dict[str, SlotProjection]:
+    """Apply one accepted image homography while preserving Tray geometry."""
+
+    if image_homography is None:
+        return dict(projections)
+    homography = np.asarray(image_homography, dtype=np.float64).reshape(3, 3)
+    if not np.all(np.isfinite(homography)):
+        raise ValueError("slot marker registration homography must be finite")
+    result: dict[str, SlotProjection] = {}
+    for slot_key, projection in projections.items():
+        source = np.asarray(
+            [projection.center_px, *projection.polygon_px], dtype=np.float32
+        )
+        corrected = cv2.perspectiveTransform(
+            source.reshape(1, -1, 2), homography
+        ).reshape(-1, 2)
+        center_px = corrected[0]
+        polygon_px = corrected[1:]
+        area = abs(float(cv2.contourArea(polygon_px.astype(np.float32))))
+        if not np.all(np.isfinite(corrected)) or area <= 1e-6:
+            raise ValueError("slot marker registration produced invalid projection")
+        result[slot_key] = SlotProjection(
+            slot_key=projection.slot_key,
+            row=projection.row,
+            column=projection.column,
+            center_T_mm=projection.center_T_mm,
+            center_px=tuple(float(value) for value in center_px),
+            polygon_T_mm=projection.polygon_T_mm,
+            polygon_px=tuple(
+                tuple(float(value) for value in point) for point in polygon_px
+            ),
+            image_coverage_ratio=_polygon_coverage_ratio(polygon_px, image_shape),
+            projected_area_px=area,
+        )
+    return result
+
+
 def warp_slot_patch(
     image: np.ndarray,
     projection: SlotProjection,
@@ -420,8 +566,10 @@ __all__ = [
     "SlotMarkerLayout",
     "SlotProjection",
     "associate_marker_to_slot",
+    "apply_slot_marker_registration",
     "build_slot_projections",
     "detect_aruco_observations",
+    "estimate_slot_marker_registration",
     "load_slot_marker_layout",
     "marker_like_pattern_features",
     "patch_points_to_image",

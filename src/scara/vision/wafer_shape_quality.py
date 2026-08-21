@@ -25,6 +25,12 @@ class WaferQualityConfig:
     upper_hsv: tuple[int, int, int] = (165, 255, 255)
     dark_value_max: int = 155
     dark_saturation_min: int = 28
+    relative_contrast_enabled: bool = True
+    relative_lab_lightness_weight: float = 0.22
+    relative_lab_distance_min: float = 18.0
+    relative_lab_chroma_min: float = 10.0
+    relative_reference_max_saturation: int = 90
+    relative_reference_min_value: int = 45
     minimum_area_ratio: float = 0.075
     maximum_area_ratio: float = 0.82
     minimum_chromatic_fraction: float = 0.62
@@ -39,6 +45,7 @@ class WaferQualityConfig:
     normal_max_yaw_deg: float = 8.0
     warning_max_yaw_deg: float = 15.0
     maximum_normal_side_ratio: float = 0.86
+    stacking_detection_enabled: bool = False
     stacked_second_component_ratio: float = 0.10
     stacked_internal_line_count: int = 2
     stacked_internal_line_score: float = 0.45
@@ -51,6 +58,7 @@ class WaferQualityConfig:
     stacked_l_min_leg_ratio: float = 0.22
     stacked_l_angle_tolerance_deg: float = 20.0
     slot_boundary_margin_ratio: float = 0.010
+    quadrilateral_min_mask_iou: float = 0.70
 
 
 DEFAULT_WAFER_QUALITY = WaferQualityConfig()
@@ -79,6 +87,8 @@ class WaferObservation:
     flags: tuple[str, ...]
     outside_slot: bool
     secondary_boxes_patch_px: tuple[tuple[tuple[float, float], ...], ...]
+    quadrilateral_fit_method: str
+    quadrilateral_fit_iou: float
 
     @classmethod
     def not_found(
@@ -106,6 +116,8 @@ class WaferObservation:
             flags=tuple(flags),
             outside_slot=False,
             secondary_boxes_patch_px=(),
+            quadrilateral_fit_method="none",
+            quadrilateral_fit_iou=0.0,
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -134,12 +146,80 @@ class WaferObservation:
                 [list(point) for point in box]
                 for box in self.secondary_boxes_patch_px
             ],
+            "quadrilateral_fit_method": self.quadrilateral_fit_method,
+            "quadrilateral_fit_iou": self.quadrilateral_fit_iou,
         }
+
+
+@dataclass(frozen=True)
+class WaferQuadrilateralFit:
+    """Four physical wafer corners recovered from one segmented contour."""
+
+    success: bool
+    reason: str
+    center_px: Optional[tuple[float, float]]
+    corners_px: tuple[tuple[float, float], ...]
+    short_side_px: float
+    long_side_px: float
+    area_px: float
+    mask_iou: float
+    yaw_deg: Optional[float]
+    method: str
+
+    @classmethod
+    def failed(cls, reason: str) -> "WaferQuadrilateralFit":
+        return cls(
+            success=False,
+            reason=str(reason),
+            center_px=None,
+            corners_px=(),
+            short_side_px=0.0,
+            long_side_px=0.0,
+            area_px=0.0,
+            mask_iou=0.0,
+            yaw_deg=None,
+            method="none",
+        )
 
 
 def normalize_square_angle_deg(angle_deg: float) -> float:
     """Normalize a square axis to [-45, 45) degrees."""
     return float((float(angle_deg) + 45.0) % 90.0 - 45.0)
+
+
+def _local_tray_lab_reference(
+    bgr: np.ndarray,
+    hsv: np.ndarray,
+    config: WaferQualityConfig,
+) -> np.ndarray:
+    """Estimate neutral tray colour from a robust outer-ring sample.
+
+    The expanded wafer ROI normally contains exposed grey tray around the
+    silicon.  Low-saturation, non-black ring pixels form the primary sample;
+    the whole patch is only used when the ring is too small.  A median keeps
+    marker cells, glare and the wafer itself from steering the reference.
+    """
+
+    height, width = bgr.shape[:2]
+    ring_width = max(2, int(round(0.12 * float(min(height, width)))))
+    ring = np.zeros((height, width), dtype=bool)
+    ring[:ring_width, :] = True
+    ring[-ring_width:, :] = True
+    ring[:, :ring_width] = True
+    ring[:, -ring_width:] = True
+    neutral = (
+        (hsv[:, :, 1] <= int(config.relative_reference_max_saturation))
+        & (hsv[:, :, 2] >= int(config.relative_reference_min_value))
+    )
+    sample_mask = ring & neutral
+    minimum_samples = max(64, int(round(0.01 * float(height * width))))
+    if int(np.count_nonzero(sample_mask)) < minimum_samples:
+        sample_mask = neutral
+    lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    samples = lab[sample_mask]
+    if samples.shape[0] < minimum_samples:
+        samples = lab.reshape(-1, 3)
+    return np.median(samples, axis=0).astype(np.float32)
 
 
 def _wafer_mask(patch: np.ndarray, config: WaferQualityConfig) -> tuple[np.ndarray, np.ndarray]:
@@ -160,13 +240,44 @@ def _wafer_mask(patch: np.ndarray, config: WaferQualityConfig) -> tuple[np.ndarr
         np.asarray((0, config.dark_saturation_min, 0), dtype=np.uint8),
         np.asarray((179, 255, config.dark_value_max), dtype=np.uint8),
     )
-    mask = cv2.bitwise_or(purple, dark_chromatic)
+    if config.relative_contrast_enabled:
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        tray_lab = _local_tray_lab_reference(bgr, hsv, config)
+        difference = lab - tray_lab.reshape(1, 1, 3)
+        lightness = difference[:, :, 0]
+        chroma = np.hypot(difference[:, :, 1], difference[:, :, 2])
+        weighted_distance = np.sqrt(
+            float(config.relative_lab_lightness_weight) * np.square(lightness)
+            + np.square(difference[:, :, 1])
+            + np.square(difference[:, :, 2])
+        )
+        relative_chromatic = np.where(
+            (
+                (weighted_distance >= float(config.relative_lab_distance_min))
+                & (chroma >= float(config.relative_lab_chroma_min))
+                & (hsv[:, :, 1] >= int(config.dark_saturation_min))
+            ),
+            255,
+            0,
+        ).astype(np.uint8)
+        # Fixed purple is now only a prior.  The relative term admits silicon
+        # whose hue moves under oblique illumination while rejecting neutral
+        # marker cells and grey shadows.
+        chromatic_support = cv2.bitwise_or(purple, relative_chromatic)
+        mask = cv2.bitwise_or(
+            purple,
+            cv2.bitwise_and(dark_chromatic, chromatic_support),
+        )
+        mask = cv2.bitwise_or(mask, relative_chromatic)
+    else:
+        chromatic_support = purple
+        mask = cv2.bitwise_or(purple, dark_chromatic)
     scale = max(1.0, min(mask.shape[:2]) / 192.0)
     open_size = max(3, int(round(3.0 * scale)) | 1)
     close_size = max(5, int(round(7.0 * scale)) | 1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((open_size, open_size), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close_size, close_size), np.uint8))
-    return mask, purple
+    return mask, chromatic_support
 
 
 def _select_components(mask: np.ndarray) -> tuple[np.ndarray, list[tuple[float, np.ndarray]]]:
@@ -219,6 +330,182 @@ def _edge_axis_angle(contour: np.ndarray, reference_deg: float = 0.0) -> tuple[O
     relative = math.degrees(math.atan2(y, x)) / 4.0
     concentration = math.hypot(x, y) / max(float(np.sum(weight_array)), 1e-9)
     return normalize_square_angle_deg(reference_deg + relative), concentration
+
+
+def _cyclic_quadrilateral(points: np.ndarray) -> Optional[np.ndarray]:
+    """Return four finite convex vertices in cyclic order."""
+
+    try:
+        raw = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    except (TypeError, ValueError):
+        return None
+    if raw.shape != (4, 2) or not np.all(np.isfinite(raw)):
+        return None
+    hull = cv2.convexHull(raw.astype(np.float32), clockwise=False).reshape(-1, 2)
+    if hull.shape != (4, 2):
+        return None
+    if abs(float(cv2.contourArea(hull.astype(np.float32)))) <= 1.0:
+        return None
+    return hull.astype(np.float64)
+
+
+def _quadrilateral_diagonal_center(
+    corners: np.ndarray,
+) -> Optional[tuple[float, float]]:
+    points = _cyclic_quadrilateral(corners)
+    if points is None:
+        return None
+    p0, p1, p2, p3 = points
+    first = p2 - p0
+    second = p3 - p1
+    matrix = np.column_stack((first, -second))
+    determinant = float(np.linalg.det(matrix))
+    scale = max(1.0, float(np.linalg.norm(first)), float(np.linalg.norm(second)))
+    if abs(determinant) <= 1e-9 * scale * scale:
+        return None
+    factors = np.linalg.solve(matrix, p1 - p0)
+    if not np.all(np.isfinite(factors)) or not np.all(
+        (-1e-6 <= factors) & (factors <= 1.0 + 1e-6)
+    ):
+        return None
+    center = p0 + float(factors[0]) * first
+    return float(center[0]), float(center[1])
+
+
+def _quadrilateral_mask_iou(
+    contour: np.ndarray,
+    corners: np.ndarray,
+    image_shape: tuple[int, int],
+) -> float:
+    height, width = image_shape
+    contour_mask = np.zeros((height, width), dtype=np.uint8)
+    polygon_mask = np.zeros_like(contour_mask)
+    cv2.drawContours(contour_mask, [contour.astype(np.int32)], -1, 255, -1)
+    cv2.fillConvexPoly(
+        polygon_mask,
+        np.round(corners).astype(np.int32),
+        255,
+        cv2.LINE_AA,
+    )
+    intersection = int(np.count_nonzero((contour_mask > 0) & (polygon_mask > 0)))
+    union = int(np.count_nonzero((contour_mask > 0) | (polygon_mask > 0)))
+    return float(intersection / union) if union else 0.0
+
+
+def _projection_quadrilateral(
+    contour: np.ndarray,
+    yaw_deg: float,
+) -> Optional[np.ndarray]:
+    """Fit four support lines at the measured wafer edge orientation."""
+
+    points = contour.reshape(-1, 2).astype(np.float64)
+    if points.shape[0] < 4:
+        return None
+    radians = math.radians(float(yaw_deg))
+    first_axis = np.asarray([math.cos(radians), math.sin(radians)])
+    second_axis = np.asarray([-math.sin(radians), math.cos(radians)])
+    first_projection = points @ first_axis
+    second_projection = points @ second_axis
+    # Robust extrema prevent a few glare-connected pixels from rotating or
+    # enlarging the fitted wafer.  Dense contours use quantiles; small clean
+    # polygons retain their exact extrema.
+    quantile = 0.012 if points.shape[0] >= 40 else 0.0
+    first_min, first_max = np.quantile(
+        first_projection, [quantile, 1.0 - quantile]
+    )
+    second_min, second_max = np.quantile(
+        second_projection, [quantile, 1.0 - quantile]
+    )
+    projected = np.asarray(
+        [
+            first_min * first_axis + second_min * second_axis,
+            first_max * first_axis + second_min * second_axis,
+            first_max * first_axis + second_max * second_axis,
+            first_min * first_axis + second_max * second_axis,
+        ],
+        dtype=np.float64,
+    )
+    return _cyclic_quadrilateral(projected)
+
+
+def fit_wafer_quadrilateral(
+    contour: np.ndarray,
+    image_shape: tuple[int, int],
+) -> WaferQuadrilateralFit:
+    """Recover four physical edges without using ``minAreaRect``.
+
+    A convex four-corner approximation is preferred.  If glare leaves extra
+    vertices, dominant contour edges define two orthogonal support-line pairs.
+    The reported centre is always the intersection of the two diagonals.
+    """
+
+    if contour is None:
+        return WaferQuadrilateralFit.failed("missing_contour")
+    try:
+        points = np.asarray(contour).reshape(-1, 2)
+    except (TypeError, ValueError):
+        return WaferQuadrilateralFit.failed("invalid_contour")
+    if points.shape[0] < 4 or not np.all(np.isfinite(points)):
+        return WaferQuadrilateralFit.failed("insufficient_contour_points")
+    hull = cv2.convexHull(points.astype(np.float32))
+    perimeter = float(cv2.arcLength(hull, True))
+    if perimeter <= 1e-6:
+        return WaferQuadrilateralFit.failed("degenerate_contour")
+
+    candidates: list[tuple[float, str, np.ndarray]] = []
+    for epsilon_ratio in (0.004, 0.007, 0.010, 0.014, 0.020, 0.028, 0.040, 0.055):
+        approximation = cv2.approxPolyDP(
+            hull, max(1.0, epsilon_ratio * perimeter), True
+        ).reshape(-1, 2)
+        corners = _cyclic_quadrilateral(approximation)
+        if corners is None:
+            continue
+        iou = _quadrilateral_mask_iou(contour, corners, image_shape)
+        candidates.append((iou, "convex_hull_four_lines", corners))
+
+    edge_angle, edge_confidence = _edge_axis_angle(hull)
+    if edge_angle is not None and edge_confidence >= 0.20:
+        projected = _projection_quadrilateral(contour, edge_angle)
+        if projected is not None:
+            iou = _quadrilateral_mask_iou(contour, projected, image_shape)
+            candidates.append((iou, "robust_orthogonal_support_lines", projected))
+
+    if not candidates:
+        return WaferQuadrilateralFit.failed("quadrilateral_fit_failed")
+    mask_iou, method, corners = max(candidates, key=lambda item: item[0])
+    center = _quadrilateral_diagonal_center(corners)
+    if center is None:
+        return WaferQuadrilateralFit.failed("quadrilateral_diagonals_degenerate")
+    edge_vectors = np.roll(corners, -1, axis=0) - corners
+    side_lengths = np.linalg.norm(edge_vectors, axis=1)
+    if np.min(side_lengths) <= 1.0:
+        return WaferQuadrilateralFit.failed("quadrilateral_too_thin")
+    paired_lengths = np.asarray(
+        [
+            0.5 * (side_lengths[0] + side_lengths[2]),
+            0.5 * (side_lengths[1] + side_lengths[3]),
+        ],
+        dtype=np.float64,
+    )
+    long_edge_index = int(np.argmax(side_lengths))
+    long_edge = edge_vectors[long_edge_index]
+    yaw = normalize_square_angle_deg(
+        math.degrees(math.atan2(float(long_edge[1]), float(long_edge[0])))
+    )
+    return WaferQuadrilateralFit(
+        success=True,
+        reason="ok",
+        center_px=center,
+        corners_px=tuple(
+            tuple(float(value) for value in point) for point in corners
+        ),
+        short_side_px=float(np.min(paired_lengths)),
+        long_side_px=float(np.max(paired_lengths)),
+        area_px=abs(float(cv2.contourArea(corners.astype(np.float32)))),
+        mask_iou=float(mask_iou),
+        yaw_deg=float(yaw),
+        method=method,
+    )
 
 
 def _internal_line_evidence(
@@ -436,15 +723,19 @@ def analyze_wafer_patch(
             area_ratio=float(area_ratio),
         )
 
-    rect = cv2.minAreaRect(contour)
-    (cx, cy), (raw_width, raw_height), _rect_angle = rect
-    short_side = min(float(raw_width), float(raw_height))
-    long_side = max(float(raw_width), float(raw_height))
-    if short_side <= 1.0:
-        return WaferObservation.not_found("candidate_too_thin")
-    box = cv2.boxPoints(rect).astype(np.float64)
-    rect_area = max(short_side * long_side, 1.0)
-    rectangularity = area / rect_area
+    quadrilateral = fit_wafer_quadrilateral(contour, (height, width))
+    if (
+        not quadrilateral.success
+        or quadrilateral.center_px is None
+        or len(quadrilateral.corners_px) != 4
+    ):
+        return WaferObservation.not_found(quadrilateral.reason)
+    cx, cy = quadrilateral.center_px
+    short_side = float(quadrilateral.short_side_px)
+    long_side = float(quadrilateral.long_side_px)
+    box = np.asarray(quadrilateral.corners_px, dtype=np.float64)
+    quadrilateral_area = max(float(quadrilateral.area_px), 1.0)
+    rectangularity = min(1.0, area / quadrilateral_area)
     hull_area = max(abs(float(cv2.contourArea(cv2.convexHull(contour)))), 1.0)
     solidity = area / hull_area
     aspect_ratio = long_side / short_side
@@ -453,11 +744,7 @@ def analyze_wafer_patch(
     center_offset_ratio = float(np.linalg.norm(np.array([cx, cy]) - patch_center)) / max(min(height, width), 1.0)
     perimeter = float(cv2.arcLength(contour, True))
     polygon = cv2.approxPolyDP(contour, max(1.0, 0.010 * perimeter), True)
-    edge_angle, edge_confidence = _edge_axis_angle(contour)
-    if edge_angle is None or edge_confidence < 0.42:
-        edge = box[1] - box[0]
-        edge_angle = normalize_square_angle_deg(math.degrees(math.atan2(float(edge[1]), float(edge[0]))))
-    yaw = normalize_square_angle_deg(edge_angle)
+    yaw = float(quadrilateral.yaw_deg or 0.0)
 
     contour_mask = np.zeros((height, width), dtype=np.uint8)
     cv2.drawContours(contour_mask, [contour], -1, 255, -1)
@@ -466,25 +753,37 @@ def analyze_wafer_patch(
     if chromatic_fraction < config.minimum_chromatic_fraction:
         return WaferObservation.not_found("marker_artifact_rejected")
 
-    second_component_ratio = (
-        float(components[1][0] / max(components[0][0], 1.0)) if len(components) > 1 else 0.0
-    )
-    internal_count, internal_score, internal_lines = _internal_line_evidence(
-        bgr, contour_mask, (float(cx), float(cy)), max(short_side, long_side)
-    )
-    l_shaped_box = _l_shaped_overlap_box(
-        internal_lines,
-        contour_mask,
-        max(short_side, long_side),
-        config,
-    )
-    second_quadrilateral_box = _second_quadrilateral_box(
-        mask,
-        primary_mask,
-        area,
-        max(short_side, long_side),
-        config,
-    )
+    # TEMPORARILY DISABLED IN PRODUCTION: reflected highlights frequently look
+    # like a second wafer.  Keep all stacking helpers and thresholds intact so
+    # the detector can be restored by setting stacking_detection_enabled=true.
+    second_component_ratio = 0.0
+    internal_count = 0
+    internal_score = 0.0
+    internal_lines: tuple[Any, ...] = ()
+    l_shaped_box = None
+    second_quadrilateral_box = None
+    if config.stacking_detection_enabled:
+        second_component_ratio = (
+            float(components[1][0] / max(components[0][0], 1.0))
+            if len(components) > 1
+            else 0.0
+        )
+        internal_count, internal_score, internal_lines = _internal_line_evidence(
+            bgr, contour_mask, (float(cx), float(cy)), max(short_side, long_side)
+        )
+        l_shaped_box = _l_shaped_overlap_box(
+            internal_lines,
+            contour_mask,
+            max(short_side, long_side),
+            config,
+        )
+        second_quadrilateral_box = _second_quadrilateral_box(
+            mask,
+            primary_mask,
+            area,
+            max(short_side, long_side),
+            config,
+        )
     secondary_boxes: tuple[tuple[tuple[float, float], ...], ...] = ()
     if second_quadrilateral_box is not None:
         secondary_boxes = (second_quadrilateral_box,)
@@ -505,6 +804,9 @@ def analyze_wafer_patch(
     flags: list[str] = []
     severe = False
     warning = False
+    if quadrilateral.mask_iou < float(config.quadrilateral_min_mask_iou):
+        flags.append("quadrilateral_fit_unreliable")
+        severe = True
     if aspect_ratio > config.warning_max_aspect_ratio:
         flags.append("non_square_aspect")
         severe = True
@@ -538,19 +840,23 @@ def analyze_wafer_patch(
     if side_ratio > config.maximum_normal_side_ratio:
         flags.append("oversize_footprint")
         severe = True
-    if second_component_ratio >= config.stacked_second_component_ratio:
-        flags.append("multiple_components")
-        warning = True
-    if internal_count >= config.stacked_internal_line_count and internal_score >= config.stacked_internal_line_score:
-        flags.append("internal_overlap_edges")
-        warning = True
-    if l_shaped_box is not None:
-        flags.append("l_shaped_overlap_corner")
-    if second_quadrilateral_box is not None:
-        flags.append("second_quadrilateral")
-    if secondary_boxes:
-        flags.append("stacked_geometry_confirmed")
-        severe = True
+    if config.stacking_detection_enabled:
+        if second_component_ratio >= config.stacked_second_component_ratio:
+            flags.append("multiple_components")
+            warning = True
+        if (
+            internal_count >= config.stacked_internal_line_count
+            and internal_score >= config.stacked_internal_line_score
+        ):
+            flags.append("internal_overlap_edges")
+            warning = True
+        if l_shaped_box is not None:
+            flags.append("l_shaped_overlap_corner")
+        if second_quadrilateral_box is not None:
+            flags.append("second_quadrilateral")
+        if secondary_boxes:
+            flags.append("stacked_geometry_confirmed")
+            severe = True
     if (
         len(polygon) > config.irregular_outline_vertex_threshold
         and solidity < config.irregular_outline_max_solidity
@@ -587,6 +893,8 @@ def analyze_wafer_patch(
         flags=tuple(flags),
         outside_slot=outside_slot,
         secondary_boxes_patch_px=secondary_boxes,
+        quadrilateral_fit_method=quadrilateral.method,
+        quadrilateral_fit_iou=float(quadrilateral.mask_iou),
     )
 
 

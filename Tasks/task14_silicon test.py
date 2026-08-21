@@ -1,6 +1,7 @@
 """Task14: automatic-exposure silicon-wafer scan over all 36 tray slots.
 
-The operator-provided normal wafers are expected at eleven slots.  The action
+The operator-provided wafers are expected at sixteen slots: eight normal and
+eight outside-slot.  The action
 visits every P00-P55 location through Task12's already-audited adjacent-cell
 closed snake, captures five camera-1 frames per slot with automatic exposure,
 and returns to the exact taught ``P00 float`` pose.  Detection statistics use
@@ -33,15 +34,22 @@ J3_TOLERANCE_MM = 0.15
 EXPECTED_NORMAL_WAFER_SLOTS = (
     "P01",
     "P03",
-    "P14",
-    "P21",
-    "P30",
-    "P32",
+    "P04",
+    "P12",
+    "P15",
+    "P20",
+    "P22",
+    "P23",
+)
+EXPECTED_OUTSIDE_WAFER_SLOTS = (
+    "P31",
     "P33",
-    "P41",
+    "P35",
+    "P42",
     "P44",
+    "P50",
     "P52",
-    "P55",
+    "P54",
 )
 
 
@@ -134,7 +142,8 @@ def build_action() -> dict[str, Any]:
             "运动速度沿用主UI当前选定速度。"
             "报告对每个槽使用全部180张照片，并排除吸盘正对该槽的5张及其他无效观测。"
             "根目录1_XXX.jpg保存槽位/硅片标注图，原始图保留在raw_task14。"
-            "预期正常硅片槽为P01/P03/P14/P21/P30/P32/P33/P41/P44/P52/P55。"
+            "预期正常硅片槽为P01/P03/P04/P12/P15/P20/P22/P23；"
+            "预期槽外硅片槽为P31/P33/P35/P42/P44/P50/P52/P54。"
             "不下降Z、不触发DO/真空、不执行视觉修正。"
         ),
         "camera_model": {
@@ -164,6 +173,7 @@ def create_task_runtime(output_dir: Path, parent=None):
         frames_per_slot=FRAMES_PER_SLOT,
         exposure_mode=CAMERA_EXPOSURE_MODE,
         parent=parent,
+        expected_outside_wafer_slots=EXPECTED_OUTSIDE_WAFER_SLOTS,
     )
 
 
