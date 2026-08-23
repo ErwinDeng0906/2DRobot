@@ -176,7 +176,7 @@ r_{innovation}=\Delta e_{actual}-J\Delta q_{actual}.
 
 ## 6. 软件权限分层
 
-- `Preset Trajectories/task10.py`：只声明起点检查、等待、途径点记录、相机 1
+- `Tasks/task10.py`：只声明起点检查、等待、途径点记录、相机 1
   拍照和一个受监督运行时动作。
 - `scara.vision.xy_visual_servo`：纯计算；实现稳定窗口、控制方程、预测和响应
   验证，不导入 Qt、相机或控制器。

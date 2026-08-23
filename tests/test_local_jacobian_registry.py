@@ -26,7 +26,7 @@ from scara.vision.tray_pose_estimator import load_tray_board_geometry
 
 
 def _load_task9():
-    path = PROJECT_ROOT / "Preset Trajectories/task9_jacobiantest.py"
+    path = PROJECT_ROOT / "Tasks/task9_jacobiantest.py"
     spec = importlib.util.spec_from_file_location("_task9_selected_slot_test", path)
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load Task9")

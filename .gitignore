@@ -1,4 +1,5 @@
 .vscode/
+.DS_Store
 logs/
 __pycache__/
 *.pyc
@@ -9,3 +10,13 @@ scara_config.toml
 Trajectory Photos/
 scara_snap_*.jpg
 _smoke/*.png
+layered_tray_annotated.png
+layered_tray_result.json
+docs/images/wafer_review_gallery/
+validation/wafer_dataset/*
+!validation/wafer_dataset/ground_truth.json
+!validation/wafer_dataset/final_truth_comparison.json
+!validation/wafer_dataset/final_per_image_audit.csv
+tools/tray_marker_detector_v2/tray_marker_detector_v2 2.py
+tools/tray_marker_detector_v2/tray_marker_layout 2.json
+tools/tray_marker_detector_v2/tray_marker_ui_v2 2.py

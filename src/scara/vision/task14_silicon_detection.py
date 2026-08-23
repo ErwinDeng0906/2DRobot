@@ -14,7 +14,7 @@ import math
 import re
 import shutil
 import traceback
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -55,7 +55,13 @@ MINIMUM_VALID_OBSERVATIONS_PER_SLOT = 5
 _POINT_NAME_RE = re.compile(r"^TASK14\|(P[0-5][0-5])\|frame=(\d{2})/(\d{2})$")
 _PHOTO_NAME_RE = re.compile(r"^1_(\d+)\.jpg$", re.IGNORECASE)
 _NORMAL_STATES = {"occupied", "warning"}
+_OUTSIDE_STATES = {"outside_slot", "stacked_outside_slot"}
 _EMPTY_STATES = {"empty"}
+_EXPECTED_STATES = {
+    "normal_wafer": _NORMAL_STATES,
+    "outside_wafer": _OUTSIDE_STATES,
+    "empty": _EMPTY_STATES,
+}
 _EXCLUDED_OBSERVATION_STATES = {
     "out_of_view": "out_of_view",
     "occluded": "occluded",
@@ -110,6 +116,38 @@ def _numeric_summary(values: Sequence[object]) -> dict[str, Optional[float] | in
         "median": float(np.median(clean)),
         "mean": float(np.mean(clean)),
         "maximum": float(np.max(clean)),
+    }
+
+
+def _frame_registration_summary(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Count mutually exclusive analysis projection modes for the report."""
+
+    stage3_passed = 0
+    strict_pnp = 0
+    planar_fallback = 0
+    unavailable = 0
+    for record in records:
+        stage3 = record.get("stage3")
+        if isinstance(stage3, Mapping) and stage3.get("quality_passed") is True:
+            stage3_passed += 1
+        source = str(record.get("projection_source") or "unavailable")
+        analysis_passed = record.get("analysis_quality_passed") is True
+        if analysis_passed and source.startswith("strict_pnp"):
+            strict_pnp += 1
+        elif analysis_passed and source in {
+            "marker_grid_homography",
+            "two_outer_marker_homography",
+        }:
+            planar_fallback += 1
+        else:
+            unavailable += 1
+    return {
+        "stage3_quality_passed_frame_count": stage3_passed,
+        "strict_pnp_analysis_frame_count": strict_pnp,
+        "planar_fallback_analysis_frame_count": planar_fallback,
+        "unavailable_analysis_frame_count": unavailable,
     }
 
 
@@ -205,6 +243,70 @@ def _iter_slot_observations(
         yield record, slot_result, _slot_state(record, slot_result), exclusion_reason
 
 
+def _five_frame_group_consistency(
+    slot_name: str,
+    records: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Summarize each stationary capture burst without hiding frame evidence."""
+
+    grouped: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for record in sorted(records, key=lambda row: int(row.get("point_sequence") or 0)):
+        capture_target = str(record.get("target_name") or "unavailable")
+        slot_result = _slot_result_from_record(record, slot_name)
+        if _observation_exclusion_reason(record, slot_name, slot_result) is not None:
+            continue
+        state = _slot_state(record, slot_result)
+        evidence = "unobservable"
+        if isinstance(slot_result, Mapping):
+            wafer = slot_result.get("wafer")
+            if isinstance(wafer, Mapping):
+                evidence = str(wafer.get("boundary_evidence") or "unobservable")
+        if evidence == "unobservable":
+            if state in _OUTSIDE_STATES:
+                evidence = "strong_outside"
+            elif state == "occupied":
+                evidence = "inside"
+        grouped[capture_target].append((state, evidence))
+
+    rows: list[dict[str, Any]] = []
+    consensus_counts: Counter[str] = Counter()
+    for capture_target in sorted(grouped):
+        observations = grouped[capture_target]
+        state_counts = Counter(state for state, _evidence in observations)
+        evidence_counts = Counter(evidence for _state, evidence in observations)
+        strong_outside_count = int(evidence_counts.get("strong_outside", 0))
+        confident_inside_count = int(
+            sum(
+                state == "occupied" and evidence == "inside"
+                for state, evidence in observations
+            )
+        )
+        empty_count = int(
+            state_counts.get("empty", 0) + state_counts.get("empty_unread_marker", 0)
+        )
+        if strong_outside_count >= 2:
+            consensus = "outside_slot"
+        elif confident_inside_count >= 3 and strong_outside_count == 0:
+            consensus = "occupied"
+        elif empty_count >= 3 and strong_outside_count == 0:
+            consensus = "empty"
+        else:
+            consensus = "warning"
+        consensus_counts[consensus] += 1
+        rows.append(
+            {
+                "capture_target": capture_target,
+                "valid_frame_count": len(observations),
+                "state_counts": dict(sorted(state_counts.items())),
+                "boundary_evidence_counts": dict(sorted(evidence_counts.items())),
+                "strong_outside_frame_count": strong_outside_count,
+                "confident_inside_frame_count": confident_inside_count,
+                "consensus": consensus,
+            }
+        )
+    return rows, dict(sorted(consensus_counts.items()))
+
+
 def summarize_task14_slot(
     target_name: str,
     known_point_T_mm: Sequence[float],
@@ -212,6 +314,7 @@ def summarize_task14_slot(
     *,
     expected_occupied: bool,
     expected_frames: int,
+    expected_label: Optional[str] = None,
 ) -> dict[str, Any]:
     ordered = sorted(records, key=lambda row: int(row.get("point_sequence") or 0))
     observations = list(
@@ -230,7 +333,18 @@ def summarize_task14_slot(
         if counts
         else "unavailable"
     )
-    acceptable_states = _NORMAL_STATES if expected_occupied else _EMPTY_STATES
+    resolved_expected_label = str(
+        expected_label
+        or ("normal_wafer" if expected_occupied else "empty")
+    )
+    if resolved_expected_label not in _EXPECTED_STATES:
+        raise ValueError(
+            f"Task14未知预期槽位类别：{resolved_expected_label!r}"
+        )
+    resolved_expected_occupied = resolved_expected_label != "empty"
+    if bool(expected_occupied) is not resolved_expected_occupied:
+        raise ValueError("Task14 expected_occupied与expected_label不一致")
+    acceptable_states = _EXPECTED_STATES[resolved_expected_label]
     acceptable_count = sum(state in acceptable_states for state in states)
     acceptable_rate = acceptable_count / max(len(valid), 1)
     frame_set_complete = len(ordered) == int(expected_frames)
@@ -242,6 +356,9 @@ def summarize_task14_slot(
     )
     slots = [slot for _row, slot, _state, _reason in valid if isinstance(slot, Mapping)]
     wafers = [slot.get("wafer") for slot in slots if isinstance(slot.get("wafer"), Mapping)]
+    five_frame_groups, five_frame_consensus_counts = _five_frame_group_consistency(
+        target_name, ordered
+    )
     other_counts = {
         state: int(count)
         for state, count in sorted(counts.items())
@@ -250,8 +367,8 @@ def summarize_task14_slot(
     return {
         "target_name": str(target_name),
         "known_slot_center_T_mm": [float(value) for value in known_point_T_mm],
-        "expected_occupied": bool(expected_occupied),
-        "expected_label": "normal_wafer" if expected_occupied else "empty",
+        "expected_occupied": resolved_expected_occupied,
+        "expected_label": resolved_expected_label,
         "captured_frame_count": len(ordered),
         "expected_frame_count": int(expected_frames),
         "frame_set_complete": frame_set_complete,
@@ -264,6 +381,10 @@ def summarize_task14_slot(
         "state_counts": dict(sorted(counts.items())),
         "representative_state": representative_state,
         "normal_frame_count": int(counts.get("occupied", 0)),
+        "outside_frame_count": int(
+            counts.get("outside_slot", 0)
+            + counts.get("stacked_outside_slot", 0)
+        ),
         "empty_frame_count": int(counts.get("empty", 0)),
         "other_state_counts": other_counts,
         "acceptable_frame_count": int(acceptable_count),
@@ -272,6 +393,8 @@ def summarize_task14_slot(
             acceptable_count / max(int(expected_frames), 1)
         ),
         "baseline_passed": baseline_passed,
+        "five_frame_group_consistency": five_frame_groups,
+        "five_frame_group_consensus_counts": five_frame_consensus_counts,
         "wafer_center_T_mm_median": _vector_median(
             [slot.get("wafer_center_T_mm") for slot in slots], 3
         ),
@@ -302,6 +425,21 @@ def summarize_task14_slot(
             ),
             "contour_solidity_for_complexity_gate": _numeric_summary(
                 [wafer.get("solidity") for wafer in wafers]
+            ),
+            "base_projection_clearance_px": _numeric_summary(
+                [wafer.get("base_projection_clearance_px") for wafer in wafers]
+            ),
+            "refined_projection_clearance_px": _numeric_summary(
+                [wafer.get("refined_projection_clearance_px") for wafer in wafers]
+            ),
+            "contour_outside_depth_px": _numeric_summary(
+                [wafer.get("contour_outside_depth_px") for wafer in wafers]
+            ),
+            "contour_outside_support_px": _numeric_summary(
+                [wafer.get("contour_outside_support_px") for wafer in wafers]
+            ),
+            "projection_disagreement_px": _numeric_summary(
+                [wafer.get("projection_disagreement_px") for wafer in wafers]
             ),
         },
         "processing_errors": [
@@ -341,12 +479,27 @@ _STATE_LABELS = {
 }
 
 
+def _row_expected_label(row: Mapping[str, Any]) -> str:
+    label = row.get("expected_label")
+    if label in _EXPECTED_STATES:
+        return str(label)
+    return "normal_wafer" if row.get("expected_occupied") else "empty"
+
+
 def _group_slots_by_state(
-    summaries: Sequence[Mapping[str, Any]], *, expected_occupied: bool
+    summaries: Sequence[Mapping[str, Any]],
+    *,
+    expected_label: Optional[str] = None,
+    expected_occupied: Optional[bool] = None,
 ) -> dict[str, list[str]]:
+    if expected_label is None and expected_occupied is None:
+        raise ValueError("必须指定expected_label或expected_occupied")
     grouped: dict[str, list[str]] = {}
     for row in summaries:
-        if bool(row.get("expected_occupied")) is not expected_occupied:
+        if expected_label is not None:
+            if _row_expected_label(row) != expected_label:
+                continue
+        elif bool(row.get("expected_occupied")) is not bool(expected_occupied):
             continue
         state = str(row.get("representative_state") or "unavailable")
         grouped.setdefault(state, []).append(str(row["target_name"]))
@@ -438,8 +591,10 @@ def _recommended_config(
         )
         return finish()
 
-    expected_rows = [row for row in summaries if row.get("expected_occupied")]
-    empty_rows = [row for row in summaries if not row.get("expected_occupied")]
+    expected_rows = [
+        row for row in summaries if _row_expected_label(row) == "normal_wafer"
+    ]
+    empty_rows = [row for row in summaries if _row_expected_label(row) == "empty"]
     empty_occupancy_errors = [
         row
         for row in empty_rows
@@ -770,8 +925,13 @@ def _markdown_summary(
 ) -> str:
     summaries = report["slots"]
     total_frames = int(report["summary"]["processed_frame_count"])
-    wafer_rows = [row for row in summaries if row.get("expected_occupied")]
-    empty_rows = [row for row in summaries if not row.get("expected_occupied")]
+    normal_rows = [
+        row for row in summaries if _row_expected_label(row) == "normal_wafer"
+    ]
+    outside_rows = [
+        row for row in summaries if _row_expected_label(row) == "outside_wafer"
+    ]
+    empty_rows = [row for row in summaries if _row_expected_label(row) == "empty"]
     lines = [
         "# Task14 硅片检测全视角统计报告",
         "",
@@ -779,6 +939,14 @@ def _markdown_summary(
         "- 采集：自动曝光；36个机械臂观察点，"
         f"每点{report['scan_configuration']['frames_per_slot']}张，共{total_frames}张原图。",
         f"- 自动曝光验证：{'通过' if report['camera']['exposure']['verified_before_motion'] else '未通过'}。",
+        "- 帧定位：严格PnP分析"
+        f"{report['summary']['strict_pnp_analysis_frame_count']}张；"
+        "只读平面降级"
+        f"{report['summary']['planar_fallback_analysis_frame_count']}张；"
+        "真正不可用"
+        f"{report['summary']['unavailable_analysis_frame_count']}张。",
+        "- 安全隔离：只读平面降级帧的 `coordinate_mapping_allowed=false`、"
+        "`robot_correction_allowed=false`；不用于标定、运动、拾取锁定或世界坐标计算。",
         f"- 统计口径：每一个槽都使用全部{total_frames}张照片进行分析，而不是只使用机械臂停在该槽上方的5张。",
         "- 排除规则：机械臂正对该槽拍摄的帧按吸盘遮挡高风险排除；同时排除画面外、显式遮挡、"
         "证据不足、二维码未识别、位姿/跟踪不可用和处理异常帧。",
@@ -789,12 +957,12 @@ def _markdown_summary(
         "- 本次只生成报告和建议配置；不会自动修改正式配置，也不会根据视觉结果控制机械臂。",
         "- 槽尺寸、槽图定义和槽边界保持锁定。",
         "",
-        "## 预期有正常硅片的11槽",
+        f"## 预期有正常硅片的{len(normal_rows)}槽",
         "",
         "| 槽位 | 有效/总帧 | 正常 | 警告 | 叠片 | 槽外 | 叠片且槽外 | 被判空槽 | 排除明细 |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
-    for row in wafer_rows:
+    for row in normal_rows:
         empty_count = _state_count(row, "empty")
         lines.append(
             f"| {row['target_name']} | {row['valid_observation_count']}/{total_frames} | "
@@ -807,7 +975,26 @@ def _markdown_summary(
     lines.extend(
         [
             "",
-            "## 预期为空槽的25槽",
+            f"## 预期有槽外硅片的{len(outside_rows)}槽",
+            "",
+            "| 槽位 | 有效/总帧 | 槽外 | 叠片且槽外 | 正常 | 警告 | 叠片 | 被判空槽 | 排除明细 |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        ]
+    )
+    for row in outside_rows:
+        lines.append(
+            f"| {row['target_name']} | {row['valid_observation_count']}/{total_frames} | "
+            f"{_state_count(row, 'outside_slot')} | "
+            f"{_state_count(row, 'stacked_outside_slot')} | "
+            f"{_state_count(row, 'occupied')} | {_state_count(row, 'warning')} | "
+            f"{_state_count(row, 'stacked')} | {_state_count(row, 'empty')} | "
+            f"{_exclusion_text(row)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            f"## 预期为空槽的{len(empty_rows)}槽",
             "",
             "| 槽位 | 有效/总帧 | 空槽 | 其他合计 | 被判正常硅片 | 警告 | 叠片 | 槽外 | 叠片且槽外 | 排除明细 |",
             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
@@ -824,6 +1011,28 @@ def _markdown_summary(
             f"{_state_count(row, 'warning')} | {_state_count(row, 'stacked')} | "
             f"{_state_count(row, 'outside_slot')} | "
             f"{_state_count(row, 'stacked_outside_slot')} | {_exclusion_text(row)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 五帧停留组边界一致性",
+            "",
+            "- 槽外确认要求同一停留组至少2帧具有强槽外证据；槽内确认要求至少3帧确定槽内且没有强槽外帧。",
+            "- 下表只汇总预期有硅片的槽；每帧原始状态和证据仍完整保留在JSON中。",
+            "",
+            "| 槽位 | 组判槽外 | 组判槽内 | 组判警告 |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for row in normal_rows + outside_rows:
+        group_counts = row.get("five_frame_group_consensus_counts", {})
+        if not isinstance(group_counts, Mapping):
+            group_counts = {}
+        lines.append(
+            f"| {row['target_name']} | {int(group_counts.get('outside_slot', 0))} | "
+            f"{int(group_counts.get('occupied', 0))} | "
+            f"{int(group_counts.get('warning', 0))} |"
         )
 
     lines.extend(["", "## 建议参数变更", ""])
@@ -864,6 +1073,7 @@ class Task14SiliconDetectionRuntime(QObject):
         exposure_mode: str,
         parent: Optional[QWidget] = None,
         *,
+        expected_outside_wafer_slots: Sequence[str] = (),
         confirm_safety: bool = True,
     ) -> None:
         super().__init__(parent)
@@ -875,6 +1085,12 @@ class Task14SiliconDetectionRuntime(QObject):
             for name, point in slot_points_T_mm.items()
         }
         self.expected_normal_slots = frozenset(str(value) for value in expected_normal_wafer_slots)
+        self.expected_outside_slots = frozenset(
+            str(value) for value in expected_outside_wafer_slots
+        )
+        self.expected_wafer_slots = (
+            self.expected_normal_slots | self.expected_outside_slots
+        )
         self.frames_per_slot = int(frames_per_slot)
         self.exposure_mode = str(exposure_mode).strip().lower()
         all_slots = {f"P{row}{column}" for row in range(6) for column in range(6)}
@@ -884,6 +1100,10 @@ class Task14SiliconDetectionRuntime(QObject):
             raise ValueError("Task14 Tray几何必须恰好包含P00-P55全部36槽")
         if not self.expected_normal_slots or not self.expected_normal_slots <= all_slots:
             raise ValueError("Task14预期正常硅片槽集合无效")
+        if not self.expected_outside_slots <= all_slots:
+            raise ValueError("Task14预期槽外硅片槽集合无效")
+        if self.expected_normal_slots & self.expected_outside_slots:
+            raise ValueError("Task14正常槽与槽外槽不能重叠")
         if self.frames_per_slot < 1:
             raise ValueError("Task14 frames_per_slot必须是正整数")
         if self.exposure_mode != "auto":
@@ -915,20 +1135,35 @@ class Task14SiliconDetectionRuntime(QObject):
         self._last_live_sequence = 0
 
         if confirm_safety:
-            slots_text = " ".join(sorted(self.expected_normal_slots))
+            normal_slots_text = " ".join(sorted(self.expected_normal_slots))
+            outside_slots_text = (
+                " ".join(sorted(self.expected_outside_slots)) or "无"
+            )
+            empty_slot_count = len(
+                all_slots - self.expected_wafer_slots
+            )
             confirmed = ask_light_warning_confirmation(
                 parent,
                 "Task14 硅片检测扫描安全确认",
                 "开始前请确认：\n\n"
                 "1. 机械臂已到达P00 float固定观察高度，全盘上方路径无障碍；\n"
                 "2. 真空关闭、吸盘不携带硅片、急停可用；\n"
-                f"3. 正常硅片仅放在：{slots_text}；其余槽为空；\n"
-                "4. 相机1为1280×720，任务将在运动前开启自动曝光并验证模式。\n\n"
+                f"3. 正常槽内硅片位于：{normal_slots_text}；\n"
+                f"4. 槽外硅片位于：{outside_slots_text}；\n"
+                f"5. 其余{empty_slot_count}槽为空；\n"
+                "6. 相机1为1280×720，任务将在运动前开启自动曝光并验证模式。\n\n"
                 f"Task14将扫描36槽，每槽拍{self.frames_per_slot}张，结束返回P00。"
                 "不会下降Z、触发DO/真空或执行视觉修正。是否继续？",
             )
             if not confirmed:
                 raise RuntimeError("用户取消：Task14安全条件尚未确认")
+
+    def _expected_label(self, slot_name: str) -> str:
+        if slot_name in self.expected_normal_slots:
+            return "normal_wafer"
+        if slot_name in self.expected_outside_slots:
+            return "outside_wafer"
+        return "empty"
 
     @property
     def manifest_path(self) -> Path:
@@ -959,10 +1194,16 @@ class Task14SiliconDetectionRuntime(QObject):
             "point_sequence": int(point_sequence),
             "target_name": str(target_name),
             "frame_index": int(frame_index),
-            "expected_occupied": target_name in self.expected_normal_slots,
+            "expected_occupied": target_name in self.expected_wafer_slots,
+            "expected_label": self._expected_label(target_name),
             "known_slot_center_T_mm": list(self.slot_points[target_name]),
             "stage3": None,
             "temporal_quality": None,
+            "analysis_quality_passed": False,
+            "projection_source": "unavailable",
+            "planar_registration": None,
+            "coordinate_mapping_allowed": False,
+            "robot_correction_allowed": False,
             "tray_vision_summary": None,
             "slot_results": {},
             "target_slot": None,
@@ -990,7 +1231,36 @@ class Task14SiliconDetectionRuntime(QObject):
                 "rotation_jump_deg": tracked.rotation_jump_deg,
                 "lost_frame_count": tracked.lost_frame_count,
             }
+            strict_quality_passed = bool(
+                getattr(
+                    result,
+                    "quality_passed",
+                    record["stage3"].get("quality_passed")
+                    and tracked.accepted_by_tracker,
+                )
+            )
             record["tray_vision_summary"] = dict(result.summary)
+            record["analysis_quality_passed"] = bool(
+                getattr(result, "analysis_quality_passed", strict_quality_passed)
+            )
+            record["projection_source"] = str(
+                getattr(
+                    result,
+                    "projection_source",
+                    "strict_pnp" if strict_quality_passed else "unavailable",
+                )
+            )
+            record["planar_registration"] = (
+                None
+                if getattr(result, "planar_registration", None) is None
+                else result.planar_registration.to_json()
+            )
+            record["coordinate_mapping_allowed"] = bool(
+                getattr(result, "coordinate_mapping_allowed", strict_quality_passed)
+            )
+            record["robot_correction_allowed"] = bool(
+                getattr(result, "robot_correction_allowed", False)
+            )
             record["slot_results"] = {
                 slot.projection.slot_key: slot.to_json() for slot in result.slots
             }
@@ -1009,12 +1279,16 @@ class Task14SiliconDetectionRuntime(QObject):
                 record["observed_state"] = target_slot.decision.state.value
             annotated = result.annotated_image.copy()
             state = str(record["observed_state"])
-            color = (0, 170, 0) if state in (_NORMAL_STATES | _EMPTY_STATES) else (0, 0, 255)
+            expected_states = _EXPECTED_STATES[
+                self._expected_label(target_name)
+            ]
+            color = (0, 170, 0) if state in expected_states else (0, 0, 255)
             cv2.rectangle(annotated, (0, 0), (annotated.shape[1], 42), (255, 255, 255), -1)
             cv2.putText(
                 annotated,
                 f"TASK14 {target_name} frame {frame_index:02d}/{self.frames_per_slot:02d} "
-                f"state={state} exposure={self.exposure_mode}",
+                f"state={state} projection={record['projection_source']} "
+                f"exposure={self.exposure_mode}",
                 (12, 29),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.68,
@@ -1181,6 +1455,9 @@ class Task14SiliconDetectionRuntime(QObject):
             "all_expected_normal_wafers_acceptable": report["summary"][
                 "all_expected_normal_wafers_acceptable"
             ],
+            "all_expected_outside_wafers_acceptable": report["summary"][
+                "all_expected_outside_wafers_acceptable"
+            ],
         }
 
     @pyqtSlot(bool, str, str)
@@ -1201,46 +1478,67 @@ class Task14SiliconDetectionRuntime(QObject):
                     target,
                     self.slot_points[target],
                     records,
-                    expected_occupied=target in self.expected_normal_slots,
+                    expected_occupied=target in self.expected_wafer_slots,
                     expected_frames=expected_total_frames,
+                    expected_label=self._expected_label(target),
                 )
                 for target in sorted(self.slot_points)
             ]
             normal_pass = [
                 row["target_name"]
                 for row in summaries
-                if row["expected_occupied"] and row["baseline_passed"]
+                if _row_expected_label(row) == "normal_wafer"
+                and row["baseline_passed"]
             ]
             normal_fail = sorted(self.expected_normal_slots - set(normal_pass))
+            outside_pass = [
+                row["target_name"]
+                for row in summaries
+                if _row_expected_label(row) == "outside_wafer"
+                and row["baseline_passed"]
+            ]
+            outside_fail = sorted(
+                self.expected_outside_slots - set(outside_pass)
+            )
             empty_other_state = [
                 row["target_name"]
                 for row in summaries
-                if not row["expected_occupied"] and row.get("other_state_counts")
+                if _row_expected_label(row) == "empty"
+                and row.get("other_state_counts")
             ]
             empty_insufficient = [
                 row["target_name"]
                 for row in summaries
-                if not row["expected_occupied"]
+                if _row_expected_label(row) == "empty"
                 and int(row.get("valid_observation_count", 0))
                 < MINIMUM_VALID_OBSERVATIONS_PER_SLOT
             ]
+            expected_normal_by_state = _group_slots_by_state(
+                summaries, expected_label="normal_wafer"
+            )
+            expected_outside_by_state = _group_slots_by_state(
+                summaries, expected_label="outside_wafer"
+            )
+            expected_empty_by_state = _group_slots_by_state(
+                summaries, expected_label="empty"
+            )
             expected_wafer_by_state = _group_slots_by_state(
                 summaries, expected_occupied=True
             )
-            expected_empty_by_state = _group_slots_by_state(
-                summaries, expected_occupied=False
-            )
             exposure = self._exposure_evidence(manifest)
+            frame_registration = _frame_registration_summary(records)
             if not ok:
                 status = "acquisition_stopped"
             elif not exposure["verified_before_motion"]:
                 status = "invalid_exposure_evidence"
-            elif normal_fail:
+            elif normal_fail or outside_fail:
                 status = "tuning_required"
+            elif self.expected_outside_slots:
+                status = "expected_wafers_acceptable"
             else:
                 status = "normal_wafers_acceptable"
             report = {
-                "schema_version": 2,
+                "schema_version": 4,
                 "status": status,
                 "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "message": str(message),
@@ -1286,15 +1584,22 @@ class Task14SiliconDetectionRuntime(QObject):
                         "tool_occlusion_out_of_view_occluded_unknown_and_unread_marker"
                     ),
                     "expected_normal_wafer_slots": sorted(self.expected_normal_slots),
-                    "expected_empty_slots": sorted(set(self.slot_points) - self.expected_normal_slots),
+                    "expected_outside_wafer_slots": sorted(
+                        self.expected_outside_slots
+                    ),
+                    "expected_empty_slots": sorted(
+                        set(self.slot_points) - self.expected_wafer_slots
+                    ),
                     "minimum_acceptable_frame_rate": MINIMUM_ACCEPTABLE_FRAME_RATE,
                     "acceptable_normal_states": sorted(_NORMAL_STATES),
+                    "acceptable_outside_states": sorted(_OUTSIDE_STATES),
                 },
                 "tuning_scope": _tuning_scope(
                     self.silicon_detection_config.fusion_config.wafer_quality
                 ),
                 "summary": {
                     "processed_frame_count": len(records),
+                    **frame_registration,
                     "total_slot_observation_count": len(records) * len(self.slot_points),
                     "valid_slot_observation_count": sum(
                         int(row["valid_observation_count"]) for row in summaries
@@ -1308,6 +1613,13 @@ class Task14SiliconDetectionRuntime(QObject):
                     "acceptable_normal_wafer_slots": sorted(normal_pass),
                     "unacceptable_normal_wafer_slots": normal_fail,
                     "all_expected_normal_wafers_acceptable": not normal_fail,
+                    "expected_outside_wafer_count": len(
+                        self.expected_outside_slots
+                    ),
+                    "acceptable_outside_wafer_count": len(outside_pass),
+                    "acceptable_outside_wafer_slots": sorted(outside_pass),
+                    "unacceptable_outside_wafer_slots": outside_fail,
+                    "all_expected_outside_wafers_acceptable": not outside_fail,
                     "empty_slot_with_other_state_slots": sorted(empty_other_state),
                     "empty_slot_insufficient_valid_observation_slots": sorted(
                         empty_insufficient
@@ -1316,6 +1628,12 @@ class Task14SiliconDetectionRuntime(QObject):
                         set(empty_other_state) | set(empty_insufficient)
                     ),
                     "expected_wafer_slots_by_state": expected_wafer_by_state,
+                    "expected_normal_wafer_slots_by_state": (
+                        expected_normal_by_state
+                    ),
+                    "expected_outside_wafer_slots_by_state": (
+                        expected_outside_by_state
+                    ),
                     "expected_empty_slots_by_state": expected_empty_by_state,
                 },
                 "slots": summaries,
@@ -1385,6 +1703,8 @@ def create_task14_silicon_detection_runtime(
     frames_per_slot: int,
     exposure_mode: str,
     parent: Optional[QWidget] = None,
+    *,
+    expected_outside_wafer_slots: Sequence[str] = (),
 ) -> Task14SiliconDetectionRuntime:
     return Task14SiliconDetectionRuntime(
         output_dir,
@@ -1395,6 +1715,7 @@ def create_task14_silicon_detection_runtime(
         frames_per_slot,
         exposure_mode,
         parent,
+        expected_outside_wafer_slots=expected_outside_wafer_slots,
     )
 
 

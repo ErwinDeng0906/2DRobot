@@ -65,11 +65,16 @@ class SiliconDetectionConfigTests(unittest.TestCase):
             set(payload["wafer_quality"]),
         )
         loaded = load_silicon_detection_config(CONFIG_PATH)
-        self.assertEqual("silicon_detection_0818", loaded.profile_name)
+        self.assertEqual(
+            "silicon_detection_0820_geometry_robust", loaded.profile_name
+        )
         self.assertEqual(192, loaded.fusion_config.canonical_patch_size)
-        self.assertAlmostEqual(11.5, loaded.fusion_config.slot_half_extent_mm)
+        self.assertAlmostEqual(15.5, loaded.fusion_config.slot_half_extent_mm)
         self.assertAlmostEqual(
-            0.86, loaded.fusion_config.wafer_quality.maximum_normal_side_ratio
+            0.62, loaded.fusion_config.wafer_quality.maximum_normal_side_ratio
+        )
+        self.assertAlmostEqual(
+            1.2, loaded.fusion_config.wafer_quality.boundary_max_aspect_ratio
         )
         self.assertEqual(64, len(loaded.source_sha256))
 
@@ -99,7 +104,7 @@ class SiliconDetectionConfigTests(unittest.TestCase):
         fractional["wafer_quality"]["stacked_internal_line_count"] = 1.5
         variants.append(fractional)
         inverted = json.loads(json.dumps(original))
-        inverted["wafer_quality"]["normal_min_solidity"] = 0.7
+        inverted["wafer_quality"]["normal_min_solidity"] = 0.4
         variants.append(inverted)
         with tempfile.TemporaryDirectory() as temporary:
             for index, payload in enumerate(variants):

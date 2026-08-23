@@ -138,6 +138,7 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
     for name in (
         "normal_max_aspect_ratio",
         "warning_max_aspect_ratio",
+        "boundary_max_aspect_ratio",
         "normal_max_yaw_deg",
         "warning_max_yaw_deg",
         "stacked_quadrilateral_max_aspect_ratio",
@@ -151,6 +152,8 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         raise ValueError("minimum_area_ratio必须小于maximum_area_ratio")
     if values["normal_max_aspect_ratio"] > values["warning_max_aspect_ratio"]:
         raise ValueError("normal_max_aspect_ratio不能高于warning_max_aspect_ratio")
+    if values["boundary_max_aspect_ratio"] > values["normal_max_aspect_ratio"]:
+        raise ValueError("boundary_max_aspect_ratio不能高于normal_max_aspect_ratio")
     if values["normal_min_rectangularity"] < values["warning_min_rectangularity"]:
         raise ValueError("normal_min_rectangularity不能低于warning_min_rectangularity")
     if values["normal_min_solidity"] < values["warning_min_solidity"]:
@@ -245,7 +248,10 @@ def load_silicon_detection_config(path: Path) -> LoadedSiliconDetectionConfig:
 def silicon_detection_selection_path(project_root: Path) -> Path:
     """Return the ignored, machine-local pointer to the UI's preferred profile."""
 
-    return Path(project_root) / SILICON_DETECTION_SELECTION_FILENAME
+    return (
+        Path(project_root).expanduser().resolve()
+        / SILICON_DETECTION_SELECTION_FILENAME
+    )
 
 
 def preferred_silicon_detection_config_path(project_root: Path) -> Path:

@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TASK12_PATH = ROOT / "Preset Trajectories" / "task12_code visibility scan.py"
+TASK12_PATH = ROOT / "Tasks" / "task12_code visibility scan.py"
 
 
 def _load_task12():

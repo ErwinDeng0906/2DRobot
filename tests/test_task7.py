@@ -22,7 +22,7 @@ def _load(name: str, path: Path):
 def _modules():
     task7 = _load(
         "task7_under_test",
-        STAGE_ROOT / "Preset Trajectories" / "task7.py",
+        STAGE_ROOT / "Tasks" / "task7_C1 ARUCO calib.py",
     )
     action_worker = _load(
         "action_worker_under_test",

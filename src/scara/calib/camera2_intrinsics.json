@@ -1,0 +1,1661 @@
+{
+  "schema_version": 1,
+  "status": "success",
+  "calibration_date": "2026-08-23T23:24:29+08:00",
+  "software": {
+    "python": "3.10.20",
+    "opencv": "5.0.0",
+    "algorithm": "OpenCV calibrateCameraExtended global Levenberg-Marquardt minimization of squared ChArUco reprojection error"
+  },
+  "board": {
+    "type": "ChArUco",
+    "squares_x": 10,
+    "squares_y": 8,
+    "square_length_mm": 18.8,
+    "marker_length_mm": 9.87,
+    "dictionary": "DICT_4X4_50",
+    "legacy_pattern": true
+  },
+  "acquisition": {
+    "camera_source": 2,
+    "planned_images": null,
+    "images_per_pose": 9,
+    "captured_images": 63,
+    "recommended_images": 25,
+    "coverage_grid": {
+      "columns": 6,
+      "rows": 4
+    },
+    "covered_cells": 24,
+    "coverage_fraction": 1.0
+  },
+  "per_image": [
+    {
+      "capture_sequence": 1,
+      "filename": "2_001.jpg",
+      "point_sequence": 1,
+      "captured_at": "2026-08-23T22:41:20.859+08:00",
+      "collection_round": 1,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 12,
+      "charuco_corner_count": 13,
+      "board_area_ratio": 0.09956223101195924,
+      "border_margin_px": 87.91851806640625,
+      "sharpness": 120.80876424851758,
+      "sharpness_enough": true,
+      "tilt_deg": 3.1879320567208653,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.3754465075238008,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 2,
+      "filename": "2_002.jpg",
+      "point_sequence": 2,
+      "captured_at": "2026-08-23T22:41:32.026+08:00",
+      "collection_round": 1,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 19,
+      "charuco_corner_count": 26,
+      "board_area_ratio": 0.22761159204201248,
+      "border_margin_px": 65.9442138671875,
+      "sharpness": 170.70171198501865,
+      "sharpness_enough": true,
+      "tilt_deg": 2.1806676026093523,
+      "tilt_enough": false,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.4307146234839986,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 3,
+      "filename": "2_003.jpg",
+      "point_sequence": 3,
+      "captured_at": "2026-08-23T22:41:43.405+08:00",
+      "collection_round": 1,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 14,
+      "charuco_corner_count": 19,
+      "board_area_ratio": 0.15877039016550143,
+      "border_margin_px": 76.58349609375,
+      "sharpness": 161.03036834994734,
+      "sharpness_enough": true,
+      "tilt_deg": 2.8674344413886246,
+      "tilt_enough": false,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.3632475107875685,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 4,
+      "filename": "2_004.jpg",
+      "point_sequence": 4,
+      "captured_at": "2026-08-23T22:41:54.782+08:00",
+      "collection_round": 1,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 21,
+      "charuco_corner_count": 30,
+      "board_area_ratio": 0.28655550899225396,
+      "border_margin_px": 75.71282958984375,
+      "sharpness": 170.92405663728536,
+      "sharpness_enough": true,
+      "tilt_deg": 1.5760568448638246,
+      "tilt_enough": false,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.3721277215280543,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 5,
+      "filename": "2_005.jpg",
+      "point_sequence": 5,
+      "captured_at": "2026-08-23T22:42:05.950+08:00",
+      "collection_round": 1,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 23,
+      "charuco_corner_count": 31,
+      "board_area_ratio": 0.3655526990932132,
+      "border_margin_px": 71.18267822265625,
+      "sharpness": 128.921608349059,
+      "sharpness_enough": true,
+      "tilt_deg": 4.6464566489291075,
+      "tilt_enough": false,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.5786517491529909,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 6,
+      "filename": "2_006.jpg",
+      "point_sequence": 6,
+      "captured_at": "2026-08-23T22:42:17.119+08:00",
+      "collection_round": 1,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 13,
+      "charuco_corner_count": 13,
+      "board_area_ratio": 0.18055127398565332,
+      "border_margin_px": 115.09862518310547,
+      "sharpness": 128.56901838161176,
+      "sharpness_enough": true,
+      "tilt_deg": 3.5007667084801084,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": 0.9465909343493185,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 7,
+      "filename": "2_007.jpg",
+      "point_sequence": 7,
+      "captured_at": "2026-08-23T22:42:28.302+08:00",
+      "collection_round": 1,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 10,
+      "charuco_corner_count": 11,
+      "board_area_ratio": 0.0933591600811718,
+      "border_margin_px": 74.2887191772461,
+      "sharpness": 89.54620783524679,
+      "sharpness_enough": true,
+      "tilt_deg": 2.2564129429005906,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": 0.3393493735687277,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 8,
+      "filename": "2_008.jpg",
+      "point_sequence": 8,
+      "captured_at": "2026-08-23T22:42:39.469+08:00",
+      "collection_round": 1,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 14,
+      "charuco_corner_count": 17,
+      "board_area_ratio": 0.14636710067433012,
+      "border_margin_px": 86.06755065917969,
+      "sharpness": 146.25097805576155,
+      "sharpness_enough": true,
+      "tilt_deg": 0.2997199218555865,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": 0.42029011870850996,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 9,
+      "filename": "2_009.jpg",
+      "point_sequence": 9,
+      "captured_at": "2026-08-23T22:42:50.636+08:00",
+      "collection_round": 1,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 14,
+      "charuco_corner_count": 18,
+      "board_area_ratio": 0.15331038189578444,
+      "border_margin_px": 118.3573989868164,
+      "sharpness": 139.5823643918975,
+      "sharpness_enough": true,
+      "tilt_deg": 1.0099436222241256,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": 0.32987797167958915,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 10,
+      "filename": "2_010.jpg",
+      "point_sequence": 10,
+      "captured_at": "2026-08-23T22:44:34.796+08:00",
+      "collection_round": 2,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 9,
+      "charuco_corner_count": 8,
+      "board_area_ratio": 0.08096873044740277,
+      "border_margin_px": 117.882080078125,
+      "sharpness": 136.53296634144465,
+      "sharpness_enough": true,
+      "tilt_deg": 13.873735431435103,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.42514845394968775,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 11,
+      "filename": "2_011.jpg",
+      "point_sequence": 11,
+      "captured_at": "2026-08-23T22:44:45.966+08:00",
+      "collection_round": 2,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 13,
+      "charuco_corner_count": 17,
+      "board_area_ratio": 0.21407059289325794,
+      "border_margin_px": 117.4599609375,
+      "sharpness": 176.44153960614062,
+      "sharpness_enough": true,
+      "tilt_deg": 10.35967826868593,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.42052840053042756,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 12,
+      "filename": "2_012.jpg",
+      "point_sequence": 12,
+      "captured_at": "2026-08-23T22:44:57.744+08:00",
+      "collection_round": 2,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 8,
+      "charuco_corner_count": 10,
+      "board_area_ratio": 0.09551346097989456,
+      "border_margin_px": 124.01495361328125,
+      "sharpness": 140.93312117269383,
+      "sharpness_enough": true,
+      "tilt_deg": 16.216420627901407,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.41435041957788904,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 13,
+      "filename": "2_013.jpg",
+      "point_sequence": 13,
+      "captured_at": "2026-08-23T22:45:08.912+08:00",
+      "collection_round": 2,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 11,
+      "charuco_corner_count": 15,
+      "board_area_ratio": 0.17470379170456504,
+      "border_margin_px": 105.17559814453125,
+      "sharpness": 182.27296334899947,
+      "sharpness_enough": true,
+      "tilt_deg": 12.609681334548222,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.2453710148292562,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 14,
+      "filename": "2_014.jpg",
+      "point_sequence": 14,
+      "captured_at": "2026-08-23T22:45:20.096+08:00",
+      "collection_round": 2,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 17,
+      "charuco_corner_count": 24,
+      "board_area_ratio": 0.3844596618361344,
+      "border_margin_px": 100.7261962890625,
+      "sharpness": 174.9857213718543,
+      "sharpness_enough": true,
+      "tilt_deg": 12.129878254537166,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.3821087791908076,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 15,
+      "filename": "2_015.jpg",
+      "point_sequence": 15,
+      "captured_at": "2026-08-23T22:45:31.263+08:00",
+      "collection_round": 2,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 9,
+      "charuco_corner_count": 9,
+      "board_area_ratio": 0.09882821973235247,
+      "border_margin_px": 98.5858154296875,
+      "sharpness": 139.45153670771197,
+      "sharpness_enough": true,
+      "tilt_deg": 14.507944710401414,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.26580525204625405,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 16,
+      "filename": "2_016.jpg",
+      "point_sequence": 16,
+      "captured_at": "2026-08-23T22:45:42.448+08:00",
+      "collection_round": 2,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 6,
+      "charuco_corner_count": 6,
+      "board_area_ratio": 0.044086744889987005,
+      "border_margin_px": 100.58707427978516,
+      "sharpness": 92.58257697948525,
+      "sharpness_enough": true,
+      "tilt_deg": 15.4094496355626,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.298113885013776,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 17,
+      "filename": "2_017.jpg",
+      "point_sequence": 17,
+      "captured_at": "2026-08-23T22:45:53.613+08:00",
+      "collection_round": 2,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 11,
+      "charuco_corner_count": 12,
+      "board_area_ratio": 0.14778479817977516,
+      "border_margin_px": 153.6617431640625,
+      "sharpness": 128.08640732553226,
+      "sharpness_enough": true,
+      "tilt_deg": 12.318801820474055,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.48708511912395724,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 18,
+      "filename": "2_018.jpg",
+      "point_sequence": 18,
+      "captured_at": "2026-08-23T22:46:05.181+08:00",
+      "collection_round": 2,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 9,
+      "charuco_corner_count": 10,
+      "board_area_ratio": 0.08502020821992523,
+      "border_margin_px": 108.674072265625,
+      "sharpness": 157.4709593241579,
+      "sharpness_enough": true,
+      "tilt_deg": 13.016010319696244,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.2728383899565991,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 19,
+      "filename": "2_019.jpg",
+      "point_sequence": 19,
+      "captured_at": "2026-08-23T22:53:18.962+08:00",
+      "collection_round": 3,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 5,
+      "charuco_corner_count": 4,
+      "board_area_ratio": 0.019072832985680684,
+      "border_margin_px": 156.13525390625,
+      "sharpness": 152.45311098713626,
+      "sharpness_enough": true,
+      "tilt_deg": null,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "板在图像中的面积不合适",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": 258.2652465758773,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 20,
+      "filename": "2_020.jpg",
+      "point_sequence": 20,
+      "captured_at": "2026-08-23T22:53:30.146+08:00",
+      "collection_round": 3,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 11,
+      "charuco_corner_count": 12,
+      "board_area_ratio": 0.13401059613404287,
+      "border_margin_px": 159.367919921875,
+      "sharpness": 147.5612294826205,
+      "sharpness_enough": true,
+      "tilt_deg": 16.310072743622158,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.6063188724604843,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 21,
+      "filename": "2_021.jpg",
+      "point_sequence": 21,
+      "captured_at": "2026-08-23T22:53:41.714+08:00",
+      "collection_round": 3,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 6,
+      "charuco_corner_count": 6,
+      "board_area_ratio": 0.055988475079969555,
+      "border_margin_px": 166.5599365234375,
+      "sharpness": 233.64851709521673,
+      "sharpness_enough": true,
+      "tilt_deg": 17.585052719032014,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.270314395065041,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 22,
+      "filename": "2_022.jpg",
+      "point_sequence": 22,
+      "captured_at": "2026-08-23T22:53:53.090+08:00",
+      "collection_round": 3,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 12,
+      "charuco_corner_count": 16,
+      "board_area_ratio": 0.21934990988749734,
+      "border_margin_px": 66.634765625,
+      "sharpness": 199.25769540288573,
+      "sharpness_enough": true,
+      "tilt_deg": 16.998767850011326,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.32835262012846433,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 23,
+      "filename": "2_023.jpg",
+      "point_sequence": 23,
+      "captured_at": "2026-08-23T22:54:04.660+08:00",
+      "collection_round": 3,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 17,
+      "charuco_corner_count": 23,
+      "board_area_ratio": 0.3342797088487262,
+      "border_margin_px": 98.40602111816406,
+      "sharpness": 163.39417880246066,
+      "sharpness_enough": true,
+      "tilt_deg": 15.844714651736325,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.37968287212650936,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 24,
+      "filename": "2_024.jpg",
+      "point_sequence": 24,
+      "captured_at": "2026-08-23T22:54:15.828+08:00",
+      "collection_round": 3,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 10,
+      "charuco_corner_count": 12,
+      "board_area_ratio": 0.13433325248802033,
+      "border_margin_px": 134.12786865234375,
+      "sharpness": 124.8044523073198,
+      "sharpness_enough": true,
+      "tilt_deg": 10.019217474723128,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.35000982453584606,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 25,
+      "filename": "2_025.jpg",
+      "point_sequence": 25,
+      "captured_at": "2026-08-23T22:54:27.013+08:00",
+      "collection_round": 3,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 8,
+      "charuco_corner_count": 8,
+      "board_area_ratio": 0.07533260412862572,
+      "border_margin_px": 110.820068359375,
+      "sharpness": 112.60387951213588,
+      "sharpness_enough": true,
+      "tilt_deg": 12.505947214922012,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.2996848623925845,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 26,
+      "filename": "2_026.jpg",
+      "point_sequence": 26,
+      "captured_at": "2026-08-23T22:54:37.988+08:00",
+      "collection_round": 3,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 14,
+      "charuco_corner_count": 19,
+      "board_area_ratio": 0.2425210852216454,
+      "border_margin_px": 88.22415161132812,
+      "sharpness": 175.00083517293285,
+      "sharpness_enough": true,
+      "tilt_deg": 14.565804234541705,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.3099234720720583,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 27,
+      "filename": "2_027.jpg",
+      "point_sequence": 27,
+      "captured_at": "2026-08-23T22:54:49.157+08:00",
+      "collection_round": 3,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 14,
+      "charuco_corner_count": 18,
+      "board_area_ratio": 0.20726382063043325,
+      "border_margin_px": 64.3087158203125,
+      "sharpness": 196.03626193997204,
+      "sharpness_enough": true,
+      "tilt_deg": 16.852822235109155,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.37650388555957137,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 28,
+      "filename": "2_028.jpg",
+      "point_sequence": 28,
+      "captured_at": "2026-08-23T22:58:38.822+08:00",
+      "collection_round": 4,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 6,
+      "charuco_corner_count": 4,
+      "board_area_ratio": 0.02213449996021407,
+      "border_margin_px": 113.31475830078125,
+      "sharpness": 184.20585901293256,
+      "sharpness_enough": true,
+      "tilt_deg": null,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": 160.0477745136552,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 29,
+      "filename": "2_029.jpg",
+      "point_sequence": 29,
+      "captured_at": "2026-08-23T22:58:49.990+08:00",
+      "collection_round": 4,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 14,
+      "charuco_corner_count": 16,
+      "board_area_ratio": 0.2730925133246713,
+      "border_margin_px": 104.9596939086914,
+      "sharpness": 84.4744122433626,
+      "sharpness_enough": true,
+      "tilt_deg": 14.667358854516486,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.6604697880159591,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 30,
+      "filename": "2_030.jpg",
+      "point_sequence": 30,
+      "captured_at": "2026-08-23T22:59:01.766+08:00",
+      "collection_round": 4,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 11,
+      "charuco_corner_count": 13,
+      "board_area_ratio": 0.18517070627300047,
+      "border_margin_px": 70.82208251953125,
+      "sharpness": 173.4699299387637,
+      "sharpness_enough": true,
+      "tilt_deg": 17.22938576877494,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.2763595111122479,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 31,
+      "filename": "2_031.jpg",
+      "point_sequence": 31,
+      "captured_at": "2026-08-23T22:59:12.936+08:00",
+      "collection_round": 4,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 18,
+      "charuco_corner_count": 25,
+      "board_area_ratio": 0.3179006124300233,
+      "border_margin_px": 104.13275146484375,
+      "sharpness": 160.85608905934032,
+      "sharpness_enough": true,
+      "tilt_deg": 16.052546121266836,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.4004968229507058,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 32,
+      "filename": "2_032.jpg",
+      "point_sequence": 32,
+      "captured_at": "2026-08-23T22:59:24.311+08:00",
+      "collection_round": 4,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 15,
+      "charuco_corner_count": 18,
+      "board_area_ratio": 0.22787164582205807,
+      "border_margin_px": 96.69500732421875,
+      "sharpness": 87.7962590716926,
+      "sharpness_enough": true,
+      "tilt_deg": 15.924916665161655,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.40473924848366827,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 33,
+      "filename": "2_033.jpg",
+      "point_sequence": 33,
+      "captured_at": "2026-08-23T22:59:35.685+08:00",
+      "collection_round": 4,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 8,
+      "charuco_corner_count": 7,
+      "board_area_ratio": 0.08314545690169729,
+      "border_margin_px": 103.41169738769531,
+      "sharpness": 116.07979689124295,
+      "sharpness_enough": true,
+      "tilt_deg": 17.39105763274532,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.20153414290494653,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 34,
+      "filename": "2_034.jpg",
+      "point_sequence": 34,
+      "captured_at": "2026-08-23T22:59:46.852+08:00",
+      "collection_round": 4,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 4,
+      "charuco_corner_count": 3,
+      "board_area_ratio": 0.007609681713843454,
+      "border_margin_px": 155.53875732421875,
+      "sharpness": 216.83297243673877,
+      "sharpness_enough": true,
+      "tilt_deg": null,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "板在图像中的面积不合适",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": null,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 35,
+      "filename": "2_035.jpg",
+      "point_sequence": 35,
+      "captured_at": "2026-08-23T22:59:58.037+08:00",
+      "collection_round": 4,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 11,
+      "charuco_corner_count": 13,
+      "board_area_ratio": 0.11255065970715318,
+      "border_margin_px": 107.68888092041016,
+      "sharpness": 113.87288756183851,
+      "sharpness_enough": true,
+      "tilt_deg": 15.191230197337195,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.5269191314050453,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 36,
+      "filename": "2_036.jpg",
+      "point_sequence": 36,
+      "captured_at": "2026-08-23T23:00:09.205+08:00",
+      "collection_round": 4,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 12,
+      "charuco_corner_count": 15,
+      "board_area_ratio": 0.13362319791110874,
+      "border_margin_px": 100.34100341796875,
+      "sharpness": 135.04282241010134,
+      "sharpness_enough": true,
+      "tilt_deg": 15.65881137544484,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.31952126852898166,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 37,
+      "filename": "2_037.jpg",
+      "point_sequence": 37,
+      "captured_at": "2026-08-23T23:02:50.026+08:00",
+      "collection_round": 5,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 6,
+      "charuco_corner_count": 5,
+      "board_area_ratio": 0.023125452659097996,
+      "border_margin_px": 108.57000732421875,
+      "sharpness": 284.16878177295797,
+      "sharpness_enough": true,
+      "tilt_deg": null,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": 93526223.85576598,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 38,
+      "filename": "2_038.jpg",
+      "point_sequence": 38,
+      "captured_at": "2026-08-23T23:03:01.402+08:00",
+      "collection_round": 5,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 10,
+      "charuco_corner_count": 11,
+      "board_area_ratio": 0.0854925968554542,
+      "border_margin_px": 132.28448486328125,
+      "sharpness": 252.0438472441784,
+      "sharpness_enough": true,
+      "tilt_deg": 14.714002999024988,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.45217303846354745,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 39,
+      "filename": "2_039.jpg",
+      "point_sequence": 39,
+      "captured_at": "2026-08-23T23:03:12.776+08:00",
+      "collection_round": 5,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 7,
+      "charuco_corner_count": 7,
+      "board_area_ratio": 0.053208686751545935,
+      "border_margin_px": 137.5963134765625,
+      "sharpness": 90.92436788985638,
+      "sharpness_enough": true,
+      "tilt_deg": 18.82037663518914,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.22441448469879946,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 40,
+      "filename": "2_040.jpg",
+      "point_sequence": 40,
+      "captured_at": "2026-08-23T23:03:24.553+08:00",
+      "collection_round": 5,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 14,
+      "charuco_corner_count": 18,
+      "board_area_ratio": 0.22202388199427053,
+      "border_margin_px": 100.41876220703125,
+      "sharpness": 171.25012269130872,
+      "sharpness_enough": true,
+      "tilt_deg": 19.657166848300893,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.41315612434368476,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 41,
+      "filename": "2_041.jpg",
+      "point_sequence": 41,
+      "captured_at": "2026-08-23T23:03:35.720+08:00",
+      "collection_round": 5,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 19,
+      "charuco_corner_count": 27,
+      "board_area_ratio": 0.35350941966483457,
+      "border_margin_px": 68.56836700439453,
+      "sharpness": 140.7086380040121,
+      "sharpness_enough": true,
+      "tilt_deg": 17.467752292441755,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.5041117607254763,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 42,
+      "filename": "2_042.jpg",
+      "point_sequence": 42,
+      "captured_at": "2026-08-23T23:03:47.292+08:00",
+      "collection_round": 5,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 9,
+      "charuco_corner_count": 8,
+      "board_area_ratio": 0.13621307836636384,
+      "border_margin_px": 126.2840576171875,
+      "sharpness": 63.30532069484348,
+      "sharpness_enough": false,
+      "tilt_deg": 14.82023889349289,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "图像模糊"
+      ],
+      "reprojection_error_px": 0.31795399817273157,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 43,
+      "filename": "2_043.jpg",
+      "point_sequence": 43,
+      "captured_at": "2026-08-23T23:03:58.668+08:00",
+      "collection_round": 5,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 7,
+      "charuco_corner_count": 8,
+      "board_area_ratio": 0.07348847035605723,
+      "border_margin_px": 74.11991882324219,
+      "sharpness": 80.43754040078527,
+      "sharpness_enough": true,
+      "tilt_deg": 18.268896247134396,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.7339647594323739,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 44,
+      "filename": "2_044.jpg",
+      "point_sequence": 44,
+      "captured_at": "2026-08-23T23:04:10.043+08:00",
+      "collection_round": 5,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 14,
+      "charuco_corner_count": 18,
+      "board_area_ratio": 0.3007858575525054,
+      "border_margin_px": 122.08330535888672,
+      "sharpness": 135.7141948068639,
+      "sharpness_enough": true,
+      "tilt_deg": 17.447025097647582,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.3931231388875011,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 45,
+      "filename": "2_045.jpg",
+      "point_sequence": 45,
+      "captured_at": "2026-08-23T23:04:21.213+08:00",
+      "collection_round": 5,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 12,
+      "charuco_corner_count": 15,
+      "board_area_ratio": 0.22317602400301287,
+      "border_margin_px": 108.61500549316406,
+      "sharpness": 80.06538692037122,
+      "sharpness_enough": true,
+      "tilt_deg": 19.772448722047553,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.4947417604210947,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 46,
+      "filename": "2_046.jpg",
+      "point_sequence": 46,
+      "captured_at": "2026-08-23T23:07:15.801+08:00",
+      "collection_round": 6,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 4,
+      "charuco_corner_count": 3,
+      "board_area_ratio": 0.009951053962814614,
+      "border_margin_px": 130.42352294921875,
+      "sharpness": 132.936091138028,
+      "sharpness_enough": true,
+      "tilt_deg": null,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "板在图像中的面积不合适",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": null,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 47,
+      "filename": "2_047.jpg",
+      "point_sequence": 47,
+      "captured_at": "2026-08-23T23:07:27.176+08:00",
+      "collection_round": 6,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 11,
+      "charuco_corner_count": 12,
+      "board_area_ratio": 0.1584677245243496,
+      "border_margin_px": 139.68853759765625,
+      "sharpness": 118.32348448194713,
+      "sharpness_enough": true,
+      "tilt_deg": 13.224786636962065,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.5556148213122312,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 48,
+      "filename": "2_048.jpg",
+      "point_sequence": 48,
+      "captured_at": "2026-08-23T23:07:38.953+08:00",
+      "collection_round": 6,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 10,
+      "charuco_corner_count": 12,
+      "board_area_ratio": 0.15218961100184514,
+      "border_margin_px": 82.1234130859375,
+      "sharpness": 206.1211220207606,
+      "sharpness_enough": true,
+      "tilt_deg": 15.326634265588801,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.4358580609402099,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 49,
+      "filename": "2_049.jpg",
+      "point_sequence": 49,
+      "captured_at": "2026-08-23T23:07:50.121+08:00",
+      "collection_round": 6,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 16,
+      "charuco_corner_count": 22,
+      "board_area_ratio": 0.34938775299956837,
+      "border_margin_px": 84.1309814453125,
+      "sharpness": 123.97862534912639,
+      "sharpness_enough": true,
+      "tilt_deg": 13.203851003576954,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.4288997605997055,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 50,
+      "filename": "2_050.jpg",
+      "point_sequence": 50,
+      "captured_at": "2026-08-23T23:08:01.097+08:00",
+      "collection_round": 6,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 15,
+      "charuco_corner_count": 19,
+      "board_area_ratio": 0.3360620155514431,
+      "border_margin_px": 86.45428466796875,
+      "sharpness": 98.15217194314657,
+      "sharpness_enough": true,
+      "tilt_deg": 10.119652479626911,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.4387072882419548,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 51,
+      "filename": "2_051.jpg",
+      "point_sequence": 51,
+      "captured_at": "2026-08-23T23:08:12.265+08:00",
+      "collection_round": 6,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 7,
+      "charuco_corner_count": 7,
+      "board_area_ratio": 0.06719971380045814,
+      "border_margin_px": 105.43011474609375,
+      "sharpness": 99.4842744371642,
+      "sharpness_enough": true,
+      "tilt_deg": 10.31325522397872,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.31228698011683215,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 52,
+      "filename": "2_052.jpg",
+      "point_sequence": 52,
+      "captured_at": "2026-08-23T23:08:23.450+08:00",
+      "collection_round": 6,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 3,
+      "charuco_corner_count": 1,
+      "board_area_ratio": 0.0,
+      "border_margin_px": null,
+      "sharpness": 49.31289397707222,
+      "sharpness_enough": false,
+      "tilt_deg": null,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "板在图像中的面积不合适",
+        "图像模糊",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": null,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 53,
+      "filename": "2_053.jpg",
+      "point_sequence": 53,
+      "captured_at": "2026-08-23T23:08:34.620+08:00",
+      "collection_round": 6,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 10,
+      "charuco_corner_count": 11,
+      "board_area_ratio": 0.0976311936362361,
+      "border_margin_px": 120.2140121459961,
+      "sharpness": 119.28607114871812,
+      "sharpness_enough": true,
+      "tilt_deg": 7.774488674170687,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": 0.32959146759326763,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 54,
+      "filename": "2_054.jpg",
+      "point_sequence": 54,
+      "captured_at": "2026-08-23T23:08:45.594+08:00",
+      "collection_round": 6,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 14,
+      "charuco_corner_count": 18,
+      "board_area_ratio": 0.21098564828112254,
+      "border_margin_px": 106.04545593261719,
+      "sharpness": 155.81254284274078,
+      "sharpness_enough": true,
+      "tilt_deg": 13.529474252192381,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.3895888786627269,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 55,
+      "filename": "2_055.jpg",
+      "point_sequence": 55,
+      "captured_at": "2026-08-23T23:11:45.164+08:00",
+      "collection_round": 7,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 6,
+      "charuco_corner_count": 6,
+      "board_area_ratio": 0.03583569641928534,
+      "border_margin_px": 93.52032470703125,
+      "sharpness": 171.90244088003863,
+      "sharpness_enough": true,
+      "tilt_deg": 16.886865715475047,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.39322142476287997,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 56,
+      "filename": "2_056.jpg",
+      "point_sequence": 56,
+      "captured_at": "2026-08-23T23:11:56.349+08:00",
+      "collection_round": 7,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 11,
+      "charuco_corner_count": 12,
+      "board_area_ratio": 0.13170618168220496,
+      "border_margin_px": 105.10186767578125,
+      "sharpness": 192.08916634582803,
+      "sharpness_enough": true,
+      "tilt_deg": 13.851908911999212,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.4270729184455724,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 57,
+      "filename": "2_057.jpg",
+      "point_sequence": 57,
+      "captured_at": "2026-08-23T23:12:07.726+08:00",
+      "collection_round": 7,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 9,
+      "charuco_corner_count": 11,
+      "board_area_ratio": 0.10376225072728833,
+      "border_margin_px": 105.54290771484375,
+      "sharpness": 199.4562505477516,
+      "sharpness_enough": true,
+      "tilt_deg": 14.777691649090457,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.3520856165963654,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 58,
+      "filename": "2_058.jpg",
+      "point_sequence": 58,
+      "captured_at": "2026-08-23T23:12:18.893+08:00",
+      "collection_round": 7,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 13,
+      "charuco_corner_count": 17,
+      "board_area_ratio": 0.24542091762690157,
+      "border_margin_px": 112.0831298828125,
+      "sharpness": 93.43196992007536,
+      "sharpness_enough": true,
+      "tilt_deg": 14.641276577532743,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.3712081562546236,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 59,
+      "filename": "2_059.jpg",
+      "point_sequence": 59,
+      "captured_at": "2026-08-23T23:12:30.270+08:00",
+      "collection_round": 7,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 17,
+      "charuco_corner_count": 23,
+      "board_area_ratio": 0.3455698679767343,
+      "border_margin_px": 127.63623046875,
+      "sharpness": 164.82660940781835,
+      "sharpness_enough": true,
+      "tilt_deg": 13.463379752145785,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.468455899578622,
+      "used_for_final_calibration": true
+    },
+    {
+      "capture_sequence": 60,
+      "filename": "2_060.jpg",
+      "point_sequence": 60,
+      "captured_at": "2026-08-23T23:12:41.437+08:00",
+      "collection_round": 7,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 10,
+      "charuco_corner_count": 11,
+      "board_area_ratio": 0.14347064828111766,
+      "border_margin_px": 91.60436248779297,
+      "sharpness": 102.36049112693847,
+      "sharpness_enough": true,
+      "tilt_deg": 8.0394385019711,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": 0.337014512976089,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 61,
+      "filename": "2_061.jpg",
+      "point_sequence": 61,
+      "captured_at": "2026-08-23T23:12:52.811+08:00",
+      "collection_round": 7,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 5,
+      "charuco_corner_count": 3,
+      "board_area_ratio": 0.009979872985289578,
+      "border_margin_px": 119.72545623779297,
+      "sharpness": 90.11894513562271,
+      "sharpness_enough": true,
+      "tilt_deg": null,
+      "tilt_enough": false,
+      "recommended": false,
+      "reasons": [
+        "角点少于15",
+        "板在图像中的面积不合适",
+        "倾斜变化不足"
+      ],
+      "reprojection_error_px": null,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 62,
+      "filename": "2_062.jpg",
+      "point_sequence": 62,
+      "captured_at": "2026-08-23T23:13:04.189+08:00",
+      "collection_round": 7,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 11,
+      "charuco_corner_count": 12,
+      "board_area_ratio": 0.19947826486895134,
+      "border_margin_px": 97.85926055908203,
+      "sharpness": 99.46433093511972,
+      "sharpness_enough": true,
+      "tilt_deg": 13.283114362953476,
+      "tilt_enough": true,
+      "recommended": false,
+      "reasons": [
+        "角点少于15"
+      ],
+      "reprojection_error_px": 0.2251519204602341,
+      "used_for_final_calibration": false
+    },
+    {
+      "capture_sequence": 63,
+      "filename": "2_063.jpg",
+      "point_sequence": 63,
+      "captured_at": "2026-08-23T23:13:15.356+08:00",
+      "collection_round": 7,
+      "resolution": {
+        "width": 1280,
+        "height": 720
+      },
+      "marker_count": 13,
+      "charuco_corner_count": 16,
+      "board_area_ratio": 0.21680463821556437,
+      "border_margin_px": 96.08740234375,
+      "sharpness": 103.42993128054921,
+      "sharpness_enough": true,
+      "tilt_deg": 14.501920817225464,
+      "tilt_enough": true,
+      "recommended": true,
+      "reasons": [],
+      "reprojection_error_px": 0.3868096183078587,
+      "used_for_final_calibration": true
+    }
+  ],
+  "camera": {
+    "logical_name": "camera2_j4_rotating_close_range",
+    "source_index": 2,
+    "capture_backend": "OpenCV DirectShow",
+    "mount": "fixed near the SCARA J4/suction assembly; follows J1/J2/J3 and rotates with J4/Rz",
+    "resolution": {
+      "width": 1280,
+      "height": 720
+    },
+    "identity_note": "OpenCV/DirectShow index does not expose a stable USB serial number. Keep this logical mapping unchanged or add the physical serial manually."
+  },
+  "image_resolution": {
+    "width": 1280,
+    "height": 720
+  },
+  "K": [
+    [
+      936.2721092935667,
+      0.0,
+      603.8970717867094
+    ],
+    [
+      0.0,
+      939.3040410800788,
+      365.3282244735052
+    ],
+    [
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "distCoeffs": [
+    -0.13608845941696462,
+    0.40957204450893936,
+    0.0003905256830518326,
+    0.0014870886691044055,
+    -0.4611702889674701
+  ],
+  "distortion_model": "OpenCV pinhole k1,k2,p1,p2,k3",
+  "global_rms_px": 0.4239658587175419,
+  "intrinsic_standard_deviations": [
+    2.961720444465819,
+    2.984764792695535,
+    1.1468869329770703,
+    0.9253517845694728,
+    0.004760839308204039,
+    0.024480869731931514,
+    0.00022069257161262858,
+    0.00034504829407608405,
+    0.036543565855595546,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "used_image_count": 25,
+  "outlier_rejection": {
+    "method": "iterative per-view RMS > max(0.75px, median + 3.0*1.4826*MAD)",
+    "history": [
+      {
+        "iteration": 1,
+        "views": 25,
+        "rms_px": 0.4239658587175419,
+        "median_view_error_px": 0.39312727451126195,
+        "mad_px": 0.02987466155862245,
+        "threshold_px": 0.75,
+        "rejected_filenames": []
+      }
+    ]
+  },
+  "pose_diversity": {
+    "tilt_min_deg": 0.8644816390919965,
+    "tilt_max_deg": 16.943125256761938,
+    "tilt_range_deg": 16.078643617669943,
+    "maximum_board_normal_separation_deg": 33.12670010342401,
+    "sufficient": true
+  },
+  "source_run_folder": "C:\\Users\\Admin\\Desktop\\2D robot\\Robot Control Tray Marker Vision\\Trajectory Photos\\260823224103"
+}

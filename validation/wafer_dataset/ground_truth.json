@@ -1,0 +1,181 @@
+{
+  "schema_version": 1,
+  "purpose": "Human-reviewed truth for evaluation only; never consumed by runtime detection or robot motion.",
+  "review_scope": {
+    "dataset_roots": [
+      "/Users/chenge/Desktop/二维机器人/images",
+      "/Users/chenge/Desktop/二维机器人/images 0805"
+    ],
+    "raw_image_count": 363,
+    "static_arrangement_count": 20,
+    "review_contact_sheet_index": "validation/wafer_dataset/contact_sheets_before_tuning/index.json",
+    "final_review_contact_sheet_index": "validation/wafer_dataset/contact_sheets_final_annotated/index.json",
+    "final_review_date": "2026-08-21",
+    "final_reviewed_image_count": 363,
+    "unlabelled_policy": "A missing slot label means the available photographs did not prove the state; it must not be treated as normal or abnormal."
+  },
+  "sequences": [
+    {
+      "dataset": "images",
+      "sequence": "1-0 flake",
+      "expected_wafer_count": 0,
+      "confirmed_placement": {
+        "empty": ["P00", "P01", "P02", "P03", "P04", "P05", "P10", "P11", "P12", "P13", "P14", "P15", "P20", "P21", "P22", "P23", "P24", "P25", "P30", "P31", "P32", "P33", "P34", "P35", "P40", "P41", "P42", "P43", "P44", "P45", "P50", "P51", "P52", "P53", "P54", "P55"]
+      },
+      "provenance": "folder count and all reviewed frames"
+    },
+    {
+      "dataset": "images",
+      "sequence": "2-1 flake normal",
+      "expected_wafer_count": 1,
+      "confirmed_placement": {"inside": ["P23"]},
+      "provenance": "manual review of both overview and close views"
+    },
+    {
+      "dataset": "images",
+      "sequence": "3-2 flake normal",
+      "expected_wafer_count": 2,
+      "confirmed_placement": {"inside": ["P23", "P32"]},
+      "provenance": "manual review"
+    },
+    {
+      "dataset": "images",
+      "sequence": "4-2 flake tilted",
+      "expected_wafer_count": 2,
+      "confirmed_occupancy": ["P23", "P32"],
+      "provenance": "manual review; exact boundary crossing is not asserted"
+    },
+    {
+      "dataset": "images",
+      "sequence": "5-3 flake normal",
+      "expected_wafer_count": 3,
+      "confirmed_placement": {"inside": ["P23", "P32", "P34"]},
+      "provenance": "manual review"
+    },
+    {
+      "dataset": "images",
+      "sequence": "6-3 flake tilted",
+      "expected_wafer_count": 3,
+      "confirmed_occupancy": ["P23", "P32", "P34"],
+      "confirmed_placement": {"inside": ["P23"], "outside": ["P32", "P34"]},
+      "provenance": "manual review of normalized slot patches"
+    },
+    {
+      "dataset": "images",
+      "sequence": "7-4 flake tilted",
+      "expected_wafer_count": 4,
+      "confirmed_occupancy": ["P23", "P24", "P32", "P34"],
+      "confirmed_placement": {"inside": ["P23", "P34"], "outside": ["P24"]},
+      "provenance": "manual review; P32 boundary state remains unlabelled"
+    },
+    {
+      "dataset": "images",
+      "sequence": "8-4 flake stacked",
+      "expected_wafer_count": 4,
+      "confirmed_occupancy": ["P23", "P32", "P34"],
+      "expected_stacked_extra_count": 1,
+      "provenance": "manual occupancy review; coincident stack slot is not visually provable"
+    },
+    {
+      "dataset": "images",
+      "sequence": "9-5 flake normal",
+      "expected_wafer_count": 5,
+      "confirmed_placement": {"inside": ["P11", "P14", "P23", "P32", "P34"]},
+      "provenance": "manual review"
+    },
+    {
+      "dataset": "images",
+      "sequence": "10-5 flake tilted",
+      "expected_wafer_count": 5,
+      "confirmed_occupancy": ["P11", "P14", "P23", "P32", "P34"],
+      "confirmed_placement": {"inside": ["P11", "P14", "P23", "P32"], "outside": ["P34"]},
+      "provenance": "manual review"
+    },
+    {
+      "dataset": "images 0805",
+      "sequence": "1-5 flake stacked",
+      "expected_wafer_count": 5,
+      "confirmed_occupancy": ["P11", "P14", "P23", "P32"],
+      "expected_stacked_extra_count": 1,
+      "provenance": "manual review"
+    },
+    {
+      "dataset": "images 0805",
+      "sequence": "2-5 flake stacked 2",
+      "expected_wafer_count": 5,
+      "confirmed_occupancy": ["P11", "P23", "P32"],
+      "expected_stacked_extra_count": 2,
+      "provenance": "manual review"
+    },
+    {
+      "dataset": "images 0805",
+      "sequence": "3-6 flake stacked 2",
+      "expected_wafer_count": 6,
+      "confirmed_occupancy": ["P11", "P23", "P32", "P43"],
+      "expected_stacked_extra_count": 2,
+      "provenance": "manual review"
+    },
+    {
+      "dataset": "images 0805",
+      "sequence": "4-10 flake stacked 3",
+      "expected_wafer_count": 10,
+      "confirmed_occupancy": ["P11", "P23", "P30", "P32", "P35", "P41", "P43"],
+      "expected_stacked_extra_count": 3,
+      "confirmed_stacking": {"confirmed": ["P11"], "single": ["P32"]},
+      "provenance": "manual review plus operator statement that old R2C5 is stacked and old R3C3 is only partially imaged"
+    },
+    {
+      "dataset": "images 0805",
+      "sequence": "5-36 flake normal",
+      "expected_wafer_count": 36,
+      "confirmed_placement": {
+        "inside": ["P00", "P01", "P02", "P03", "P04", "P05", "P10", "P11", "P12", "P13", "P14", "P15", "P20", "P21", "P22", "P23", "P24", "P25", "P30", "P31", "P32", "P33", "P34", "P35", "P40", "P41", "P42", "P43", "P44", "P45", "P50", "P51", "P52", "P53", "P54", "P55"]
+      },
+      "confirmed_stacking": {"single": ["P00", "P01", "P02", "P03", "P04", "P05", "P10", "P11", "P12", "P13", "P14", "P15", "P20", "P21", "P22", "P23", "P24", "P25", "P30", "P31", "P32", "P33", "P34", "P35", "P40", "P41", "P42", "P43", "P44", "P45", "P50", "P51", "P52", "P53", "P54", "P55"]},
+      "provenance": "folder label and manual review of all views"
+    },
+    {
+      "dataset": "images 0805",
+      "sequence": "6-36 flake 2-stacked 1-crooked",
+      "expected_wafer_count": 36,
+      "expected_stacked_extra_count": 2,
+      "expected_crooked_count": 1,
+      "provenance": "folder experiment label; exact slots remain unlabelled"
+    },
+    {
+      "dataset": "images 0805",
+      "sequence": "7-36 flake 2-stacked 4-crooked",
+      "expected_wafer_count": 36,
+      "expected_stacked_extra_count": 2,
+      "expected_crooked_count": 4,
+      "provenance": "folder experiment label; exact slots remain unlabelled"
+    },
+    {
+      "dataset": "images 0805",
+      "sequence": "8-36 flake 2-stacked 6-crooked",
+      "expected_wafer_count": 36,
+      "expected_stacked_extra_count": 2,
+      "expected_crooked_count": 6,
+      "confirmed_placement": {"inside": ["P25"], "outside": ["P35"]},
+      "provenance": "operator-explicit old R6C4 normal and old R6C3 crooked, mapped to current P25/P35"
+    },
+    {
+      "dataset": "images 0805",
+      "sequence": "9-36 flake 6-stacked",
+      "expected_wafer_count": 36,
+      "expected_stacked_extra_count": 6,
+      "confirmed_stacking": {"confirmed": ["P43", "P44", "P53"]},
+      "provenance": "operator-explicit old R4C2, R5C2 and R4C1 stacks, mapped to current P43/P44/P53"
+    },
+    {
+      "dataset": "images 0805",
+      "sequence": "10-36 flake 6-crooked",
+      "expected_wafer_count": 36,
+      "expected_crooked_count": 6,
+      "confirmed_stacking": {
+        "single": ["P00", "P01", "P02", "P03", "P04", "P05", "P10", "P11", "P12", "P13", "P14", "P15", "P20", "P21", "P22", "P23", "P24", "P25", "P30", "P31", "P32", "P33", "P34", "P35", "P40", "P41", "P42", "P43", "P44", "P45", "P50", "P51", "P52", "P53", "P54", "P55"]
+      },
+      "provenance": "folder experiment label; exact six slots remain unlabelled"
+    }
+  ]
+}

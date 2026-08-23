@@ -8,7 +8,7 @@ Task12回答一个独立于Jacobian的问题：当相机1和吸盘位于P00-P55�
 
 ## 运动与采集
 
-- UI导入文件：`Preset Trajectories/task12_code visibility scan.py`
+- UI导入文件：`Tasks/task12_code visibility scan.py`
 - 起点：已示教的 `P00 float`
 - 路线：P00-P55全部36槽的相邻槽回环蛇形路线
 - 每槽：稳定等待0.8秒，采集相机1图像20帧

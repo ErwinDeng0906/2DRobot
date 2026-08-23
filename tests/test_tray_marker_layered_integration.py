@@ -48,6 +48,7 @@ from scara.vision.wafer_shape_quality import (
     DEFAULT_WAFER_QUALITY,
     WaferObservation,
     analyze_wafer_patch,
+    reconcile_projection_boundary_evidence,
 )
 
 
@@ -202,31 +203,59 @@ class WaferQualityTests(unittest.TestCase):
         self.assertEqual(result.quality, "normal", result.flags)
         self.assertAlmostEqual(result.yaw_relative_to_tray_deg, 6.0, delta=1.5)
 
-    def test_overlapping_squares_are_abnormal(self) -> None:
+    def test_unconfirmed_overlapping_squares_remain_warning_only(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
         _draw_square(patch, (75.0, 96.0), 82.0, 0.0, _purple(140, 100))
         _draw_square(patch, (119.0, 96.0), 82.0, 0.0, _purple(150, 135))
         result = analyze_wafer_patch(patch)
         self.assertTrue(result.found)
-        self.assertEqual(result.quality, "abnormal")
+        self.assertEqual(result.quality, "warning")
         self.assertTrue(
-            {"non_square_aspect", "irregular_outline", "internal_overlap_edges"}
+            {
+                "non_square_aspect",
+                "aspect_borderline",
+                "irregular_outline",
+                "internal_overlap_edges",
+            }
             & set(result.flags),
             result.flags,
         )
         self.assertNotIn("stacked_geometry_confirmed", result.flags)
         self.assertEqual(result.secondary_boxes_patch_px, ())
 
-    def test_reflection_edges_are_warning_not_confirmed_stacking(self) -> None:
+    def test_reflection_edges_do_not_downgrade_a_valid_square(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
         _draw_square(patch, (96.0, 96.0), 92.0, 0.0, _purple(140, 100))
         cv2.rectangle(patch, (91, 50), (101, 142), _purple(140, 220), -1)
         result = analyze_wafer_patch(patch)
         self.assertTrue(result.found)
-        self.assertEqual(result.quality, "warning", result.flags)
+        self.assertEqual(result.quality, "normal", result.flags)
         self.assertIn("internal_overlap_edges", result.flags)
         self.assertNotIn("stacked_geometry_confirmed", result.flags)
         self.assertEqual(result.secondary_boxes_patch_px, ())
+
+    def test_thin_bridge_to_neighbour_colour_does_not_enlarge_normal_wafer(
+        self,
+    ) -> None:
+        patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        cv2.rectangle(patch, (48, 45), (140, 137), _purple(), -1)
+        cv2.rectangle(patch, (40, 162), (142, 191), _purple(), -1)
+        cv2.line(patch, (50, 137), (50, 162), _purple(), 5)
+        result = analyze_wafer_patch(patch)
+        self.assertTrue(result.found)
+        self.assertEqual("normal", result.quality, result.flags)
+        self.assertFalse(result.outside_slot)
+        self.assertIn("thin_bridge_removed", result.flags)
+
+    def test_non_square_partial_colour_crossing_is_not_confidently_outside(
+        self,
+    ) -> None:
+        patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        cv2.rectangle(patch, (24, 52), (94, 142), _purple(), -1)
+        result = analyze_wafer_patch(patch)
+        self.assertTrue(result.found)
+        self.assertFalse(result.outside_slot)
+        self.assertIn("boundary_crossing_unconfirmed", result.flags)
 
     def test_l_corner_confirms_stacking_and_produces_second_outline(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
@@ -253,12 +282,52 @@ class WaferQualityTests(unittest.TestCase):
 
     def test_boundary_crossing_wafer_records_outside_slot_evidence(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
-        _draw_square(patch, (170.0, 96.0), 72.0, 0.0, _purple())
+        # Cross the inner slot boundary while keeping all four wafer corners
+        # inside the wider canonical context.
+        _draw_square(patch, (150.0, 96.0), 72.0, 0.0, _purple())
         result = analyze_wafer_patch(patch)
         self.assertTrue(result.found)
         self.assertTrue(result.outside_slot)
         self.assertIn("outside_slot", result.flags)
         self.assertTrue(result.to_json()["outside_slot"])
+
+    def test_subpixel_boundary_crossing_is_uncertain_not_outside(self) -> None:
+        patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(patch, (129.0, 96.0), 66.0, 0.0, _purple())
+        result = analyze_wafer_patch(patch)
+        self.assertTrue(result.found)
+        self.assertFalse(result.outside_slot)
+        self.assertEqual("uncertain", result.boundary_evidence)
+        self.assertIn("boundary_uncertain", result.flags)
+        self.assertEqual("warning", result.quality)
+        self.assertGreater(result.minimum_slot_clearance_px or 0.0, -3.0)
+
+    def test_dual_projection_uses_strong_outside_evidence_from_either_path(self) -> None:
+        refined_patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        base_patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(refined_patch, (122.0, 96.0), 60.0, 6.0, _purple())
+        _draw_square(base_patch, (135.0, 96.0), 60.0, 6.0, _purple())
+        refined = analyze_wafer_patch(refined_patch)
+        base = analyze_wafer_patch(base_patch)
+        self.assertEqual("inside", refined.boundary_evidence)
+        self.assertEqual("strong_outside", base.boundary_evidence)
+        result = reconcile_projection_boundary_evidence(
+            refined,
+            base=base,
+            primary_is_refined=True,
+            projection_disagreement_px=5.0,
+        )
+        self.assertTrue(result.outside_slot)
+        self.assertEqual("strong_outside", result.boundary_evidence)
+        self.assertIn("projection_boundary_disagreement", result.flags)
+        self.assertAlmostEqual(
+            base.minimum_slot_clearance_px,
+            result.base_projection_clearance_px,
+        )
+        self.assertAlmostEqual(
+            refined.minimum_slot_clearance_px,
+            result.refined_projection_clearance_px,
+        )
 
     def test_black_white_marker_is_not_a_wafer(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
@@ -297,8 +366,8 @@ class WaferMetricCentreTests(unittest.TestCase):
         )
         expected = np.array(
             [
-                11.5 * (1.0 - 2.0 * 80.0 / 191.0),
-                11.5 * (1.0 - 2.0 * 120.0 / 191.0),
+                15.5 * (1.0 - 2.0 * 80.0 / 191.0),
+                15.5 * (1.0 - 2.0 * 120.0 / 191.0),
             ]
         )
         np.testing.assert_allclose(offset_T, expected, atol=1e-12)
@@ -419,7 +488,7 @@ class OccupancyDecisionTests(unittest.TestCase):
         )
 
         outside_patch = np.full((192, 192, 3), 185, dtype=np.uint8)
-        _draw_square(outside_patch, (170.0, 96.0), 72.0, 0.0, _purple())
+        _draw_square(outside_patch, (150.0, 96.0), 72.0, 0.0, _purple())
         outside = analyze_wafer_patch(outside_patch)
         self.assertEqual(
             decide_slot_state(self._projection(), self._marker(), outside).state,
@@ -453,7 +522,7 @@ class OccupancyDecisionTests(unittest.TestCase):
         self.assertIn("internal_overlap_edges", reflection.flags)
         self.assertEqual(
             decide_slot_state(self._projection(), self._marker(), reflection).state,
-            SlotState.WARNING,
+            SlotState.OCCUPIED,
         )
 
     def test_no_evidence_is_unknown(self) -> None:
@@ -557,7 +626,9 @@ class FusionFailClosedTests(unittest.TestCase):
         result = analyzer.analyze_tracked(image, tracked)
         self.assertFalse(result.quality_passed)
         self.assertEqual(result.failure_reason, "synthetic temporal jump")
-        self.assertEqual(result.slots, ())
+        self.assertTrue(result.analysis_quality_passed)
+        self.assertEqual(len(result.slots), 36)
+        self.assertEqual(result.projection_source, "strict_pnp_untracked_read_only")
         self.assertFalse(result.coordinate_mapping_allowed)
 
 

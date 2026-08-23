@@ -1,7 +1,10 @@
 # Tray Marker 分层合并记录
 
-日期：2026-08-18
+更新日期：2026-08-20
 开发分支：`agent/integrate-tray-marker-vision`
+
+基于本层实现的实时目标锁定、`W←T` 登记和转移状态机见
+`docs/wafer_transfer_runtime_integration.md`。
 
 ## 1. 合并范围
 
@@ -19,7 +22,8 @@
 
 2. `wafer_shape_quality.py`
    - 在透视校正后的单槽小图中检测紫色/深色高饱和度硅片。
-   - 使用面积、边长、长宽比、矩形度、实心度、中心偏移、相对角度、轮廓顶点、连通块和内部边线判断正常、警告或异常。
+   - 使用面积、边长、长宽比、矩形度、实心度、中心偏移、相对角度、轮廓顶点、连通块和内部边线判断正常、警告或已确认异常。
+   - 使用颜色支持点的稳健旋转矩形确定四角；只在正方形度改善时分离细桥，防止相邻紫色区域扩大边界。
    - 单独的内部直线和第二颜色连通块只作为警告证据；只有内部边形成有效L角，或检测到第二个方形轮廓，才确认叠片。
    - 要求候选区域具有足够的紫色色彩比例，避免把黑白 ArUco marker 当成硅片。
 
@@ -94,18 +98,19 @@ SHA256。
 python3 -m unittest tests.test_tray_marker_layered_integration -v
 ```
 
-共 22 项，覆盖固定 ID 映射、36 槽投影、像素到 Tray 坐标往返、多尺度 marker、正常硅片角度、反光内部边负样本、L角叠片、第二四边形叠片、双轮廓相机叠加、槽边界越界、叠片/槽外组合状态、二维码误识别、画面外状态、空槽/占用状态、硅片中心毫米偏差、滤波位姿复用和 tracker fail-closed，全部通过。
+当前该测试文件共 25 项，在原覆盖项上增加了细桥误连接、非正方形局部色块越界 fail-closed，以及槽外完整正方形的回归测试，全部通过。
 
 真实图片结果：
 
 | 图片 | 位姿结果 | 槽位结果 |
 |---|---|---|
 | `1_001.jpg` | 拒绝 | Marker 5 RMS `3.082 px > 3.000 px`，不分析槽位 |
-| `1_012.jpg` | 通过，RMS `1.770 px` | 1 empty，1 abnormal，29 out_of_view，5 unknown |
+| `1_012.jpg` | 通过，RMS `1.770 px` | 0818 历史运行记录：1 empty，1 abnormal，29 out_of_view，5 unknown |
 | `1_023.jpg` | 通过，RMS `1.662 px` | 19 empty，14 out_of_view，3 unknown |
 | `1_034.jpg` | 拒绝 | 只识别到 2 个外围 marker，不分析槽位 |
 
-全仓库测试在当前系统 Python 下有 16 个导入错误，原因均为未安装 `PyQt6`；本次新增测试和不依赖 Qt 的原有视觉/数值测试通过。
+标注图、旧图回归和任意分辨率复核工具见
+`docs/wafer_recognition_0820_validation.md`。
 
 ## 6. 架构图
 
@@ -118,7 +123,7 @@ python3 -m unittest tests.test_tray_marker_layered_integration -v
 - 本次只合并相机 1 的托盘总览逻辑。
 - 相机 2 的吸盘和被提起硅片必须作为独立观测源，不能进入托盘占用判断。
 - `robot_correction_allowed` 当前固定为 `false`。只有将点击点/目标槽的 Tray 坐标交给现有手眼标定和吸盘目标模块，并再次通过质量门后，才可计算机械臂修正量。
-- `1_012.jpg` 中的大面积深色遮挡被标为 abnormal。后续应使用新相机的无遮挡数据重新标定硅片色彩范围，并为临时遮挡接入显式 mask 或独立遮挡分类器。
+- 新相机位置不使用 fixed robot arm mask。工具或吸盘临时遮挡但没有足够硅片/marker 证据时保持 `unknown`，不猜测为空槽或槽外。
 
 ## 8. 相机1手眼交互 UI 集成
 

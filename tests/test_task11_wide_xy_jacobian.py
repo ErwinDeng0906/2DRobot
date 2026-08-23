@@ -29,7 +29,7 @@ from scara.vision.wide_xy_jacobian import REQUIRED_WIDE_XY_JACOBIAN_QUALITY_GATE
 
 
 def load_task11():
-    path = ROOT / "Preset Trajectories" / "task11.py"
+    path = ROOT / "Tasks" / "task11.py"
     spec = importlib.util.spec_from_file_location("task11_contract", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

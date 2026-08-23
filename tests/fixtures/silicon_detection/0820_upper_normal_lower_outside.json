@@ -1,0 +1,6 @@
+{
+  "source": "operator-labelled 2026-08-20 photograph",
+  "normal_slots": ["P01", "P03", "P04", "P12", "P15", "P20", "P22", "P23"],
+  "outside_slots": ["P31", "P33", "P35", "P42", "P44", "P50", "P52", "P54"],
+  "notes": "The upper physical half contains normal wafers. The lower physical half contains wafers placed outside their recesses. P02 is visibly obstructed and is not labelled empty."
+}

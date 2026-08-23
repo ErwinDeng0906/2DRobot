@@ -24,7 +24,7 @@ from .tray_pose_estimator import TrayBoardPoseEstimator, TrayPoseEstimate
 
 
 LEGACY_SLOT_DICTIONARY = "DICT_4X4_50"
-DEFAULT_SLOT_HALF_EXTENT_MM = 11.5
+DEFAULT_SLOT_HALF_EXTENT_MM = 15.5
 DEFAULT_CANONICAL_PATCH_SIZE = 192
 
 
@@ -57,6 +57,9 @@ class ArucoObservation:
     perimeter_px: float
     area_px: float
     square_quality: float
+    detection_scale: float = 1.0
+    preprocessing: str = "native"
+    complete_decoded: bool = True
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -67,6 +70,9 @@ class ArucoObservation:
             "perimeter_px": self.perimeter_px,
             "area_px": self.area_px,
             "square_quality": self.square_quality,
+            "detection_scale": self.detection_scale,
+            "preprocessing": self.preprocessing,
+            "complete_decoded": self.complete_decoded,
         }
 
 
@@ -203,47 +209,76 @@ def detect_aruco_observations(
     dictionary_name: str,
     *,
     scales: Sequence[float] = (1.0, 1.5, 2.0),
+    include_clahe: bool = False,
+    prefer_native: bool = True,
 ) -> dict[int, ArucoObservation]:
-    """Detect IDs at several scales and retain the largest valid duplicate.
+    """Detect complete IDs with native-first multi-scale supplementation.
 
-    The multi-scale policy and duplicate selection are retained from the old
-    tray marker detector because they are useful when the overview camera is
-    zoomed out.  Marker corner orientation is recorded but is not used to set
-    the Tray Frame angle.
+    A marker decoded in the original image is authoritative. Enlarged and
+    CLAHE images only add IDs that are still missing, so a fallback candidate
+    can never replace reliable native-scale corners. Marker corner orientation
+    is recorded but is not used to set the Tray Frame angle.
     """
     if image is None or image.ndim not in (2, 3):
         raise ValueError("image must be a valid grayscale or BGR array")
     detector = _make_aruco_detector(dictionary_name)
-    observations: dict[int, ArucoObservation] = {}
+    normalized_scales: list[float] = []
     for raw_scale in scales:
         scale = float(raw_scale)
         if scale <= 0.0:
             raise ValueError("marker detection scales must be positive")
-        scaled = image if abs(scale - 1.0) < 1e-9 else cv2.resize(
-            image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
-        )
-        corners, ids, _rejected = detector.detectMarkers(scaled)
-        if ids is None:
-            continue
-        for raw_id, raw_corners in zip(ids.reshape(-1), corners):
-            marker_id = int(raw_id)
-            points = np.asarray(raw_corners, dtype=np.float64).reshape(4, 2) / scale
-            perimeter, area, edge_ratio, diagonal_ratio = _marker_metrics(points)
-            top_edge = points[1] - points[0]
-            angle = math.degrees(math.atan2(float(top_edge[1]), float(top_edge[0])))
-            quality = max(0.0, min(1.0, edge_ratio * diagonal_ratio))
-            candidate = ArucoObservation(
-                marker_id=marker_id,
-                center_px=tuple(float(x) for x in np.mean(points, axis=0)),
-                corners_px=tuple(tuple(float(x) for x in point) for point in points),
-                angle_deg=float(angle),
-                perimeter_px=perimeter,
-                area_px=area,
-                square_quality=quality,
+        if not any(abs(scale - previous) < 1e-9 for previous in normalized_scales):
+            normalized_scales.append(scale)
+    # The original scale is always tried first, even when callers provided a
+    # different ordering.
+    normalized_scales.sort(key=lambda value: (abs(value - 1.0) >= 1e-9, value))
+
+    preprocessing_inputs: list[tuple[str, np.ndarray]] = [("native", image)]
+    if include_clahe:
+        gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        preprocessing_inputs.append(("clahe", clahe))
+
+    observations: dict[int, ArucoObservation] = {}
+    for preprocessing, detector_input in preprocessing_inputs:
+        for scale in normalized_scales:
+            scaled = detector_input if abs(scale - 1.0) < 1e-9 else cv2.resize(
+                detector_input,
+                None,
+                fx=scale,
+                fy=scale,
+                interpolation=cv2.INTER_CUBIC,
             )
-            previous = observations.get(marker_id)
-            if previous is None or candidate.perimeter_px > previous.perimeter_px:
-                observations[marker_id] = candidate
+            corners, ids, _rejected = detector.detectMarkers(scaled)
+            if ids is None:
+                continue
+            for raw_id, raw_corners in zip(ids.reshape(-1), corners):
+                marker_id = int(raw_id)
+                if prefer_native and marker_id in observations:
+                    continue
+                points = np.asarray(raw_corners, dtype=np.float64).reshape(4, 2) / scale
+                perimeter, area, edge_ratio, diagonal_ratio = _marker_metrics(points)
+                top_edge = points[1] - points[0]
+                angle = math.degrees(math.atan2(float(top_edge[1]), float(top_edge[0])))
+                quality = max(0.0, min(1.0, edge_ratio * diagonal_ratio))
+                candidate = ArucoObservation(
+                    marker_id=marker_id,
+                    center_px=tuple(float(x) for x in np.mean(points, axis=0)),
+                    corners_px=tuple(tuple(float(x) for x in point) for point in points),
+                    angle_deg=float(angle),
+                    perimeter_px=perimeter,
+                    area_px=area,
+                    square_quality=quality,
+                    detection_scale=scale,
+                    preprocessing=preprocessing,
+                    complete_decoded=True,
+                )
+                previous = observations.get(marker_id)
+                if (
+                    previous is None
+                    or (not prefer_native and candidate.perimeter_px > previous.perimeter_px)
+                ):
+                    observations[marker_id] = candidate
     return observations
 
 
@@ -311,6 +346,144 @@ def build_slot_projections(
             center_px=tuple(float(value) for value in center_px),
             polygon_T_mm=tuple(tuple(float(value) for value in point) for point in polygon_T),
             polygon_px=tuple(tuple(float(value) for value in point) for point in polygon_px),
+            image_coverage_ratio=_polygon_coverage_ratio(polygon_px, image_shape),
+            projected_area_px=area,
+        )
+    return result
+
+
+def estimate_slot_marker_registration(
+    projections: Mapping[str, SlotProjection],
+    layout: SlotMarkerLayout,
+    observations: Mapping[int, ArucoObservation],
+) -> tuple[Optional[np.ndarray], dict[str, Any]]:
+    """Fit a guarded read-only image correction from decoded slot centres.
+
+    The calibrated Tray pose and all metric coordinates remain untouched.  The
+    returned homography is accepted only with six well-distributed slot IDs,
+    strong RANSAC support, low residual, and a bounded image displacement.
+    """
+
+    source_points: list[tuple[float, float]] = []
+    target_points: list[tuple[float, float]] = []
+    slot_keys: list[str] = []
+    for slot_key in sorted(projections):
+        marker_id = layout.marker_id_by_slot.get(slot_key)
+        observation = observations.get(marker_id) if marker_id is not None else None
+        if observation is None:
+            continue
+        source_points.append(projections[slot_key].center_px)
+        target_points.append(observation.center_px)
+        slot_keys.append(slot_key)
+
+    diagnostics: dict[str, Any] = {
+        "applied": False,
+        "reason": "insufficient_decoded_slot_markers",
+        "pair_count": len(source_points),
+        "required_pair_count": 6,
+        "slot_keys": slot_keys,
+    }
+    if len(source_points) < 6:
+        return None, diagnostics
+
+    source = np.asarray(source_points, dtype=np.float32)
+    target = np.asarray(target_points, dtype=np.float32)
+    singular_values = np.linalg.svd(
+        source.astype(np.float64) - np.mean(source, axis=0), compute_uv=False
+    )
+    spatial_ratio = float(
+        singular_values[-1] / max(float(singular_values[0]), 1e-9)
+    )
+    diagnostics["source_spatial_singular_value_ratio"] = spatial_ratio
+    if spatial_ratio < 0.08:
+        diagnostics["reason"] = "decoded_slot_markers_not_spatially_distributed"
+        return None, diagnostics
+
+    homography, inlier_mask = cv2.findHomography(
+        source, target, cv2.RANSAC, 2.5, maxIters=3000, confidence=0.995
+    )
+    if homography is None or inlier_mask is None or not np.all(np.isfinite(homography)):
+        diagnostics["reason"] = "slot_marker_homography_fit_failed"
+        return None, diagnostics
+    inliers = inlier_mask.reshape(-1).astype(bool)
+    inlier_count = int(np.count_nonzero(inliers))
+    inlier_ratio = float(inlier_count / len(source))
+    diagnostics["inlier_count"] = inlier_count
+    diagnostics["inlier_ratio"] = inlier_ratio
+    diagnostics["inlier_slot_keys"] = [
+        slot_key for slot_key, is_inlier in zip(slot_keys, inliers) if is_inlier
+    ]
+    if inlier_count < 6 or inlier_ratio < 0.65:
+        diagnostics["reason"] = "slot_marker_homography_has_too_few_inliers"
+        return None, diagnostics
+
+    registered = cv2.perspectiveTransform(
+        source.reshape(1, -1, 2), homography.astype(np.float64)
+    ).reshape(-1, 2)
+    residuals = np.linalg.norm(registered - target, axis=1)
+    inlier_residuals = residuals[inliers]
+    inlier_rms = float(np.sqrt(np.mean(np.square(inlier_residuals))))
+    inlier_max = float(np.max(inlier_residuals))
+    displacement = np.linalg.norm(registered - source, axis=1)
+    diagnostics.update(
+        {
+            "raw_center_error_median_px": float(
+                np.median(np.linalg.norm(source - target, axis=1))
+            ),
+            "inlier_residual_rms_px": inlier_rms,
+            "inlier_residual_max_px": inlier_max,
+            "projection_shift_median_px": float(np.median(displacement)),
+            "projection_shift_max_px": float(np.max(displacement)),
+        }
+    )
+    if inlier_rms > 1.75 or inlier_max > 3.0:
+        diagnostics["reason"] = "slot_marker_homography_residual_too_large"
+        return None, diagnostics
+    if float(np.median(displacement)) > 20.0 or float(np.max(displacement)) > 35.0:
+        diagnostics["reason"] = "slot_marker_homography_shift_too_large"
+        return None, diagnostics
+
+    diagnostics["applied"] = True
+    diagnostics["reason"] = "ok"
+    diagnostics["image_homography"] = homography.astype(float).tolist()
+    return homography.astype(np.float64), diagnostics
+
+
+def apply_slot_marker_registration(
+    projections: Mapping[str, SlotProjection],
+    image_homography: Optional[np.ndarray],
+    image_shape: tuple[int, ...],
+) -> dict[str, SlotProjection]:
+    """Apply an accepted image correction while preserving Tray geometry."""
+
+    if image_homography is None:
+        return dict(projections)
+    homography = np.asarray(image_homography, dtype=np.float64).reshape(3, 3)
+    if not np.all(np.isfinite(homography)):
+        raise ValueError("slot marker registration homography must be finite")
+    result: dict[str, SlotProjection] = {}
+    for slot_key, projection in projections.items():
+        source = np.asarray(
+            [projection.center_px, *projection.polygon_px], dtype=np.float32
+        )
+        corrected = cv2.perspectiveTransform(
+            source.reshape(1, -1, 2), homography
+        ).reshape(-1, 2)
+        center_px = corrected[0]
+        polygon_px = corrected[1:]
+        area = abs(float(cv2.contourArea(polygon_px.astype(np.float32))))
+        if not np.all(np.isfinite(corrected)) or area <= 1e-6:
+            raise ValueError("slot marker registration produced invalid projection")
+        result[slot_key] = SlotProjection(
+            slot_key=projection.slot_key,
+            row=projection.row,
+            column=projection.column,
+            center_T_mm=projection.center_T_mm,
+            center_px=tuple(float(value) for value in center_px),
+            polygon_T_mm=projection.polygon_T_mm,
+            polygon_px=tuple(
+                tuple(float(value) for value in point) for point in polygon_px
+            ),
             image_coverage_ratio=_polygon_coverage_ratio(polygon_px, image_shape),
             projected_area_px=area,
         )
@@ -420,8 +593,10 @@ __all__ = [
     "SlotMarkerLayout",
     "SlotProjection",
     "associate_marker_to_slot",
+    "apply_slot_marker_registration",
     "build_slot_projections",
     "detect_aruco_observations",
+    "estimate_slot_marker_registration",
     "load_slot_marker_layout",
     "marker_like_pattern_features",
     "patch_points_to_image",

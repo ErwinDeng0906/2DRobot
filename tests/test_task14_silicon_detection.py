@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
-TASK14_PATH = ROOT / "Preset Trajectories" / "task14.py"
+TASK14_PATH = ROOT / "Tasks" / "task14_silicon test.py"
 
 
 def _load_task14():
@@ -56,10 +56,17 @@ class Task14ActionTests(unittest.TestCase):
         )
         self.assertEqual(
             {
-                "P01", "P03", "P14", "P21", "P30", "P32",
-                "P33", "P41", "P44", "P52", "P55",
+                "P01", "P03", "P04", "P12",
+                "P15", "P20", "P22", "P23",
             },
             set(self.task14.EXPECTED_NORMAL_WAFER_SLOTS),
+        )
+        self.assertEqual(
+            {
+                "P31", "P33", "P35", "P42",
+                "P44", "P50", "P52", "P54",
+            },
+            set(self.task14.EXPECTED_OUTSIDE_WAFER_SLOTS),
         )
         self.assertEqual(
             {"assert_joints", "move_joints", "wait", "record_point", "capture"},
@@ -232,6 +239,72 @@ class CameraCaptureSettingTests(unittest.TestCase):
 
 
 class Task14ReportTests(unittest.TestCase):
+    def test_five_frame_group_consistency_requires_coherent_boundary_evidence(self) -> None:
+        from scara.vision.task14_silicon_detection import (
+            _five_frame_group_consistency,
+        )
+
+        records = []
+        evidence = [
+            ("occupied", "inside"),
+            ("outside_slot", "strong_outside"),
+            ("occupied", "inside"),
+            ("stacked_outside_slot", "strong_outside"),
+            ("warning", "uncertain"),
+        ]
+        for index, (state, boundary_evidence) in enumerate(evidence, start=1):
+            records.append(
+                {
+                    "point_sequence": index,
+                    "target_name": "P02",
+                    "slot_results": {
+                        "P52": {
+                            "decision": {"state": state},
+                            "wafer": {"boundary_evidence": boundary_evidence},
+                        }
+                    },
+                }
+            )
+        groups, counts = _five_frame_group_consistency("P52", records)
+        self.assertEqual(1, len(groups))
+        self.assertEqual("outside_slot", groups[0]["consensus"])
+        self.assertEqual(2, groups[0]["strong_outside_frame_count"])
+        self.assertEqual({"outside_slot": 1}, counts)
+
+    def test_frame_registration_summary_separates_three_analysis_paths(self) -> None:
+        from scara.vision.task14_silicon_detection import (
+            _frame_registration_summary,
+        )
+
+        summary = _frame_registration_summary(
+            [
+                {
+                    "stage3": {"quality_passed": True},
+                    "analysis_quality_passed": True,
+                    "projection_source": "strict_pnp_slot_marker_refined",
+                },
+                {
+                    "stage3": {"quality_passed": False},
+                    "analysis_quality_passed": True,
+                    "projection_source": "marker_grid_homography",
+                },
+                {
+                    "stage3": {"quality_passed": False},
+                    "analysis_quality_passed": False,
+                    "projection_source": "unavailable",
+                },
+            ]
+        )
+        self.assertEqual(
+            {
+                "stage3_quality_passed_frame_count": 1,
+                "strict_pnp_analysis_frame_count": 1,
+                "planar_fallback_analysis_frame_count": 1,
+                "unavailable_analysis_frame_count": 1,
+            },
+            summary,
+        )
+
     def test_each_slot_uses_all_source_frames_and_excludes_invalid_evidence(self) -> None:
         from scara.vision.task14_silicon_detection import summarize_task14_slot
 
@@ -312,6 +385,9 @@ class Task14ReportTests(unittest.TestCase):
                 task14.EXPECTED_NORMAL_WAFER_SLOTS,
                 1,
                 "auto",
+                expected_outside_wafer_slots=(
+                    task14.EXPECTED_OUTSIDE_WAFER_SLOTS
+                ),
                 confirm_safety=False,
             )
             path = output / "1_001.jpg"
@@ -405,6 +481,9 @@ class Task14ReportTests(unittest.TestCase):
                 task14.EXPECTED_NORMAL_WAFER_SLOTS,
                 1,
                 "auto",
+                expected_outside_wafer_slots=(
+                    task14.EXPECTED_OUTSIDE_WAFER_SLOTS
+                ),
                 confirm_safety=False,
             )
 
@@ -412,16 +491,28 @@ class Task14ReportTests(unittest.TestCase):
             photos = []
             sequence = 0
             normal_slots = set(task14.EXPECTED_NORMAL_WAFER_SLOTS)
+            outside_slots = set(task14.EXPECTED_OUTSIDE_WAFER_SLOTS)
+            wafer_slots = normal_slots | outside_slots
             for target in task14.TARGET_ORDER:
-                expected = target in normal_slots
-                state = "warning" if expected else "empty"
+                expected = target in wafer_slots
+                if target in normal_slots:
+                    state = "warning"
+                elif target in outside_slots:
+                    state = "outside_slot"
+                else:
+                    state = "empty"
                 frame_index = 1
                 sequence += 1
                 filename = f"1_{sequence:03d}.jpg"
                 slot_results = {}
                 for slot_name in sorted(geometry["slots"]):
-                    slot_expected = slot_name in normal_slots
-                    slot_state = "warning" if slot_expected else "empty"
+                    slot_expected = slot_name in wafer_slots
+                    if slot_name in normal_slots:
+                        slot_state = "warning"
+                    elif slot_name in outside_slots:
+                        slot_state = "outside_slot"
+                    else:
+                        slot_state = "empty"
                     slot_results[slot_name] = {
                         "wafer_center_T_mm": (
                             [1.0, 2.0, -2.0] if slot_expected else None
@@ -483,10 +574,22 @@ class Task14ReportTests(unittest.TestCase):
             runtime.on_task_finished(True, "动作完成", str(output))
 
             report = json.loads((output / RESULT_FILENAME).read_text(encoding="utf-8"))
-            self.assertEqual("normal_wafers_acceptable", report["status"])
-            self.assertEqual(2, report["schema_version"])
+            self.assertEqual("expected_wafers_acceptable", report["status"])
+            self.assertEqual(4, report["schema_version"])
             self.assertTrue(report["camera"]["exposure"]["verified_before_motion"])
-            self.assertEqual(11, report["summary"]["acceptable_normal_wafer_count"])
+            self.assertEqual(8, report["summary"]["acceptable_normal_wafer_count"])
+            self.assertEqual(8, report["summary"]["acceptable_outside_wafer_count"])
+            self.assertEqual(
+                sorted(task14.EXPECTED_NORMAL_WAFER_SLOTS),
+                report["scan_configuration"]["expected_normal_wafer_slots"],
+            )
+            self.assertEqual(
+                sorted(task14.EXPECTED_OUTSIDE_WAFER_SLOTS),
+                report["scan_configuration"]["expected_outside_wafer_slots"],
+            )
+            self.assertEqual(
+                20, len(report["scan_configuration"]["expected_empty_slots"])
+            )
             self.assertEqual(36, report["summary"]["processed_frame_count"])
             self.assertEqual(
                 "1_XXX.jpg (TrayVision annotated)",
@@ -494,7 +597,7 @@ class Task14ReportTests(unittest.TestCase):
             )
             self.assertEqual("raw_task14", report["artifacts"]["raw_directory"])
             self.assertEqual(
-                "silicon_detection_0818",
+                "silicon_detection_0820_geometry_robust",
                 report["locked_inputs"]["silicon_detection_profile_name"],
             )
             self.assertEqual(
@@ -539,7 +642,9 @@ class Task14ReportTests(unittest.TestCase):
             markdown = (output / SUMMARY_FILENAME).read_text(encoding="utf-8")
             self.assertIn("每一个槽都使用全部36张照片", markdown)
             self.assertIn("| P01 | 35/36 | 0 | 35 |", markdown)
-            self.assertIn("预期为空槽的25槽", markdown)
+            self.assertIn("预期有正常硅片的8槽", markdown)
+            self.assertIn("预期有槽外硅片的8槽", markdown)
+            self.assertIn("预期为空槽的20槽", markdown)
             self.assertIn("不会自动修改正式配置", markdown)
             recommended = load_silicon_detection_config(
                 output / RECOMMENDED_CONFIG_FILENAME
@@ -676,7 +781,7 @@ class Task14ReportTests(unittest.TestCase):
                     "target_slot": {
                         "wafer": {
                             "flags": ["candidate_area_out_of_range"],
-                            "area_ratio": 0.060,
+                            "area_ratio": 0.050,
                         }
                     },
                 }

@@ -63,9 +63,19 @@ python main.py --no-services
 - 相机使用 OpenCV + DirectShow，点击「连接相机」后按「源#」选择 USB 设备号；相机打不开时只在日志报错，不影响机械臂控制。
 - 「快照」只保存最近 1 秒内采集到的新鲜画面，默认写到程序启动目录下的 `scara_snap_YYYYmmdd_HHMMSS.jpg`。
 - 左栏「轨迹拍照」内的「导入动作」可加载 `ACTION_API_VERSION = 1` 的 Python 动作文件；步骤可组合关节目标、相对 XYZ/R、等待、源#0～#8 拍照和 JSON 途径点记录。
-- `Preset Trajectories/task1.py` 使用 `scara_presets.json` 的 P00/P50/P55/P05 float 点和相机源 0/1/2。源0仅在初始 P00 拍1张；源1仅在 P00/P50/P55/P05 的 float 到达点各拍1张（共4张）；源2覆盖全部45个途径点。世界 Y+ 为 P05→P00；Rz 直接定义为相机方向相对世界 Y− 的角度，因此不需要另行输入相机基准角。
+- `Tasks/task1.py` 使用 `scara_presets.json` 的 P00/P50/P55/P05 float 点和相机源 0/1/2。源0仅在初始 P00 拍1张；源1仅在 P00/P50/P55/P05 的 float 到达点各拍1张（共4张）；源2覆盖全部45个途径点。世界 Y+ 为 P05→P00；Rz 直接定义为相机方向相对世界 Y− 的角度，因此不需要另行输入相机基准角。
 - 每次动作在 `Trajectory Photos/YYMMDDHHMMSS/` 创建独立实验目录；照片按 `源序号_三位全局途径点编号.jpg` 命名，同一点的不同相机共用编号，例如初始点为 `0_001.jpg`、`1_001.jpg`、`2_001.jpg`。`points.json` 保存每个采点的 J1～J4、机械中心 x/y/z/Rx/Ry/Rz、由 task1 计算的旋转相机 x/y/z 及照片索引；源1实际拍照的4个点另含 `camera1_position`，其 XY 按前臂方向 `J1+J2` 和J4轴外延33.55 mm计算。
 - 执行动作前必须连接、使能且无急停/报警。运行时左侧手动控制和相机切换会锁定，「停止动作」及底部急停保持可用；任务相机会临时接管所需设备，结束后恢复原预览源。
+
+### 相机1硅片识别与拾取导航
+
+1. 连接相机源#1，打开「手眼交互 -> 转移视觉」。
+2. 等待托盘位姿、`W←T` 和拾取稳定证据通过；拾取槽需最近 5 帧中至少 3 帧为正常占用，且最新帧仍正常。
+3. 在画面中点击正常硅片，界面会持续显示点击像素、托盘毫米坐标、匹配槽位及吸盘 XY 偏差。
+4. 「锁定拾取导航」只启动计算和跟踪；窗口始终输出 `robot_motion_authorized=false`，不会发送运动、Z、J4、DO或真空命令。
+5. 相机超时或分析异常会清除旧图、多帧证据和 `W←T`；已锁定会话直接进入 `blocked`。
+
+识别参数、标注图和回归命令见 [`docs/wafer_recognition_0820_validation.md`](docs/wafer_recognition_0820_validation.md)；实时坐标链和安全门见 [`docs/wafer_transfer_runtime_integration.md`](docs/wafer_transfer_runtime_integration.md)。
 
 ## 安全提示
 
@@ -103,7 +113,7 @@ tools/
   snrobot bridge/          snrobot 桥及运行时文件的换机部署副本
   uitest/                  使能/模式/急停/报警 SDK 探测客户端与人工测试入口
   DOtest/                  DO 泵脉冲人工测试脚本
-Preset Trajectories/       可导入的 ACTION_API_VERSION=1 动作脚本（当前含 task1.py）
+Tasks/                     可导入的 ACTION_API_VERSION=1 动作脚本
 Trajectory Photos/         每次动作的照片和 points.json 输出（Git 忽略）
 _smoke/                    不接真机的 Qt 页面、运动、相机、动作和 JSON 回归测试
 logs/                      主程序与 armweb 运行日志（Git 忽略）
