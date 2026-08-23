@@ -9,7 +9,7 @@ fails its existing reprojection quality gates.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Optional, Sequence
 
 import cv2
@@ -22,11 +22,18 @@ from .slot_marker_observation import (
     SlotMarkerEvidence,
     SlotMarkerLayout,
     SlotProjection,
+    apply_slot_marker_registration,
     associate_marker_to_slot,
     build_slot_projections,
     detect_aruco_observations,
+    estimate_slot_marker_registration,
     patch_points_to_image,
     warp_slot_patch,
+)
+from .planar_tray_registration import (
+    PlanarTrayRegistration,
+    build_planar_slot_projections,
+    estimate_planar_tray_registration,
 )
 from .tray_occupancy import (
     DEFAULT_SLOT_DECISION,
@@ -46,6 +53,7 @@ from .wafer_shape_quality import (
     WaferObservation,
     WaferQualityConfig,
     analyze_wafer_patch,
+    reconcile_projection_boundary_evidence,
 )
 
 
@@ -73,6 +81,10 @@ class SlotAnalysis:
     wafer_offset_T_mm: Optional[tuple[float, float]]
     wafer_offset_distance_mm: Optional[float]
     explicit_occlusion_ratio: float
+    wafer_contour_image_px: tuple[tuple[float, float], ...] = ()
+    base_slot_inner_boundary_image_px: tuple[tuple[float, float], ...] = ()
+    refined_slot_inner_boundary_image_px: tuple[tuple[float, float], ...] = ()
+    projection_disagreement_px: Optional[float] = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -103,6 +115,16 @@ class SlotAnalysis:
             ),
             "wafer_offset_distance_mm": self.wafer_offset_distance_mm,
             "explicit_occlusion_ratio": self.explicit_occlusion_ratio,
+            "wafer_contour_image_px": [
+                list(point) for point in self.wafer_contour_image_px
+            ],
+            "base_slot_inner_boundary_image_px": [
+                list(point) for point in self.base_slot_inner_boundary_image_px
+            ],
+            "refined_slot_inner_boundary_image_px": [
+                list(point) for point in self.refined_slot_inner_boundary_image_px
+            ],
+            "projection_disagreement_px": self.projection_disagreement_px,
         }
 
 
@@ -118,11 +140,17 @@ class TrayVisionResult:
     slots: tuple[SlotAnalysis, ...]
     summary: dict[str, int]
     annotated_image: np.ndarray
+    analysis_quality_passed: bool = False
+    projection_source: str = "unavailable"
+    planar_registration: Optional[PlanarTrayRegistration] = None
+    projection_diagnostics: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
             "success": self.success,
             "quality_passed": self.quality_passed,
+            "analysis_quality_passed": self.analysis_quality_passed,
+            "projection_source": self.projection_source,
             "failure_reason": self.failure_reason,
             "coordinate_mapping_allowed": self.coordinate_mapping_allowed,
             "robot_correction_allowed": self.robot_correction_allowed,
@@ -133,6 +161,12 @@ class TrayVisionResult:
             },
             "slots": [slot.to_json() for slot in self.slots],
             "summary": dict(self.summary),
+            "planar_registration": (
+                None
+                if self.planar_registration is None
+                else self.planar_registration.to_json()
+            ),
+            "projection_diagnostics": dict(self.projection_diagnostics),
         }
 
 
@@ -153,6 +187,80 @@ def _explicit_occlusion_ratio(
     if not np.any(cell_pixels):
         return 0.0
     return float(np.mean(mask[cell_pixels] > 0))
+
+
+def _projection_disagreement_px(
+    base: SlotProjection,
+    refined: SlotProjection,
+) -> float:
+    base_points = np.vstack(
+        (
+            np.asarray(base.center_px, dtype=np.float64).reshape(1, 2),
+            np.asarray(base.polygon_px, dtype=np.float64).reshape(4, 2),
+        )
+    )
+    refined_points = np.vstack(
+        (
+            np.asarray(refined.center_px, dtype=np.float64).reshape(1, 2),
+            np.asarray(refined.polygon_px, dtype=np.float64).reshape(4, 2),
+        )
+    )
+    return float(np.sqrt(np.mean(np.sum(np.square(refined_points - base_points), axis=1))))
+
+
+def _inner_boundary_patch_points(
+    output_size: int,
+    margin_ratio: float,
+) -> np.ndarray:
+    margin = max(1.0, float(margin_ratio) * float(output_size))
+    upper = float(output_size - 1) - margin
+    return np.asarray(
+        [[margin, margin], [upper, margin], [upper, upper], [margin, upper]],
+        dtype=np.float32,
+    )
+
+
+def _mapped_inner_boundary(
+    image_to_patch: np.ndarray,
+    *,
+    output_size: int,
+    margin_ratio: float,
+) -> tuple[tuple[float, float], ...]:
+    points = patch_points_to_image(
+        _inner_boundary_patch_points(output_size, margin_ratio), image_to_patch
+    )
+    return tuple(tuple(float(value) for value in point) for point in points)
+
+
+def _draw_inner_boundary(
+    canvas: np.ndarray,
+    polygon_raw: Sequence[Sequence[float]],
+    *,
+    color: tuple[int, int, int],
+    crossed_sides: Sequence[str] = (),
+) -> None:
+    if len(polygon_raw) != 4:
+        return
+    polygon = np.round(np.asarray(polygon_raw, dtype=np.float64)).astype(np.int32)
+    cv2.polylines(canvas, [polygon], True, color, 1, cv2.LINE_AA)
+    segments = {
+        "top": (0, 1),
+        "right": (1, 2),
+        "bottom": (2, 3),
+        "left": (3, 0),
+    }
+    for side in crossed_sides:
+        pair = segments.get(str(side))
+        if pair is None:
+            continue
+        cv2.line(
+            canvas,
+            tuple(polygon[pair[0]]),
+            tuple(polygon[pair[1]]),
+            (0, 0, 255),
+            4,
+            cv2.LINE_AA,
+        )
 
 
 def image_pixel_to_tray_plane(
@@ -311,18 +419,35 @@ class TrayVisionAnalyzer:
         if len(geometry_slots) != 36 or geometry_slots != layout_slots:
             raise ValueError("metric geometry and slot marker layout must describe the same 36 slots")
 
-    def _failed_result(self, pose: TrayPoseEstimate) -> TrayVisionResult:
+    def _failed_result(
+        self,
+        pose: TrayPoseEstimate,
+        *,
+        observations: Optional[dict[int, ArucoObservation]] = None,
+        planar_registration: Optional[PlanarTrayRegistration] = None,
+    ) -> TrayVisionResult:
+        reason = pose.failure_reason or "tray pose rejected"
+        if planar_registration is not None and planar_registration.failure_reason:
+            reason = f"{reason}; planar fallback: {planar_registration.failure_reason}"
         return TrayVisionResult(
             success=False,
             quality_passed=False,
-            failure_reason=pose.failure_reason or "tray pose rejected",
+            failure_reason=reason,
             coordinate_mapping_allowed=False,
             robot_correction_allowed=False,
             pose=pose,
-            slot_markers={},
+            slot_markers=observations or {},
             slots=(),
             summary={"analyzed": 0, "unknown": 36},
             annotated_image=pose.annotated_image.copy(),
+            analysis_quality_passed=False,
+            projection_source="unavailable",
+            planar_registration=planar_registration,
+            projection_diagnostics=(
+                {}
+                if planar_registration is None
+                else planar_registration.to_json()
+            ),
         )
 
     @staticmethod
@@ -340,8 +465,21 @@ class TrayVisionAnalyzer:
             SlotState.UNKNOWN: (255, 180, 0),
         }
         color = colors[analysis.decision.state]
+        wafer = getattr(analysis, "wafer", None)
         polygon = np.asarray(analysis.projection.polygon_px, dtype=np.int32).reshape(4, 2)
         cv2.polylines(canvas, [polygon], True, color, 2, cv2.LINE_AA)
+        _draw_inner_boundary(
+            canvas,
+            getattr(analysis, "base_slot_inner_boundary_image_px", ()),
+            color=(255, 255, 0),
+            crossed_sides=getattr(wafer, "base_boundary_crossed_sides", ()),
+        )
+        _draw_inner_boundary(
+            canvas,
+            getattr(analysis, "refined_slot_inner_boundary_image_px", ()),
+            color=(0, 255, 255),
+            crossed_sides=getattr(wafer, "refined_boundary_crossed_sides", ()),
+        )
         center = tuple(np.round(analysis.projection.center_px).astype(int))
         cv2.circle(canvas, center, 5, color, -1, cv2.LINE_AA)
         state_codes = {
@@ -371,6 +509,49 @@ class TrayVisionAnalyzer:
             2,
             cv2.LINE_AA,
         )
+        wafer_contour_image_px = getattr(
+            analysis, "wafer_contour_image_px", ()
+        )
+        if wafer_contour_image_px:
+            wafer_contour = np.round(
+                np.asarray(wafer_contour_image_px, dtype=np.float64)
+            ).astype(np.int32)
+            cv2.polylines(
+                canvas,
+                [wafer_contour],
+                True,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        if (
+            wafer is not None
+            and wafer.found
+            and (
+                wafer.boundary_evidence != "inside"
+                or (getattr(analysis, "projection_disagreement_px", None) or 0.0)
+                >= 3.0
+            )
+        ):
+            base_clearance = wafer.base_projection_clearance_px
+            refined_clearance = wafer.refined_projection_clearance_px
+            clearance_text = (
+                f"b={base_clearance:+.1f}px"
+                if base_clearance is not None
+                else "b=NA"
+            )
+            if refined_clearance is not None:
+                clearance_text += f" r={refined_clearance:+.1f}px"
+            cv2.putText(
+                canvas,
+                clearance_text,
+                (center[0] + 7, center[1] + 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                max(0.38, 0.75 * scale),
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
         if analysis.wafer_box_image_px:
             wafer_box = np.asarray(analysis.wafer_box_image_px, dtype=np.int32).reshape(4, 2)
             cv2.polylines(canvas, [wafer_box], True, color, 3, cv2.LINE_AA)
@@ -441,23 +622,92 @@ class TrayVisionAnalyzer:
         if explicit_occlusion_mask is not None and explicit_occlusion_mask.shape[:2] != image.shape[:2]:
             raise ValueError("explicit occlusion mask must match the image size")
         pose_result = pose if pose is not None else self.pose_estimator.estimate(image)
-        if not pose_result.success or not pose_result.quality_passed:
-            return self._failed_result(pose_result)
-
-        projections = build_slot_projections(
-            self.geometry,
-            self.pose_estimator,
-            pose_result,
-            image.shape,
-            half_extent_mm=self.config.slot_half_extent_mm,
-        )
-        observations = detect_aruco_observations(
-            image, self.slot_marker_layout.dictionary_name
-        )
+        strict_pose_passed = bool(pose_result.success and pose_result.quality_passed)
+        planar_registration: Optional[PlanarTrayRegistration] = None
+        projection_diagnostics: dict[str, Any] = {}
+        image_registration: Optional[np.ndarray] = None
+        base_projections: Mapping[str, SlotProjection]
+        if strict_pose_passed:
+            # Normal frames keep the original Stage-3 pose and quality gates.
+            # Multi-scale decoding here is observational and cannot modify PnP.
+            observations = detect_aruco_observations(
+                image, self.slot_marker_layout.dictionary_name
+            )
+            base_projections = build_slot_projections(
+                self.geometry,
+                self.pose_estimator,
+                pose_result,
+                image.shape,
+                half_extent_mm=self.config.slot_half_extent_mm,
+            )
+            image_registration, projection_diagnostics = (
+                estimate_slot_marker_registration(
+                    base_projections, self.slot_marker_layout, observations
+                )
+            )
+            projections = apply_slot_marker_registration(
+                base_projections, image_registration, image.shape
+            )
+            projection_source = (
+                "strict_pnp_slot_marker_refined"
+                if image_registration is not None
+                else "strict_pnp"
+            )
+        else:
+            # Expensive detection is deliberately restricted to rejected
+            # Stage-3 frames.  It feeds only the observation-only homography.
+            observations = detect_aruco_observations(
+                image,
+                self.slot_marker_layout.dictionary_name,
+                scales=(1.0, 1.5, 2.0),
+            )
+            planar_registration = estimate_planar_tray_registration(
+                image,
+                self.geometry,
+                self.slot_marker_layout,
+                observations,
+            )
+            if not planar_registration.success:
+                # CLAHE is a second-stage supplement, not routine work.  It is
+                # only paid for when native multi-scale decoding cannot form a
+                # checked plane.
+                observations = detect_aruco_observations(
+                    image,
+                    self.slot_marker_layout.dictionary_name,
+                    scales=(1.0, 1.5, 2.0),
+                    include_clahe=True,
+                )
+                planar_registration = estimate_planar_tray_registration(
+                    image,
+                    self.geometry,
+                    self.slot_marker_layout,
+                    observations,
+                )
+            if not planar_registration.success:
+                return self._failed_result(
+                    pose_result,
+                    observations=observations,
+                    planar_registration=planar_registration,
+                )
+            projections = build_planar_slot_projections(
+                self.geometry,
+                planar_registration,
+                image.shape,
+                half_extent_mm=self.config.slot_half_extent_mm,
+            )
+            projection_source = planar_registration.method
+            projection_diagnostics = planar_registration.to_json()
+            base_projections = projections
         analyses: list[SlotAnalysis] = []
         canvas = pose_result.annotated_image.copy()
         for slot_key in sorted(projections):
             projection = projections[slot_key]
+            base_projection = base_projections[slot_key]
+            projection_disagreement = (
+                _projection_disagreement_px(base_projection, projection)
+                if image_registration is not None
+                else None
+            )
             patch, image_to_patch = warp_slot_patch(
                 image,
                 projection,
@@ -470,6 +720,43 @@ class TrayVisionAnalyzer:
                 patch,
             )
             wafer = analyze_wafer_patch(patch, self.config.wafer_quality)
+            base_inner_boundary: tuple[tuple[float, float], ...]
+            refined_inner_boundary: tuple[tuple[float, float], ...]
+            if image_registration is not None:
+                refined_inner_boundary = _mapped_inner_boundary(
+                    image_to_patch,
+                    output_size=self.config.canonical_patch_size,
+                    margin_ratio=self.config.wafer_quality.slot_boundary_margin_ratio,
+                )
+                base_patch, base_image_to_patch = warp_slot_patch(
+                    image,
+                    base_projection,
+                    output_size=self.config.canonical_patch_size,
+                )
+                base_inner_boundary = _mapped_inner_boundary(
+                    base_image_to_patch,
+                    output_size=self.config.canonical_patch_size,
+                    margin_ratio=self.config.wafer_quality.slot_boundary_margin_ratio,
+                )
+                base_wafer = (
+                    analyze_wafer_patch(base_patch, self.config.wafer_quality)
+                    if wafer.found or not marker.decoded
+                    else None
+                )
+                wafer = reconcile_projection_boundary_evidence(
+                    wafer,
+                    base=base_wafer,
+                    primary_is_refined=True,
+                    projection_disagreement_px=projection_disagreement,
+                )
+            else:
+                base_inner_boundary = _mapped_inner_boundary(
+                    image_to_patch,
+                    output_size=self.config.canonical_patch_size,
+                    margin_ratio=self.config.wafer_quality.slot_boundary_margin_ratio,
+                )
+                refined_inner_boundary = ()
+                wafer = reconcile_projection_boundary_evidence(wafer)
             occlusion_ratio = _explicit_occlusion_ratio(
                 projection.polygon_px, explicit_occlusion_mask
             )
@@ -484,6 +771,7 @@ class TrayVisionAnalyzer:
             wafer_secondary_boxes_image: tuple[
                 tuple[tuple[float, float], ...], ...
             ] = ()
+            wafer_contour_image: tuple[tuple[float, float], ...] = ()
             wafer_center_image: Optional[tuple[float, float]] = None
             wafer_center_T: Optional[tuple[float, float, float]] = None
             wafer_offset_T: Optional[tuple[float, float]] = None
@@ -504,6 +792,15 @@ class TrayVisionAnalyzer:
                         tuple(tuple(float(value) for value in point) for point in mapped)
                     )
                 wafer_secondary_boxes_image = tuple(mapped_secondary_boxes)
+            if wafer.found and wafer.contour_patch_px:
+                mapped_contour = patch_points_to_image(
+                    np.asarray(wafer.contour_patch_px, dtype=np.float32),
+                    image_to_patch,
+                )
+                wafer_contour_image = tuple(
+                    tuple(float(value) for value in point)
+                    for point in mapped_contour
+                )
             if wafer.found and wafer.center_patch_px is not None:
                 mapped_center = patch_points_to_image(
                     np.asarray([wafer.center_patch_px], dtype=np.float32),
@@ -533,6 +830,10 @@ class TrayVisionAnalyzer:
                 wafer_offset_T_mm=wafer_offset_T,
                 wafer_offset_distance_mm=wafer_offset_distance,
                 explicit_occlusion_ratio=occlusion_ratio,
+                wafer_contour_image_px=wafer_contour_image,
+                base_slot_inner_boundary_image_px=base_inner_boundary,
+                refined_slot_inner_boundary_image_px=refined_inner_boundary,
+                projection_disagreement_px=projection_disagreement,
             )
             analyses.append(analysis)
             self._draw_slot(canvas, analysis)
@@ -541,8 +842,16 @@ class TrayVisionAnalyzer:
         for analysis in analyses:
             summary[analysis.decision.state.value] += 1
         summary["analyzed"] = len(analyses)
+        registration_status = (
+            f"pose PASS | RMS={pose_result.reprojection_rms_px:.3f}px"
+            if strict_pose_passed
+            else (
+                "READ-ONLY PLANAR | "
+                f"RMS={planar_registration.reprojection_rms_px:.3f}px"
+            )
+        )
         status = (
-            f"pose PASS | RMS={pose_result.reprojection_rms_px:.3f}px | "
+            f"{registration_status} | "
             f"empty={summary['empty'] + summary['empty_unread_marker']} | "
             f"occupied={summary['occupied']} | warn={summary['warning']} | "
             f"stacked={summary['stacked']} | outside={summary['outside_slot']} | "
@@ -561,9 +870,10 @@ class TrayVisionAnalyzer:
         )
         return TrayVisionResult(
             success=True,
-            quality_passed=True,
-            failure_reason=None,
-            coordinate_mapping_allowed=True,
+            # quality_passed remains the strict metric Stage-3 contract.
+            quality_passed=strict_pose_passed,
+            failure_reason=(None if strict_pose_passed else pose_result.failure_reason),
+            coordinate_mapping_allowed=strict_pose_passed,
             # Pixel->Tray is ready here.  Robot correction still requires the
             # existing suction/hand-eye registration layer and is not guessed.
             robot_correction_allowed=False,
@@ -572,6 +882,10 @@ class TrayVisionAnalyzer:
             slots=tuple(analyses),
             summary=summary,
             annotated_image=canvas,
+            analysis_quality_passed=True,
+            projection_source=projection_source,
+            planar_registration=planar_registration,
+            projection_diagnostics=projection_diagnostics,
         )
 
     def analyze_tracked(
@@ -582,9 +896,43 @@ class TrayVisionAnalyzer:
         explicit_occlusion_mask: Optional[np.ndarray] = None,
     ) -> TrayVisionResult:
         """Analyze one frame with the same filtered pose as the live UI."""
+        tracked_estimate = tracked_pose_estimate(tracked_pose)
+        if (
+            not tracked_pose.accepted_by_tracker
+            and tracked_pose.raw.success
+            and tracked_pose.raw.quality_passed
+        ):
+            # A raw Stage-3 pose that fails the temporal tracker remains useful
+            # for this frame's read-only patches, but must not regain any metric
+            # or robot authorization.  The externally visible pose and safety
+            # flags therefore remain the authoritative tracker rejection.
+            read_only = self.analyze(
+                image,
+                pose=tracked_pose.raw,
+                explicit_occlusion_mask=explicit_occlusion_mask,
+            )
+            diagnostics = dict(read_only.projection_diagnostics)
+            diagnostics["temporal_tracker"] = {
+                "accepted": False,
+                "reason": tracked_pose.tracker_reason,
+                "read_only_raw_pnp_projection": True,
+            }
+            return replace(
+                read_only,
+                quality_passed=False,
+                failure_reason=(
+                    tracked_pose.tracker_reason
+                    or "tray pose rejected by temporal tracker"
+                ),
+                coordinate_mapping_allowed=False,
+                robot_correction_allowed=False,
+                pose=tracked_estimate,
+                projection_source="strict_pnp_untracked_read_only",
+                projection_diagnostics=diagnostics,
+            )
         return self.analyze(
             image,
-            pose=tracked_pose_estimate(tracked_pose),
+            pose=tracked_estimate,
             explicit_occlusion_mask=explicit_occlusion_mask,
         )
 

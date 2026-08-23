@@ -12,7 +12,7 @@ requiring chromatic wafer pixels.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 
 import cv2
@@ -57,6 +57,16 @@ class WaferQualityConfig:
 DEFAULT_WAFER_QUALITY = WaferQualityConfig()
 
 
+# Boundary decisions use canonical-patch pixels so the gates remain independent
+# of camera zoom. The patch is 192 px in production. A three-pixel dead band
+# prevents exposure-driven contour jitter from flipping a frame at zero, while
+# a confirmed violation additionally needs coherent primary-contour support.
+BOUNDARY_UNCERTAINTY_PX = 3.0
+BOUNDARY_CONTOUR_MIN_DEPTH_PX = 2.0
+BOUNDARY_CONTOUR_MIN_SUPPORT_PX = 8
+BOUNDARY_CONTOUR_MIN_AREA_RATIO = 0.015
+
+
 @dataclass(frozen=True)
 class WaferObservation:
     found: bool
@@ -81,6 +91,17 @@ class WaferObservation:
     outside_slot: bool
     minimum_slot_clearance_ratio: Optional[float]
     secondary_boxes_patch_px: tuple[tuple[tuple[float, float], ...], ...]
+    minimum_slot_clearance_px: Optional[float] = None
+    contour_patch_px: tuple[tuple[float, float], ...] = ()
+    contour_outside_depth_px: float = 0.0
+    contour_outside_support_px: int = 0
+    contour_outside_area_ratio: float = 0.0
+    boundary_evidence: str = "unobservable"
+    base_projection_clearance_px: Optional[float] = None
+    refined_projection_clearance_px: Optional[float] = None
+    projection_disagreement_px: Optional[float] = None
+    base_boundary_crossed_sides: tuple[str, ...] = ()
+    refined_boundary_crossed_sides: tuple[str, ...] = ()
 
     @classmethod
     def not_found(
@@ -134,11 +155,268 @@ class WaferObservation:
             "flags": list(self.flags),
             "outside_slot": self.outside_slot,
             "minimum_slot_clearance_ratio": self.minimum_slot_clearance_ratio,
+            "minimum_slot_clearance_px": self.minimum_slot_clearance_px,
+            "contour_outside_depth_px": self.contour_outside_depth_px,
+            "contour_outside_support_px": self.contour_outside_support_px,
+            "contour_outside_area_ratio": self.contour_outside_area_ratio,
+            "boundary_evidence": self.boundary_evidence,
+            "base_projection_clearance_px": self.base_projection_clearance_px,
+            "refined_projection_clearance_px": self.refined_projection_clearance_px,
+            "projection_disagreement_px": self.projection_disagreement_px,
+            "base_boundary_crossed_sides": list(self.base_boundary_crossed_sides),
+            "refined_boundary_crossed_sides": list(self.refined_boundary_crossed_sides),
             "secondary_boxes_patch_px": [
                 [list(point) for point in box]
                 for box in self.secondary_boxes_patch_px
             ],
         }
+
+
+def _longest_cyclic_true_run(values: np.ndarray) -> int:
+    flags = np.asarray(values, dtype=bool).reshape(-1)
+    count = int(flags.size)
+    if count == 0 or not np.any(flags):
+        return 0
+    if np.all(flags):
+        return count
+    doubled = np.concatenate((flags, flags))
+    best = 0
+    current = 0
+    for value in doubled:
+        current = current + 1 if value else 0
+        best = max(best, current)
+    return min(best, count)
+
+
+def _boundary_measurements(
+    primary_mask: np.ndarray,
+    box: np.ndarray,
+    *,
+    boundary_margin: float,
+) -> tuple[float, float, int, float, tuple[str, ...]]:
+    """Measure fitted-box and actual-contour evidence at the inner slot edge."""
+
+    height, width = primary_mask.shape[:2]
+    lower = float(boundary_margin)
+    upper_x = float(width - 1) - lower
+    upper_y = float(height - 1) - lower
+    clearances = np.asarray(
+        [
+            np.min(box[:, 0]) - lower,
+            upper_x - np.max(box[:, 0]),
+            np.min(box[:, 1]) - lower,
+            upper_y - np.max(box[:, 1]),
+        ],
+        dtype=np.float64,
+    )
+    side_names = ("left", "right", "top", "bottom")
+    crossed_sides = tuple(
+        name for name, clearance in zip(side_names, clearances) if clearance < 0.0
+    )
+
+    dense_contours, _ = cv2.findContours(
+        primary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    if dense_contours:
+        dense = max(dense_contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float64)
+        violations = np.column_stack(
+            (
+                lower - dense[:, 0],
+                dense[:, 0] - upper_x,
+                lower - dense[:, 1],
+                dense[:, 1] - upper_y,
+            )
+        )
+        point_depth = np.maximum(np.max(violations, axis=1), 0.0)
+        outside_depth = float(np.max(point_depth)) if point_depth.size else 0.0
+        outside_support = _longest_cyclic_true_run(point_depth > 0.0)
+    else:
+        outside_depth = 0.0
+        outside_support = 0
+
+    ys, xs = np.nonzero(primary_mask > 0)
+    if xs.size:
+        outside_pixels = (
+            (xs < lower) | (xs > upper_x) | (ys < lower) | (ys > upper_y)
+        )
+        outside_area_ratio = float(np.count_nonzero(outside_pixels) / xs.size)
+    else:
+        outside_area_ratio = 0.0
+    return (
+        float(np.min(clearances)),
+        outside_depth,
+        int(outside_support),
+        outside_area_ratio,
+        crossed_sides,
+    )
+
+
+def reconcile_projection_boundary_evidence(
+    primary: WaferObservation,
+    *,
+    base: Optional[WaferObservation] = None,
+    primary_is_refined: bool = False,
+    projection_disagreement_px: Optional[float] = None,
+) -> WaferObservation:
+    """Fail closed when base and marker-refined slot boundaries disagree."""
+
+    if not primary.found:
+        return primary
+    observations = [primary]
+    if base is not None and base.found:
+        observations.append(base)
+    evidence = [row.boundary_evidence for row in observations]
+
+    def supported_outside(row: WaferObservation) -> bool:
+        return bool(
+            row.minimum_slot_clearance_px is not None
+            and row.minimum_slot_clearance_px < 0.0
+            # The 30.912 px boundary falls between raster rows, so a physical
+            # two-pixel crossing is measured as 1.912 px. Keep a quarter-pixel
+            # raster tolerance without lowering the declared two-pixel gate.
+            and row.contour_outside_depth_px
+            >= BOUNDARY_CONTOUR_MIN_DEPTH_PX - 0.25
+            and row.contour_outside_support_px >= BOUNDARY_CONTOUR_MIN_SUPPORT_PX
+        )
+
+    if len(observations) == 1:
+        row = observations[0]
+        strong_outside = bool(
+            row.boundary_evidence == "strong_outside"
+            or (
+                supported_outside(row)
+                and abs(float(row.yaw_relative_to_tray_deg or 0.0)) >= 2.5
+            )
+        )
+    elif primary_is_refined:
+        primary_supported = supported_outside(primary)
+        base_supported = bool(base is not None and supported_outside(base))
+        if primary_supported:
+            # The marker-grid-refined projection is the normal read-only image
+            # path. Coherent contour support is sufficient
+            # even when the fitted corner penetration is inside the dead band.
+            strong_outside = True
+        elif base_supported:
+            # The unrefined PnP patch is an alternate safeguard, not an equal
+            # authority. It may overrule a refined inside result only when the
+            # wafer is visibly rotated, which supports a real corner crossing
+            # while rejecting near-axis-aligned projection conflicts.
+            yaw = abs(float(primary.yaw_relative_to_tray_deg or 0.0))
+            strong_outside = bool(
+                yaw >= 4.0
+                and (
+                    base.boundary_evidence == "strong_outside"
+                    or primary.boundary_evidence != "inside"
+                )
+            )
+        else:
+            strong_outside = False
+    else:
+        outside_support = [supported_outside(row) for row in observations]
+        strong_outside = all(outside_support)
+        if not strong_outside and any(outside_support):
+            outside_index = outside_support.index(True)
+            outside_row = observations[outside_index]
+            other_row = observations[1 - outside_index]
+            if other_row.boundary_evidence != "inside":
+                # Two uncertain projections become coherent evidence when one
+                # has a real contour crossing and the other is not confidently
+                # inside. This recovers shallow but stable crossings.
+                strong_outside = True
+            elif outside_row.boundary_evidence == "strong_outside":
+                crossing_depth = -float(outside_row.minimum_slot_clearance_px or 0.0)
+                inside_margin = float(other_row.minimum_slot_clearance_px or 0.0)
+                # A strong crossing may overrule the other projection only when
+                # it exceeds that inside margin by two canonical pixels. This
+                # rejects the pattern where one extrapolated boundary crosses
+                # but the other remains comfortably inside.
+                strong_outside = crossing_depth >= inside_margin + 2.0
+    base_required_and_missing = bool(
+        primary_is_refined and (base is None or not base.found)
+    )
+    confident_inside = bool(
+        evidence
+        and all(value == "inside" for value in evidence)
+        and not base_required_and_missing
+    )
+    resolved_evidence = (
+        "strong_outside" if strong_outside else "inside" if confident_inside else "uncertain"
+    )
+
+    flags = list(primary.flags)
+    if base is not None and base.found and base.boundary_evidence != primary.boundary_evidence:
+        if "projection_boundary_disagreement" not in flags:
+            flags.append("projection_boundary_disagreement")
+    if strong_outside:
+        if "outside_slot" not in flags:
+            flags.append("outside_slot")
+        flags = [flag for flag in flags if flag != "boundary_uncertain"]
+    elif not confident_inside:
+        flags = [flag for flag in flags if flag != "outside_slot"]
+        if "boundary_uncertain" not in flags:
+            flags.append("boundary_uncertain")
+
+    clearances_px = [
+        float(row.minimum_slot_clearance_px)
+        for row in observations
+        if row.minimum_slot_clearance_px is not None
+    ]
+    clearances_ratio = [
+        float(row.minimum_slot_clearance_ratio)
+        for row in observations
+        if row.minimum_slot_clearance_ratio is not None
+    ]
+    quality = primary.quality
+    if strong_outside:
+        quality = "abnormal"
+    elif not confident_inside and quality == "normal":
+        quality = "warning"
+
+    base_observation = base if primary_is_refined else primary
+    refined_observation = primary if primary_is_refined else None
+    return replace(
+        primary,
+        quality=quality,
+        flags=tuple(flags),
+        outside_slot=strong_outside,
+        minimum_slot_clearance_px=(min(clearances_px) if clearances_px else None),
+        minimum_slot_clearance_ratio=(
+            min(clearances_ratio) if clearances_ratio else None
+        ),
+        contour_outside_depth_px=max(
+            float(row.contour_outside_depth_px) for row in observations
+        ),
+        contour_outside_support_px=max(
+            int(row.contour_outside_support_px) for row in observations
+        ),
+        contour_outside_area_ratio=max(
+            float(row.contour_outside_area_ratio) for row in observations
+        ),
+        boundary_evidence=resolved_evidence,
+        base_projection_clearance_px=(
+            None
+            if base_observation is None
+            else base_observation.minimum_slot_clearance_px
+        ),
+        refined_projection_clearance_px=(
+            None
+            if refined_observation is None
+            else refined_observation.minimum_slot_clearance_px
+        ),
+        projection_disagreement_px=projection_disagreement_px,
+        base_boundary_crossed_sides=(
+            ()
+            if base_observation is None
+            else base_observation.base_boundary_crossed_sides
+            or base_observation.refined_boundary_crossed_sides
+        ),
+        refined_boundary_crossed_sides=(
+            ()
+            if refined_observation is None
+            else refined_observation.refined_boundary_crossed_sides
+            or refined_observation.base_boundary_crossed_sides
+        ),
+    )
 
 
 def normalize_square_angle_deg(angle_deg: float) -> float:
@@ -712,34 +990,70 @@ def analyze_wafer_patch(
         1.0,
         float(config.slot_boundary_margin_ratio) * float(min(height, width)),
     )
-    lower_bound = boundary_margin
-    upper_x = float(width - 1) - boundary_margin
-    upper_y = float(height - 1) - boundary_margin
-    clearances = np.asarray(
-        [
-            np.min(box[:, 0]) - lower_bound,
-            upper_x - np.max(box[:, 0]),
-            np.min(box[:, 1]) - lower_bound,
-            upper_y - np.max(box[:, 1]),
-        ],
-        dtype=np.float64,
+    (
+        minimum_slot_clearance_px,
+        contour_outside_depth_px,
+        contour_outside_support_px,
+        contour_outside_area_ratio,
+        boundary_crossed_sides,
+    ) = _boundary_measurements(
+        primary_mask,
+        box,
+        boundary_margin=boundary_margin,
     )
     minimum_slot_clearance_ratio = float(
-        np.min(clearances) / max(float(min(height, width)), 1.0)
+        minimum_slot_clearance_px / max(float(min(height, width)), 1.0)
     )
-    boundary_crossing_observed = bool(minimum_slot_clearance_ratio < 0.0)
+    boundary_crossing_observed = bool(minimum_slot_clearance_px < 0.0)
     # A partial reflection blob can cross the boundary even though it is not a
     # trustworthy estimate of the square's four corners. Such a frame remains
     # a warning and cannot be selected for pickup, but it is not promoted to a
     # confident outside-slot label. Clear boundary decisions require the
     # fitted footprint itself to remain square-like.
+    stacking_boundary_ambiguous = bool(
+        internal_count >= config.stacked_internal_line_count
+        and internal_score >= config.stacked_internal_line_score
+        and len(polygon) > config.irregular_outline_vertex_threshold
+        # Specular lines also appear on a clean single wafer.  Only a clearly
+        # non-solid merged silhouette makes the layer ownership ambiguous.
+        and solidity < 0.85
+    )
     boundary_fit_reliable = bool(
         aspect_ratio <= config.boundary_max_aspect_ratio
         and rectangularity >= config.warning_min_rectangularity
         and solidity >= config.warning_min_solidity
         and side_ratio <= config.maximum_normal_side_ratio
+        # A merged multi-wafer silhouette does not identify which physical
+        # wafer crosses the slot. Keep placement fail-closed until a separate
+        # quadrilateral supplies layer-specific evidence.
+        and not stacking_boundary_ambiguous
     )
-    outside_slot = bool(boundary_crossing_observed and boundary_fit_reliable)
+    strong_boundary_crossing = bool(
+        boundary_fit_reliable
+        and minimum_slot_clearance_px <= -BOUNDARY_UNCERTAINTY_PX
+        and contour_outside_depth_px >= BOUNDARY_CONTOUR_MIN_DEPTH_PX
+        and contour_outside_support_px >= BOUNDARY_CONTOUR_MIN_SUPPORT_PX
+    )
+    reliable_contour_crossing = bool(
+        contour_outside_depth_px >= BOUNDARY_CONTOUR_MIN_DEPTH_PX
+        and contour_outside_support_px >= BOUNDARY_CONTOUR_MIN_SUPPORT_PX
+        and contour_outside_area_ratio >= BOUNDARY_CONTOUR_MIN_AREA_RATIO
+    )
+    boundary_uncertain = bool(
+        not strong_boundary_crossing
+        and (
+            minimum_slot_clearance_px <= BOUNDARY_UNCERTAINTY_PX
+            or reliable_contour_crossing
+        )
+    )
+    boundary_evidence = (
+        "strong_outside"
+        if strong_boundary_crossing
+        else "uncertain"
+        if boundary_uncertain
+        else "inside"
+    )
+    outside_slot = strong_boundary_crossing
 
     flags: list[str] = []
     severe = False
@@ -802,6 +1116,9 @@ def analyze_wafer_patch(
     if boundary_crossing_observed and not boundary_fit_reliable:
         flags.append("boundary_crossing_unconfirmed")
         warning = True
+    if boundary_uncertain:
+        flags.append("boundary_uncertain")
+        warning = True
     if outside_slot:
         flags.append("outside_slot")
         severe = True
@@ -833,6 +1150,16 @@ def analyze_wafer_patch(
         outside_slot=outside_slot,
         minimum_slot_clearance_ratio=minimum_slot_clearance_ratio,
         secondary_boxes_patch_px=secondary_boxes,
+        minimum_slot_clearance_px=minimum_slot_clearance_px,
+        contour_patch_px=tuple(
+            tuple(float(value) for value in point)
+            for point in polygon.reshape(-1, 2)
+        ),
+        contour_outside_depth_px=contour_outside_depth_px,
+        contour_outside_support_px=contour_outside_support_px,
+        contour_outside_area_ratio=contour_outside_area_ratio,
+        boundary_evidence=boundary_evidence,
+        base_boundary_crossed_sides=boundary_crossed_sides,
     )
 
 
@@ -935,25 +1262,43 @@ def analyze_dark_wafer_patch(
         1.0,
         float(config.slot_boundary_margin_ratio) * float(min(height, width)),
     )
-    clearances = np.asarray(
-        [
-            np.min(box[:, 0]) - boundary_margin,
-            float(width - 1) - boundary_margin - np.max(box[:, 0]),
-            np.min(box[:, 1]) - boundary_margin,
-            float(height - 1) - boundary_margin - np.max(box[:, 1]),
-        ],
-        dtype=np.float64,
+    (
+        minimum_clearance_px,
+        contour_outside_depth_px,
+        contour_outside_support_px,
+        contour_outside_area_ratio,
+        boundary_crossed_sides,
+    ) = _boundary_measurements(
+        primary_mask,
+        box,
+        boundary_margin=boundary_margin,
     )
     minimum_clearance = float(
-        np.min(clearances) / max(float(min(height, width)), 1.0)
+        minimum_clearance_px / max(float(min(height, width)), 1.0)
     )
-    # Otsu edges on a nearly black wafer move by a few pixels with exposure.
-    # Keep a 0.8 mm uncertainty band (0.025 of the 31 mm context) so this
-    # fallback cannot turn that segmentation jitter into a certain violation.
-    outside_slot = bool(minimum_clearance < -0.025)
+    outside_slot = bool(
+        minimum_clearance_px <= -BOUNDARY_UNCERTAINTY_PX
+        and contour_outside_depth_px >= BOUNDARY_CONTOUR_MIN_DEPTH_PX
+        and contour_outside_support_px >= BOUNDARY_CONTOUR_MIN_SUPPORT_PX
+    )
+    reliable_contour_crossing = bool(
+        contour_outside_depth_px >= BOUNDARY_CONTOUR_MIN_DEPTH_PX
+        and contour_outside_support_px >= BOUNDARY_CONTOUR_MIN_SUPPORT_PX
+        and contour_outside_area_ratio >= BOUNDARY_CONTOUR_MIN_AREA_RATIO
+    )
+    boundary_uncertain = bool(
+        not outside_slot
+        and (
+            minimum_clearance_px <= BOUNDARY_UNCERTAINTY_PX
+            or reliable_contour_crossing
+        )
+    )
     flags = ["dark_low_chroma_fallback"]
     severe = False
-    warning = False
+    # A low-chroma Otsu square is deliberately only fallback evidence.  It may
+    # support diagnostics, but must not by itself authorize a definite wafer
+    # occupancy conclusion.
+    warning = True
     if center_offset_ratio > config.normal_max_center_offset_ratio:
         flags.append("center_offset_borderline")
         warning = True
@@ -966,8 +1311,8 @@ def analyze_dark_wafer_patch(
     if outside_slot:
         flags.append("outside_slot")
         severe = True
-    elif minimum_clearance < 0.0:
-        flags.append("boundary_clearance_uncertain")
+    elif boundary_uncertain:
+        flags.append("boundary_uncertain")
         warning = True
     quality = "abnormal" if severe else "warning" if warning else "normal"
     confidence = max(
@@ -1004,14 +1349,31 @@ def analyze_dark_wafer_patch(
         outside_slot=outside_slot,
         minimum_slot_clearance_ratio=minimum_clearance,
         secondary_boxes_patch_px=(),
+        minimum_slot_clearance_px=minimum_clearance_px,
+        contour_patch_px=tuple(
+            tuple(float(value) for value in point)
+            for point in polygon.reshape(-1, 2)
+        ),
+        contour_outside_depth_px=contour_outside_depth_px,
+        contour_outside_support_px=contour_outside_support_px,
+        contour_outside_area_ratio=contour_outside_area_ratio,
+        boundary_evidence=(
+            "strong_outside" if outside_slot else "uncertain" if boundary_uncertain else "inside"
+        ),
+        base_boundary_crossed_sides=boundary_crossed_sides,
     )
 
 
 __all__ = [
+    "BOUNDARY_CONTOUR_MIN_DEPTH_PX",
+    "BOUNDARY_CONTOUR_MIN_AREA_RATIO",
+    "BOUNDARY_CONTOUR_MIN_SUPPORT_PX",
+    "BOUNDARY_UNCERTAINTY_PX",
     "DEFAULT_WAFER_QUALITY",
     "WaferObservation",
     "WaferQualityConfig",
     "analyze_dark_wafer_patch",
     "analyze_wafer_patch",
     "normalize_square_angle_deg",
+    "reconcile_projection_boundary_evidence",
 ]

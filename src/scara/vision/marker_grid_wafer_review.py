@@ -207,7 +207,11 @@ def _fit_marker_grid(
     geometry: Mapping[str, Any],
     layout: SlotMarkerLayout,
 ) -> tuple[MarkerGridFit, dict[int, Any]]:
-    observations = detect_aruco_observations(image, layout.dictionary_name)
+    # Preserve the audited 363-image review detector's largest-candidate
+    # duplicate policy. Task14/live fallback uses the safer native-first policy.
+    observations = detect_aruco_observations(
+        image, layout.dictionary_name, prefer_native=False
+    )
     slots = geometry.get("slots")
     if not isinstance(slots, Mapping):
         return _failed_fit("tray geometry does not contain slots"), observations
@@ -503,7 +507,9 @@ def _independent_states_for_review(
             "boundary_crossing_unconfirmed",
             "boundary_geometry_extrapolated",
             "boundary_clearance_uncertain",
+            "boundary_uncertain",
             "boundary_fallback_geometry_unconfirmed",
+            "dark_low_chroma_fallback",
         }:
             placement = "uncertain"
         else:
@@ -555,6 +561,17 @@ def _independent_states_for_review(
             or (
                 "multiple_components" in flags
                 and "non_square_aspect" in flags
+            )
+            or (
+                "boundary_uncertain" in flags
+                and bool(
+                    flags
+                    & {
+                        "multiple_components",
+                        "internal_overlap_edges",
+                        "irregular_outline",
+                    }
+                )
             )
         ):
             stacking = "uncertain"

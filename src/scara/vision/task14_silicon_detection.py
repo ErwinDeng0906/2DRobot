@@ -14,7 +14,7 @@ import math
 import re
 import shutil
 import traceback
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -119,6 +119,38 @@ def _numeric_summary(values: Sequence[object]) -> dict[str, Optional[float] | in
     }
 
 
+def _frame_registration_summary(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Count mutually exclusive analysis projection modes for the report."""
+
+    stage3_passed = 0
+    strict_pnp = 0
+    planar_fallback = 0
+    unavailable = 0
+    for record in records:
+        stage3 = record.get("stage3")
+        if isinstance(stage3, Mapping) and stage3.get("quality_passed") is True:
+            stage3_passed += 1
+        source = str(record.get("projection_source") or "unavailable")
+        analysis_passed = record.get("analysis_quality_passed") is True
+        if analysis_passed and source.startswith("strict_pnp"):
+            strict_pnp += 1
+        elif analysis_passed and source in {
+            "marker_grid_homography",
+            "two_outer_marker_homography",
+        }:
+            planar_fallback += 1
+        else:
+            unavailable += 1
+    return {
+        "stage3_quality_passed_frame_count": stage3_passed,
+        "strict_pnp_analysis_frame_count": strict_pnp,
+        "planar_fallback_analysis_frame_count": planar_fallback,
+        "unavailable_analysis_frame_count": unavailable,
+    }
+
+
 def _vector_median(values: Sequence[object], length: int) -> Optional[list[float]]:
     rows = []
     for value in values:
@@ -211,6 +243,70 @@ def _iter_slot_observations(
         yield record, slot_result, _slot_state(record, slot_result), exclusion_reason
 
 
+def _five_frame_group_consistency(
+    slot_name: str,
+    records: Sequence[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Summarize each stationary capture burst without hiding frame evidence."""
+
+    grouped: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for record in sorted(records, key=lambda row: int(row.get("point_sequence") or 0)):
+        capture_target = str(record.get("target_name") or "unavailable")
+        slot_result = _slot_result_from_record(record, slot_name)
+        if _observation_exclusion_reason(record, slot_name, slot_result) is not None:
+            continue
+        state = _slot_state(record, slot_result)
+        evidence = "unobservable"
+        if isinstance(slot_result, Mapping):
+            wafer = slot_result.get("wafer")
+            if isinstance(wafer, Mapping):
+                evidence = str(wafer.get("boundary_evidence") or "unobservable")
+        if evidence == "unobservable":
+            if state in _OUTSIDE_STATES:
+                evidence = "strong_outside"
+            elif state == "occupied":
+                evidence = "inside"
+        grouped[capture_target].append((state, evidence))
+
+    rows: list[dict[str, Any]] = []
+    consensus_counts: Counter[str] = Counter()
+    for capture_target in sorted(grouped):
+        observations = grouped[capture_target]
+        state_counts = Counter(state for state, _evidence in observations)
+        evidence_counts = Counter(evidence for _state, evidence in observations)
+        strong_outside_count = int(evidence_counts.get("strong_outside", 0))
+        confident_inside_count = int(
+            sum(
+                state == "occupied" and evidence == "inside"
+                for state, evidence in observations
+            )
+        )
+        empty_count = int(
+            state_counts.get("empty", 0) + state_counts.get("empty_unread_marker", 0)
+        )
+        if strong_outside_count >= 2:
+            consensus = "outside_slot"
+        elif confident_inside_count >= 3 and strong_outside_count == 0:
+            consensus = "occupied"
+        elif empty_count >= 3 and strong_outside_count == 0:
+            consensus = "empty"
+        else:
+            consensus = "warning"
+        consensus_counts[consensus] += 1
+        rows.append(
+            {
+                "capture_target": capture_target,
+                "valid_frame_count": len(observations),
+                "state_counts": dict(sorted(state_counts.items())),
+                "boundary_evidence_counts": dict(sorted(evidence_counts.items())),
+                "strong_outside_frame_count": strong_outside_count,
+                "confident_inside_frame_count": confident_inside_count,
+                "consensus": consensus,
+            }
+        )
+    return rows, dict(sorted(consensus_counts.items()))
+
+
 def summarize_task14_slot(
     target_name: str,
     known_point_T_mm: Sequence[float],
@@ -260,6 +356,9 @@ def summarize_task14_slot(
     )
     slots = [slot for _row, slot, _state, _reason in valid if isinstance(slot, Mapping)]
     wafers = [slot.get("wafer") for slot in slots if isinstance(slot.get("wafer"), Mapping)]
+    five_frame_groups, five_frame_consensus_counts = _five_frame_group_consistency(
+        target_name, ordered
+    )
     other_counts = {
         state: int(count)
         for state, count in sorted(counts.items())
@@ -294,6 +393,8 @@ def summarize_task14_slot(
             acceptable_count / max(int(expected_frames), 1)
         ),
         "baseline_passed": baseline_passed,
+        "five_frame_group_consistency": five_frame_groups,
+        "five_frame_group_consensus_counts": five_frame_consensus_counts,
         "wafer_center_T_mm_median": _vector_median(
             [slot.get("wafer_center_T_mm") for slot in slots], 3
         ),
@@ -324,6 +425,21 @@ def summarize_task14_slot(
             ),
             "contour_solidity_for_complexity_gate": _numeric_summary(
                 [wafer.get("solidity") for wafer in wafers]
+            ),
+            "base_projection_clearance_px": _numeric_summary(
+                [wafer.get("base_projection_clearance_px") for wafer in wafers]
+            ),
+            "refined_projection_clearance_px": _numeric_summary(
+                [wafer.get("refined_projection_clearance_px") for wafer in wafers]
+            ),
+            "contour_outside_depth_px": _numeric_summary(
+                [wafer.get("contour_outside_depth_px") for wafer in wafers]
+            ),
+            "contour_outside_support_px": _numeric_summary(
+                [wafer.get("contour_outside_support_px") for wafer in wafers]
+            ),
+            "projection_disagreement_px": _numeric_summary(
+                [wafer.get("projection_disagreement_px") for wafer in wafers]
             ),
         },
         "processing_errors": [
@@ -823,6 +939,14 @@ def _markdown_summary(
         "- 采集：自动曝光；36个机械臂观察点，"
         f"每点{report['scan_configuration']['frames_per_slot']}张，共{total_frames}张原图。",
         f"- 自动曝光验证：{'通过' if report['camera']['exposure']['verified_before_motion'] else '未通过'}。",
+        "- 帧定位：严格PnP分析"
+        f"{report['summary']['strict_pnp_analysis_frame_count']}张；"
+        "只读平面降级"
+        f"{report['summary']['planar_fallback_analysis_frame_count']}张；"
+        "真正不可用"
+        f"{report['summary']['unavailable_analysis_frame_count']}张。",
+        "- 安全隔离：只读平面降级帧的 `coordinate_mapping_allowed=false`、"
+        "`robot_correction_allowed=false`；不用于标定、运动、拾取锁定或世界坐标计算。",
         f"- 统计口径：每一个槽都使用全部{total_frames}张照片进行分析，而不是只使用机械臂停在该槽上方的5张。",
         "- 排除规则：机械臂正对该槽拍摄的帧按吸盘遮挡高风险排除；同时排除画面外、显式遮挡、"
         "证据不足、二维码未识别、位姿/跟踪不可用和处理异常帧。",
@@ -887,6 +1011,28 @@ def _markdown_summary(
             f"{_state_count(row, 'warning')} | {_state_count(row, 'stacked')} | "
             f"{_state_count(row, 'outside_slot')} | "
             f"{_state_count(row, 'stacked_outside_slot')} | {_exclusion_text(row)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 五帧停留组边界一致性",
+            "",
+            "- 槽外确认要求同一停留组至少2帧具有强槽外证据；槽内确认要求至少3帧确定槽内且没有强槽外帧。",
+            "- 下表只汇总预期有硅片的槽；每帧原始状态和证据仍完整保留在JSON中。",
+            "",
+            "| 槽位 | 组判槽外 | 组判槽内 | 组判警告 |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for row in normal_rows + outside_rows:
+        group_counts = row.get("five_frame_group_consensus_counts", {})
+        if not isinstance(group_counts, Mapping):
+            group_counts = {}
+        lines.append(
+            f"| {row['target_name']} | {int(group_counts.get('outside_slot', 0))} | "
+            f"{int(group_counts.get('occupied', 0))} | "
+            f"{int(group_counts.get('warning', 0))} |"
         )
 
     lines.extend(["", "## 建议参数变更", ""])
@@ -1053,6 +1199,11 @@ class Task14SiliconDetectionRuntime(QObject):
             "known_slot_center_T_mm": list(self.slot_points[target_name]),
             "stage3": None,
             "temporal_quality": None,
+            "analysis_quality_passed": False,
+            "projection_source": "unavailable",
+            "planar_registration": None,
+            "coordinate_mapping_allowed": False,
+            "robot_correction_allowed": False,
             "tray_vision_summary": None,
             "slot_results": {},
             "target_slot": None,
@@ -1080,7 +1231,36 @@ class Task14SiliconDetectionRuntime(QObject):
                 "rotation_jump_deg": tracked.rotation_jump_deg,
                 "lost_frame_count": tracked.lost_frame_count,
             }
+            strict_quality_passed = bool(
+                getattr(
+                    result,
+                    "quality_passed",
+                    record["stage3"].get("quality_passed")
+                    and tracked.accepted_by_tracker,
+                )
+            )
             record["tray_vision_summary"] = dict(result.summary)
+            record["analysis_quality_passed"] = bool(
+                getattr(result, "analysis_quality_passed", strict_quality_passed)
+            )
+            record["projection_source"] = str(
+                getattr(
+                    result,
+                    "projection_source",
+                    "strict_pnp" if strict_quality_passed else "unavailable",
+                )
+            )
+            record["planar_registration"] = (
+                None
+                if getattr(result, "planar_registration", None) is None
+                else result.planar_registration.to_json()
+            )
+            record["coordinate_mapping_allowed"] = bool(
+                getattr(result, "coordinate_mapping_allowed", strict_quality_passed)
+            )
+            record["robot_correction_allowed"] = bool(
+                getattr(result, "robot_correction_allowed", False)
+            )
             record["slot_results"] = {
                 slot.projection.slot_key: slot.to_json() for slot in result.slots
             }
@@ -1107,7 +1287,8 @@ class Task14SiliconDetectionRuntime(QObject):
             cv2.putText(
                 annotated,
                 f"TASK14 {target_name} frame {frame_index:02d}/{self.frames_per_slot:02d} "
-                f"state={state} exposure={self.exposure_mode}",
+                f"state={state} projection={record['projection_source']} "
+                f"exposure={self.exposure_mode}",
                 (12, 29),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.68,
@@ -1345,6 +1526,7 @@ class Task14SiliconDetectionRuntime(QObject):
                 summaries, expected_occupied=True
             )
             exposure = self._exposure_evidence(manifest)
+            frame_registration = _frame_registration_summary(records)
             if not ok:
                 status = "acquisition_stopped"
             elif not exposure["verified_before_motion"]:
@@ -1356,7 +1538,7 @@ class Task14SiliconDetectionRuntime(QObject):
             else:
                 status = "normal_wafers_acceptable"
             report = {
-                "schema_version": 2,
+                "schema_version": 4,
                 "status": status,
                 "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "message": str(message),
@@ -1417,6 +1599,7 @@ class Task14SiliconDetectionRuntime(QObject):
                 ),
                 "summary": {
                     "processed_frame_count": len(records),
+                    **frame_registration,
                     "total_slot_observation_count": len(records) * len(self.slot_points),
                     "valid_slot_observation_count": sum(
                         int(row["valid_observation_count"]) for row in summaries

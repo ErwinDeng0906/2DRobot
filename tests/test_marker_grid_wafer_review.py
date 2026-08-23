@@ -109,9 +109,17 @@ class MarkerGridWaferReviewTests(unittest.TestCase):
             set(self.labels["normal_slots"]),
             {slot for slot, state in states.items() if state == "occupied"},
         )
+        expected_outside = set(self.labels["outside_slots"])
         self.assertEqual(
-            set(self.labels["outside_slots"]),
-            {slot for slot, state in states.items() if state == "outside_slot"},
+            expected_outside,
+            {
+                slot
+                for slot in expected_outside
+                if states[slot] in {"outside_slot", "warning"}
+            },
+        )
+        self.assertNotIn(
+            "occupied", {states[slot] for slot in expected_outside}
         )
 
     def test_known_0805_normal_and_outside_patches_remain_distinct(self) -> None:
@@ -150,16 +158,23 @@ class MarkerGridWaferReviewTests(unittest.TestCase):
         self.assertIn("boundary_crossing_unconfirmed", observation.flags)
         self.assertFalse(observation.outside_slot)
 
-    def test_uniform_low_chroma_square_is_a_normal_fallback_candidate(self) -> None:
+    def test_uniform_low_chroma_square_is_a_warning_only_fallback_candidate(self) -> None:
         patch = np.full((192, 192, 3), 205, dtype=np.uint8)
         cv2.rectangle(patch, (49, 49), (142, 142), (35, 32, 36), -1)
         observation = analyze_dark_wafer_patch(
             patch, self.config.wafer_quality
         )
         self.assertTrue(observation.found, observation.flags)
-        self.assertEqual("normal", observation.quality, observation.flags)
+        self.assertEqual("warning", observation.quality, observation.flags)
         self.assertIn("dark_low_chroma_fallback", observation.flags)
         self.assertFalse(observation.outside_slot)
+        placement, _stacking = _independent_states_for_review(
+            observation,
+            marker_visible=False,
+            coverage=1.0,
+            minimum_coverage=0.90,
+        )
+        self.assertEqual("uncertain", placement)
 
     def test_insufficient_marker_geometry_rejects_without_coordinates(self) -> None:
         crop = self.image[:220, :220]
@@ -521,6 +536,27 @@ class MarkerGridWaferReviewTests(unittest.TestCase):
             coverage=1.0,
             minimum_coverage=0.90,
         )
+        self.assertEqual("uncertain", stacking)
+
+    def test_boundary_uncertain_composite_is_fail_closed_for_both_axes(self) -> None:
+        observation = self._wafer_observation(
+            side_ratio=0.56,
+            center_offset_ratio=0.12,
+            rectangularity=0.90,
+            solidity=0.76,
+            flags=(
+                "multiple_components",
+                "irregular_outline",
+                "boundary_uncertain",
+            ),
+        )
+        placement, stacking = _independent_states_for_review(
+            observation,
+            marker_visible=False,
+            coverage=1.0,
+            minimum_coverage=0.90,
+        )
+        self.assertEqual("uncertain", placement)
         self.assertEqual("uncertain", stacking)
 
     @staticmethod

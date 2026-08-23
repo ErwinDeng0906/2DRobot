@@ -94,6 +94,11 @@ def _slot_payload(slot: Any) -> dict[str, Any]:
         "internal_line_score": wafer.internal_line_score,
         "chromatic_fraction": wafer.chromatic_fraction,
         "minimum_slot_clearance_ratio": wafer.minimum_slot_clearance_ratio,
+        "minimum_slot_clearance_px": wafer.minimum_slot_clearance_px,
+        "contour_outside_depth_px": wafer.contour_outside_depth_px,
+        "contour_outside_support_px": wafer.contour_outside_support_px,
+        "contour_outside_area_ratio": wafer.contour_outside_area_ratio,
+        "boundary_evidence": wafer.boundary_evidence,
         "flags": list(wafer.flags),
     }
 
@@ -134,7 +139,9 @@ def _placement_consensus(evidence: list[dict[str, Any]]) -> dict[str, Any]:
             "boundary_crossing_unconfirmed",
             "boundary_geometry_extrapolated",
             "boundary_clearance_uncertain",
+            "boundary_uncertain",
             "boundary_fallback_geometry_unconfirmed",
+            "dark_low_chroma_fallback",
         }:
             continue
         boundary_samples.append((clearance, str(item["file"])))

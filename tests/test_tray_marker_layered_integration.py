@@ -48,6 +48,7 @@ from scara.vision.wafer_shape_quality import (
     DEFAULT_WAFER_QUALITY,
     WaferObservation,
     analyze_wafer_patch,
+    reconcile_projection_boundary_evidence,
 )
 
 
@@ -289,6 +290,44 @@ class WaferQualityTests(unittest.TestCase):
         self.assertTrue(result.outside_slot)
         self.assertIn("outside_slot", result.flags)
         self.assertTrue(result.to_json()["outside_slot"])
+
+    def test_subpixel_boundary_crossing_is_uncertain_not_outside(self) -> None:
+        patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(patch, (129.0, 96.0), 66.0, 0.0, _purple())
+        result = analyze_wafer_patch(patch)
+        self.assertTrue(result.found)
+        self.assertFalse(result.outside_slot)
+        self.assertEqual("uncertain", result.boundary_evidence)
+        self.assertIn("boundary_uncertain", result.flags)
+        self.assertEqual("warning", result.quality)
+        self.assertGreater(result.minimum_slot_clearance_px or 0.0, -3.0)
+
+    def test_dual_projection_uses_strong_outside_evidence_from_either_path(self) -> None:
+        refined_patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        base_patch = np.full((192, 192, 3), 185, dtype=np.uint8)
+        _draw_square(refined_patch, (122.0, 96.0), 60.0, 6.0, _purple())
+        _draw_square(base_patch, (135.0, 96.0), 60.0, 6.0, _purple())
+        refined = analyze_wafer_patch(refined_patch)
+        base = analyze_wafer_patch(base_patch)
+        self.assertEqual("inside", refined.boundary_evidence)
+        self.assertEqual("strong_outside", base.boundary_evidence)
+        result = reconcile_projection_boundary_evidence(
+            refined,
+            base=base,
+            primary_is_refined=True,
+            projection_disagreement_px=5.0,
+        )
+        self.assertTrue(result.outside_slot)
+        self.assertEqual("strong_outside", result.boundary_evidence)
+        self.assertIn("projection_boundary_disagreement", result.flags)
+        self.assertAlmostEqual(
+            base.minimum_slot_clearance_px,
+            result.base_projection_clearance_px,
+        )
+        self.assertAlmostEqual(
+            refined.minimum_slot_clearance_px,
+            result.refined_projection_clearance_px,
+        )
 
     def test_black_white_marker_is_not_a_wafer(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
@@ -587,7 +626,9 @@ class FusionFailClosedTests(unittest.TestCase):
         result = analyzer.analyze_tracked(image, tracked)
         self.assertFalse(result.quality_passed)
         self.assertEqual(result.failure_reason, "synthetic temporal jump")
-        self.assertEqual(result.slots, ())
+        self.assertTrue(result.analysis_quality_passed)
+        self.assertEqual(len(result.slots), 36)
+        self.assertEqual(result.projection_source, "strict_pnp_untracked_read_only")
         self.assertFalse(result.coordinate_mapping_allowed)
 
 

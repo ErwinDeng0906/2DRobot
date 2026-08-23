@@ -239,6 +239,72 @@ class CameraCaptureSettingTests(unittest.TestCase):
 
 
 class Task14ReportTests(unittest.TestCase):
+    def test_five_frame_group_consistency_requires_coherent_boundary_evidence(self) -> None:
+        from scara.vision.task14_silicon_detection import (
+            _five_frame_group_consistency,
+        )
+
+        records = []
+        evidence = [
+            ("occupied", "inside"),
+            ("outside_slot", "strong_outside"),
+            ("occupied", "inside"),
+            ("stacked_outside_slot", "strong_outside"),
+            ("warning", "uncertain"),
+        ]
+        for index, (state, boundary_evidence) in enumerate(evidence, start=1):
+            records.append(
+                {
+                    "point_sequence": index,
+                    "target_name": "P02",
+                    "slot_results": {
+                        "P52": {
+                            "decision": {"state": state},
+                            "wafer": {"boundary_evidence": boundary_evidence},
+                        }
+                    },
+                }
+            )
+        groups, counts = _five_frame_group_consistency("P52", records)
+        self.assertEqual(1, len(groups))
+        self.assertEqual("outside_slot", groups[0]["consensus"])
+        self.assertEqual(2, groups[0]["strong_outside_frame_count"])
+        self.assertEqual({"outside_slot": 1}, counts)
+
+    def test_frame_registration_summary_separates_three_analysis_paths(self) -> None:
+        from scara.vision.task14_silicon_detection import (
+            _frame_registration_summary,
+        )
+
+        summary = _frame_registration_summary(
+            [
+                {
+                    "stage3": {"quality_passed": True},
+                    "analysis_quality_passed": True,
+                    "projection_source": "strict_pnp_slot_marker_refined",
+                },
+                {
+                    "stage3": {"quality_passed": False},
+                    "analysis_quality_passed": True,
+                    "projection_source": "marker_grid_homography",
+                },
+                {
+                    "stage3": {"quality_passed": False},
+                    "analysis_quality_passed": False,
+                    "projection_source": "unavailable",
+                },
+            ]
+        )
+        self.assertEqual(
+            {
+                "stage3_quality_passed_frame_count": 1,
+                "strict_pnp_analysis_frame_count": 1,
+                "planar_fallback_analysis_frame_count": 1,
+                "unavailable_analysis_frame_count": 1,
+            },
+            summary,
+        )
+
     def test_each_slot_uses_all_source_frames_and_excludes_invalid_evidence(self) -> None:
         from scara.vision.task14_silicon_detection import summarize_task14_slot
 
@@ -509,7 +575,7 @@ class Task14ReportTests(unittest.TestCase):
 
             report = json.loads((output / RESULT_FILENAME).read_text(encoding="utf-8"))
             self.assertEqual("expected_wafers_acceptable", report["status"])
-            self.assertEqual(2, report["schema_version"])
+            self.assertEqual(4, report["schema_version"])
             self.assertTrue(report["camera"]["exposure"]["verified_before_motion"])
             self.assertEqual(8, report["summary"]["acceptable_normal_wafer_count"])
             self.assertEqual(8, report["summary"]["acceptable_outside_wafer_count"])

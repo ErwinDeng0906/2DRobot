@@ -1082,7 +1082,10 @@ class HandEyeDemoDialog(QDialog):
 
     def _update_slot_table(self, result: TrayVisionResult) -> None:
         """Render one complete, current TrayVision result into 36 rows."""
-        if not result.quality_passed or len(result.slots) != 36:
+        analysis_quality_passed = bool(
+            getattr(result, "analysis_quality_passed", result.quality_passed)
+        )
+        if not analysis_quality_passed or len(result.slots) != 36:
             self._set_slot_table_unavailable(
                 result.failure_reason or "当前帧未完成36槽分析"
             )
