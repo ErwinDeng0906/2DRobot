@@ -639,6 +639,7 @@ class ScaraControlWidget(QWidget):
             point_count = sum(step["type"] == "record_point" for step in task["actions"])
             photo_count = sum(step["type"] == "capture" for step in task["actions"])
             video_count = sum(step["type"] == "start_video" for step in task["actions"])
+            do_count = sum(step["type"] == "set_do" for step in task["actions"])
             self._action_file = path
             self._action_builder = build
             self._action_camera_calculator = camera_calculator
@@ -648,7 +649,8 @@ class ScaraControlWidget(QWidget):
             self._btn_import_action.setToolTip(str(path))
             self._btn_run_action.setEnabled(True)
             self._action_label.setText(
-                f"{path.name} · {point_count} 点/{photo_count} 照片/{video_count} 录像"
+                f"{path.name} · {point_count} 点/{photo_count} 照片/"
+                f"{video_count} 录像/{do_count} DO"
             )
             self._append(
                 "动作",
@@ -739,6 +741,8 @@ class ScaraControlWidget(QWidget):
         runtime_move_count = sum(
             step["type"] == "runtime_move_joints" for step in task["actions"]
         )
+        do_steps = [step for step in task["actions"] if step["type"] == "set_do"]
+        do_channels = sorted({int(step["channel"]) for step in do_steps})
         confirmation = QMessageBox(self)
         confirmation.setIcon(QMessageBox.Icon.Warning)
         confirmation.setWindowTitle("确认执行动作")
@@ -747,8 +751,10 @@ class ScaraControlWidget(QWidget):
             f"相机源：{', '.join(f'#{source}' for source in sources) or '无'}\n"
             f"记录点：{point_count}；照片：{photo_count}；录像：{video_count}\n"
             f"运行时人工确认关节运动：{runtime_move_count}\n"
+            f"DO写入：{len(do_steps)}次；通道："
+            f"{', '.join(f'DO{channel}' for channel in do_channels) or '无'}\n"
             "相机坐标：旋转相机按 Rz 计算；源1按 J1+J2 计算\n\n"
-            "动作会按脚本自动运动并直接打开所需相机源。\n"
+            "动作会按脚本自动运动、打开所需相机源并切换列出的DO。\n"
             f"输出：{output_dir}\n\n"
             "请确认机械臂位于脚本要求的起点、工作区无障碍物、速度较低，"
             "且物理急停可用。"
