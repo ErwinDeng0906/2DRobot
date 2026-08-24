@@ -106,6 +106,12 @@ class SiliconDetectionConfigTests(unittest.TestCase):
         inverted = json.loads(json.dumps(original))
         inverted["wafer_quality"]["normal_min_solidity"] = 0.4
         variants.append(inverted)
+        inverted_overlap = json.loads(json.dumps(original))
+        inverted_overlap["wafer_quality"]["stacked_candidate_min_overlap_ratio"] = 0.95
+        variants.append(inverted_overlap)
+        impossible_support = json.loads(json.dumps(original))
+        impossible_support["wafer_quality"]["stacked_l_temporal_min_support"] = 6
+        variants.append(impossible_support)
         with tempfile.TemporaryDirectory() as temporary:
             for index, payload in enumerate(variants):
                 path = Path(temporary) / f"invalid_{index}.json"

@@ -17,6 +17,7 @@ from typing import Callable, Optional, Sequence
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from scara.config.camera_config import ResolvedCameraSource, resolve_camera_sources
 from scara.controller.scara_controller import ScaraController
 from scara.file_io import atomic_write_text
 
@@ -27,6 +28,7 @@ SUPPORTED_ACTION_TYPES = {
     "move_joints",
     "runtime_move_joints",
     "move_xyzr",
+    "set_do",
     "wait",
     "capture",
     "start_video",
@@ -226,6 +228,7 @@ def normalize_action_task(raw_task: object) -> dict:
             "move_joints",
             "runtime_move_joints",
             "move_xyzr",
+            "set_do",
             "record_point",
             "operator_checkpoint",
         }:
@@ -525,6 +528,23 @@ def normalize_action_task(raw_task: object) -> dict:
                 step[key] = _finite(raw.get(key, 0.0), f"第 {index} 步 {key}")
             if not any(abs(step[key]) > 1e-12 for key in ("x_mm", "y_mm", "z_mm", "r_deg")):
                 raise ValueError(f"第 {index} 步 move_xyzr 至少要有一个非零增量")
+        elif kind == "set_do":
+            channel = raw.get("channel")
+            level = raw.get("level")
+            if (
+                isinstance(channel, bool)
+                or not isinstance(channel, int)
+                or not 1 <= channel <= 16
+            ):
+                raise ValueError(f"第 {index} 步 set_do.channel 必须是1到16的整数")
+            if (
+                isinstance(level, bool)
+                or not isinstance(level, int)
+                or level not in {0, 1}
+            ):
+                raise ValueError(f"第 {index} 步 set_do.level 必须是整数0或1")
+            step["channel"] = int(channel)
+            step["level"] = int(level)
         elif kind == "wait":
             step["seconds"] = _finite(raw.get("seconds"), f"第 {index} 步 seconds")
             if step["seconds"] < 0:
@@ -669,10 +689,19 @@ def calculate_camera_position(pose: Sequence[float], camera_model: dict) -> dict
 class CameraSourcePool:
     """Keep all required OpenCV camera sources open for one action run."""
 
-    def __init__(self, width: int = 1280, height: int = 720):
+    def __init__(
+        self,
+        width: int = 1280,
+        height: int = 720,
+        source_resolver: Callable[
+            [Sequence[int]], dict[int, ResolvedCameraSource]
+        ] = resolve_camera_sources,
+    ):
         self._width = int(width)
         self._height = int(height)
+        self._source_resolver = source_resolver
         self._captures: dict[int, object] = {}
+        self._resolved_sources: dict[int, ResolvedCameraSource] = {}
         self._cv2 = None
         self._capture_setting_reports: dict[int, dict] = {}
         self._video_sessions: dict[int, dict] = {}
@@ -783,6 +812,12 @@ class CameraSourcePool:
             for source, report in sorted(self._capture_setting_reports.items())
         }
 
+    def camera_sources_report(self) -> dict[str, dict]:
+        return {
+            str(source): row.to_json()
+            for source, row in sorted(self._resolved_sources.items())
+        }
+
     def open_sources(
         self,
         sources: Sequence[int],
@@ -793,12 +828,22 @@ class CameraSourcePool:
         except Exception as exc:
             return False, f"未安装 opencv-python: {exc}"
         self._cv2 = cv2
-        for source in sorted(set(int(value) for value in sources)):
-            cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+        requested_sources = sorted(set(int(value) for value in sources))
+        try:
+            self._resolved_sources = self._source_resolver(requested_sources)
+        except Exception as exc:
+            self.close()
+            return False, f"相机USB身份检查失败：{exc}"
+        for source in requested_sources:
+            resolved = self._resolved_sources[source]
+            cap = cv2.VideoCapture(resolved.physical_index, resolved.backend)
             if not cap.isOpened():
                 cap.release()
                 self.close()
-                return False, f"无法打开相机源#{source}"
+                return False, (
+                    f"无法打开逻辑相机源#{source}（物理Index "
+                    f"{resolved.physical_index}）"
+                )
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
             self._captures[source] = cap
@@ -806,6 +851,7 @@ class CameraSourcePool:
                 source, {"auto_exposure": True}
             )
             applied, reason = self._apply_capture_setting(source, setting)
+            self._capture_setting_reports[source]["camera"] = resolved.to_json()
             if not applied:
                 self.close()
                 return False, reason
@@ -817,7 +863,11 @@ class CameraSourcePool:
         for source in sorted(self._captures):
             if self._read_fresh_frame(source, attempts=12) is None:
                 self.close()
-                return False, f"相机源#{source}已打开，但预热后仍无法取帧"
+                resolved = self._resolved_sources[source]
+                return False, (
+                    f"逻辑相机源#{source}/物理Index {resolved.physical_index}"
+                    "已打开，但预热后仍无法取帧"
+                )
             assert self._capture_setting_reports[source]["applied"] is not None
             settled_mode = float(
                 self._captures[source].get(cv2.CAP_PROP_AUTO_EXPOSURE)
@@ -1044,6 +1094,16 @@ class ActionWorker(QThread):
         self._runtime_move_response: Optional[object] = None
         self._runtime_move_request_sequence = 0
         self._runtime_session_complete = False
+        self._declared_do_channels = sorted(
+            {
+                int(step["channel"])
+                for step in self._task["actions"]
+                if step["type"] == "set_do"
+            }
+        )
+        self._touched_do_channels: set[int] = set()
+        self._uncertain_do_channels: set[int] = set()
+        self._known_do_levels: dict[int, int] = {}
         self._repeatable = any(
             step["type"] == "operator_checkpoint"
             for step in self._task["actions"]
@@ -1052,7 +1112,12 @@ class ActionWorker(QThread):
 
     def request_stop(self) -> None:
         self._stop_requested.set()
-        self._controller.emergency_stop()
+        try:
+            self._controller.emergency_stop(
+                do_channels=list(self._declared_do_channels)
+            )
+        except TypeError:
+            self._controller.emergency_stop()
 
     def respond_operator_checkpoint(self, continue_collection: bool) -> None:
         """Release a paused checkpoint from the Qt UI thread.
@@ -1983,6 +2048,127 @@ class ActionWorker(QThread):
         ):
             raise RuntimeError(f"移动到 {step['name']} 失败")
 
+    def _set_do(self, step: dict) -> None:
+        """Synchronously write one task-owned DO and persist the evidence.
+
+        Turning an output on is fail-closed on controller connection, enable,
+        alarm and E-stop state. Turning it off is always attempted so a fault
+        cannot prevent the task from releasing an energized output.
+        """
+        channel = int(step["channel"])
+        level = int(step["level"])
+        event = {
+            "sequence": len(self._manifest.setdefault("do_events", [])) + 1,
+            "name": step["name"],
+            "requested_at": datetime.now().astimezone().isoformat(
+                timespec="milliseconds"
+            ),
+            "channel": channel,
+            "level": level,
+            "status": "requested",
+        }
+        self._manifest["do_events"].append(event)
+        self._touched_do_channels.add(channel)
+        self._uncertain_do_channels.add(channel)
+
+        if level == 1:
+            state = self._read_state(f"{step['name']} DO开启前安全检查")
+            safety = state["controller_safety"]
+            failed = []
+            if safety.get("connected") is not True:
+                failed.append("controller_connected")
+            if safety.get("effectively_enabled") is not True:
+                failed.append("controller_enabled")
+            if safety.get("estop") is True:
+                failed.append("estop_clear")
+            if safety.get("soft_estop") is True:
+                failed.append("soft_estop_clear")
+            if int(safety.get("warn", -1)) != 0 or safety.get("need_clear") is True:
+                failed.append("alarm_clear")
+            event["preflight"] = {
+                "passed": not failed,
+                "failed_gates": failed,
+                "controller_safety": safety,
+            }
+            if failed:
+                event["status"] = "rejected"
+                event["failure_reason"] = ", ".join(failed)
+                self._save_manifest()
+                raise RuntimeError(
+                    f"{step['name']} 被DO开启安全门拒绝：{', '.join(failed)}"
+                )
+
+        self._save_manifest()
+        writer = getattr(self._controller, "set_do_sync", None)
+        if not callable(writer):
+            event["status"] = "failed"
+            event["failure_reason"] = "控制器不支持同步set_do_sync"
+            self._save_manifest()
+            raise RuntimeError(f"{step['name']}：控制器不支持同步DO写入")
+        try:
+            ok, detail = writer(channel, level)
+        except Exception as exc:
+            ok, detail = False, str(exc)
+        event["completed_at"] = datetime.now().astimezone().isoformat(
+            timespec="milliseconds"
+        )
+        event["controller_message"] = str(detail or "")[:1000]
+        if not ok:
+            event["status"] = "failed"
+            self._save_manifest()
+            raise RuntimeError(
+                f"{step['name']} 写入失败：{str(detail or '未知错误')[:200]}"
+            )
+        event["status"] = "completed"
+        self._known_do_levels[channel] = level
+        self._uncertain_do_channels.discard(channel)
+        self._save_manifest()
+
+    def _cleanup_task_outputs(self, *, task_ok: bool) -> tuple[bool, str]:
+        """Clear outputs that may remain on after an interrupted task."""
+        active = {
+            channel
+            for channel, level in self._known_do_levels.items()
+            if int(level) != 0
+        }
+        cleanup_channels = sorted(active | self._uncertain_do_channels)
+        if not task_ok:
+            cleanup_channels = sorted(
+                set(cleanup_channels) | self._touched_do_channels
+            )
+        if not cleanup_channels:
+            if self._manifest:
+                self._manifest["do_cleanup"] = {
+                    "required": False,
+                    "passed": True,
+                    "channels": [],
+                }
+            return True, "not required"
+
+        cleaner = getattr(self._controller, "zero_do_channels_sync", None)
+        if not callable(cleaner):
+            ok, detail = False, "控制器不支持zero_do_channels_sync"
+        else:
+            try:
+                ok, detail = cleaner(cleanup_channels)
+            except Exception as exc:
+                ok, detail = False, str(exc)
+        if ok:
+            for channel in cleanup_channels:
+                self._known_do_levels[channel] = 0
+                self._uncertain_do_channels.discard(channel)
+        if self._manifest:
+            self._manifest["do_cleanup"] = {
+                "required": True,
+                "passed": bool(ok),
+                "channels": cleanup_channels,
+                "finished_at": datetime.now().astimezone().isoformat(
+                    timespec="milliseconds"
+                ),
+                "controller_message": str(detail or "")[:1000],
+            }
+        return bool(ok), str(detail or "")
+
     def _execute_step(self, step: dict) -> None:
         kind = step["type"]
         if kind == "assert_joints":
@@ -2001,6 +2187,8 @@ class ActionWorker(QThread):
                 should_stop=self._stop_requested.is_set,
             ):
                 raise RuntimeError(f"执行 {step['name']} 失败")
+        elif kind == "set_do":
+            self._set_do(step)
         elif kind == "wait":
             if not self._interruptible_wait(step["seconds"]):
                 raise RuntimeError("动作已取消")
@@ -2042,6 +2230,7 @@ class ActionWorker(QThread):
                 "photos": [],
                 "videos": [],
                 "runtime_moves": [],
+                "do_events": [],
             }
             if self._repeatable:
                 self._manifest["collection_mode"] = "operator_repeated_scan"
@@ -2082,6 +2271,9 @@ class ActionWorker(QThread):
                 opened, error = self._camera_pool.open_sources(
                     pool_sources,
                     effective_capture_settings,
+                )
+                self._manifest["camera_sources_resolved"] = (
+                    self._camera_pool.camera_sources_report()
                 )
                 # Persist attempted mode writes even when a driver explicitly
                 # rejects auto mode, so a stopped run contains the exact
@@ -2124,7 +2316,8 @@ class ActionWorker(QThread):
             photo_total = sum(self._photo_counts.values())
             message = (
                 f"动作完成，共记录 {len(self._manifest['points'])} 个点、"
-                f"保存 {photo_total} 张照片、{len(self._manifest['videos'])} 段录像"
+                f"保存 {photo_total} 张照片、{len(self._manifest['videos'])} 段录像、"
+                f"执行 {len(self._manifest['do_events'])} 次DO写入"
             )
         except FileExistsError:
             message = f"输出文件夹已存在：{self._output_dir}"
@@ -2139,6 +2332,13 @@ class ActionWorker(QThread):
             if self._camera_pool is not None:
                 self._camera_pool.close()
             if self._manifest:
+                cleanup_ok, cleanup_detail = self._cleanup_task_outputs(task_ok=ok)
+                if not cleanup_ok:
+                    ok = False
+                    message = (
+                        f"{message}；安全清零DO失败："
+                        f"{str(cleanup_detail or '未知错误')[:200]}"
+                    )
                 self._manifest["status"] = "completed" if ok else "stopped"
                 self._manifest["finished_at"] = datetime.now().astimezone().isoformat(
                     timespec="milliseconds"

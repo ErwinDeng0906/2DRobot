@@ -63,6 +63,9 @@ from scara.vision.silicon_detection_config import (
     preferred_silicon_detection_config_path,
     save_preferred_silicon_detection_config_path,
 )
+from scara.vision.stacking_temporal_consensus import (
+    FiveFrameLShapeStackingTracker,
+)
 from scara.vision.tray_vision_fusion import (
     DEFAULT_TRAY_VISION_FUSION,
     TrayVisionAnalyzer,
@@ -387,6 +390,9 @@ class HandEyeMonitorThread(QThread):
                 slot_layout,
                 config=tray_config,
             )
+            stacking_tracker = FiveFrameLShapeStackingTracker(
+                tray_config.wafer_quality
+            )
         except Exception as exc:  # noqa: BLE001
             self.monitor_error.emit(f"手眼计算初始化失败：{exc}")
             return
@@ -413,12 +419,14 @@ class HandEyeMonitorThread(QThread):
             if frame is None:
                 if not self.camera.isRunning():
                     self.frame_invalidated.emit("相机1未运行或已经断开")
+                    stacking_tracker.reset()
                     return
                 if (
                     not invalidation_emitted
                     and time.monotonic() - no_frame_since > 1.0
                 ):
                     self.frame_invalidated.emit("相机1画面已超过1秒未更新")
+                    stacking_tracker.reset()
                     invalidation_emitted = True
                 self.msleep(80)
                 continue
@@ -429,6 +437,7 @@ class HandEyeMonitorThread(QThread):
                     and time.monotonic() - no_frame_since > 1.0
                 ):
                     self.frame_invalidated.emit("相机1画面已超过1秒未更新")
+                    stacking_tracker.reset()
                     invalidation_emitted = True
                 self.msleep(80)
                 continue
@@ -448,6 +457,9 @@ class HandEyeMonitorThread(QThread):
                     slot_layout,
                     config=requested_tray_config,
                 )
+                stacking_tracker = FiveFrameLShapeStackingTracker(
+                    requested_tray_config.wafer_quality
+                )
                 tray_config_version = requested_tray_config_version
             robot_state: Optional[Mapping[str, Any]] = None
             if self._robot_state_provider is not None:
@@ -458,6 +470,15 @@ class HandEyeMonitorThread(QThread):
             try:
                 tracked = tracker.update(frame)
                 tray_result = tray_analyzer.analyze_tracked(frame, tracked)
+                stacking_frame_id = (
+                    frame_sequence
+                    if frame_sequence is not None
+                    else time.monotonic_ns()
+                )
+                tray_result = stacking_tracker.update(
+                    tray_result,
+                    frame_id=stacking_frame_id,
+                )
                 evaluation = evaluate_handeye_frame(
                     frame,
                     tracked,
@@ -1141,6 +1162,31 @@ class HandEyeDemoDialog(QDialog):
             if analysis.wafer.found:
                 tooltip_lines.append(
                     f"wafer confidence: {analysis.wafer.confidence:.3f}"
+                )
+            for candidate in getattr(
+                analysis.wafer, "secondary_candidates", ()
+            ):
+                candidate_state = (
+                    "accepted"
+                    if candidate.accepted
+                    else str(candidate.rejection_reason or "rejected")
+                )
+                tooltip_lines.append(
+                    f"second candidate ({candidate.source}): "
+                    f"overlap={candidate.overlap_ratio:.3f}, "
+                    f"protrusion={candidate.protrusion_depth_px:.2f}px, "
+                    f"{candidate_state}"
+                )
+            temporal = getattr(result, "stacking_temporal", {}).get(slot_name)
+            if temporal is not None:
+                jitter = temporal.max_relative_center_jitter_px
+                median_iou = temporal.median_pairwise_iou
+                tooltip_lines.append(
+                    "L-shape window: "
+                    f"{temporal.l_shape_support_count}/{temporal.window_size}, "
+                    f"status={temporal.status}, "
+                    f"jitter={'NA' if jitter is None else f'{jitter:.2f}px'}, "
+                    f"median IoU={'NA' if median_iou is None else f'{median_iou:.3f}'}"
                 )
             tooltip = "\n".join(tooltip_lines)
             background = QColor(background_hex)
