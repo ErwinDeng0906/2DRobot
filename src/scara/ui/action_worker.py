@@ -17,6 +17,7 @@ from typing import Callable, Optional, Sequence
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from scara.config.camera_config import ResolvedCameraSource, resolve_camera_sources
 from scara.controller.scara_controller import ScaraController
 from scara.file_io import atomic_write_text
 
@@ -688,10 +689,19 @@ def calculate_camera_position(pose: Sequence[float], camera_model: dict) -> dict
 class CameraSourcePool:
     """Keep all required OpenCV camera sources open for one action run."""
 
-    def __init__(self, width: int = 1280, height: int = 720):
+    def __init__(
+        self,
+        width: int = 1280,
+        height: int = 720,
+        source_resolver: Callable[
+            [Sequence[int]], dict[int, ResolvedCameraSource]
+        ] = resolve_camera_sources,
+    ):
         self._width = int(width)
         self._height = int(height)
+        self._source_resolver = source_resolver
         self._captures: dict[int, object] = {}
+        self._resolved_sources: dict[int, ResolvedCameraSource] = {}
         self._cv2 = None
         self._capture_setting_reports: dict[int, dict] = {}
         self._video_sessions: dict[int, dict] = {}
@@ -802,6 +812,12 @@ class CameraSourcePool:
             for source, report in sorted(self._capture_setting_reports.items())
         }
 
+    def camera_sources_report(self) -> dict[str, dict]:
+        return {
+            str(source): row.to_json()
+            for source, row in sorted(self._resolved_sources.items())
+        }
+
     def open_sources(
         self,
         sources: Sequence[int],
@@ -812,12 +828,22 @@ class CameraSourcePool:
         except Exception as exc:
             return False, f"未安装 opencv-python: {exc}"
         self._cv2 = cv2
-        for source in sorted(set(int(value) for value in sources)):
-            cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+        requested_sources = sorted(set(int(value) for value in sources))
+        try:
+            self._resolved_sources = self._source_resolver(requested_sources)
+        except Exception as exc:
+            self.close()
+            return False, f"相机USB身份检查失败：{exc}"
+        for source in requested_sources:
+            resolved = self._resolved_sources[source]
+            cap = cv2.VideoCapture(resolved.physical_index, resolved.backend)
             if not cap.isOpened():
                 cap.release()
                 self.close()
-                return False, f"无法打开相机源#{source}"
+                return False, (
+                    f"无法打开逻辑相机源#{source}（物理Index "
+                    f"{resolved.physical_index}）"
+                )
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
             self._captures[source] = cap
@@ -825,6 +851,7 @@ class CameraSourcePool:
                 source, {"auto_exposure": True}
             )
             applied, reason = self._apply_capture_setting(source, setting)
+            self._capture_setting_reports[source]["camera"] = resolved.to_json()
             if not applied:
                 self.close()
                 return False, reason
@@ -836,7 +863,11 @@ class CameraSourcePool:
         for source in sorted(self._captures):
             if self._read_fresh_frame(source, attempts=12) is None:
                 self.close()
-                return False, f"相机源#{source}已打开，但预热后仍无法取帧"
+                resolved = self._resolved_sources[source]
+                return False, (
+                    f"逻辑相机源#{source}/物理Index {resolved.physical_index}"
+                    "已打开，但预热后仍无法取帧"
+                )
             assert self._capture_setting_reports[source]["applied"] is not None
             settled_mode = float(
                 self._captures[source].get(cv2.CAP_PROP_AUTO_EXPOSURE)
@@ -2240,6 +2271,9 @@ class ActionWorker(QThread):
                 opened, error = self._camera_pool.open_sources(
                     pool_sources,
                     effective_capture_settings,
+                )
+                self._manifest["camera_sources_resolved"] = (
+                    self._camera_pool.camera_sources_report()
                 )
                 # Persist attempted mode writes even when a driver explicitly
                 # rejects auto mode, so a stopped run contains the exact

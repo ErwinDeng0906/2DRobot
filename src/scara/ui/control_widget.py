@@ -445,7 +445,7 @@ class ScaraControlWidget(QWidget):
         bar = QHBoxLayout()
         self._btn_cam = QPushButton("连接相机"); self._btn_cam.setObjectName("cambtn")
         self._btn_snap = QPushButton("快照"); self._btn_snap.setObjectName("cambtn")
-        self._cam_idx = QSpinBox(); self._cam_idx.setRange(0, 8); self._cam_idx.setValue(self._default_cam_index()); self._cam_idx.setPrefix("源#")
+        self._cam_idx = QSpinBox(); self._cam_idx.setRange(0, 2); self._cam_idx.setValue(self._default_cam_index()); self._cam_idx.setPrefix("逻辑源#")
         bar.addWidget(self._btn_cam); bar.addWidget(self._btn_snap); bar.addWidget(self._cam_idx)
         bar.addStretch(1)
         g.addLayout(bar)
@@ -458,18 +458,9 @@ class ScaraControlWidget(QWidget):
 
     @staticmethod
     def _default_cam_index() -> int:
-        """相机源默认值按 station_map.json 角色解析（交接 §9：index 不写死，权威源唯一）：
-        优先 `scara_j3`（J3 下移相机，装上登记后自动跟随），未登记退 `right_tray`，再退 0。
-        刻意不抛异常：映射错了顶多画面串一串，不该让整个 SCARA 页起不来。"""
-        try:
-            from orchestrator.ui.peel_camera_view import cam_index_of
-            for role in ("scara_j3", "right_tray"):
-                idx = cam_index_of(role)
-                if idx is not None:
-                    return int(idx)
-        except Exception:  # noqa: BLE001
-            pass
-        return 0
+        """Default to logical camera 1; physical indices live in local config."""
+
+        return 1
 
     def _kv_row(self, g: QVBoxLayout, key: str) -> QLabel:
         row = QHBoxLayout(); row.setSpacing(6)

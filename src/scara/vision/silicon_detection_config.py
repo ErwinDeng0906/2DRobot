@@ -113,6 +113,11 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         "irregular_outline_vertex_threshold",
         "stacked_l_temporal_window_size",
         "stacked_l_temporal_min_support",
+        "temporal_inside_window_size",
+        "temporal_inside_min_weak_contour_frames",
+        "multiview_inside_min_groups",
+        "multiview_inside_min_occupied_groups",
+        "multiview_inside_min_occupied_frames",
     ):
         values[name] = _integer(values[name], f"wafer_quality.{name}")
         if values[name] < 1:
@@ -139,6 +144,10 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         "stacked_candidate_min_overlap_ratio",
         "stacked_candidate_max_overlap_ratio",
         "stacked_l_temporal_min_pairwise_iou",
+        "temporal_inside_min_pairwise_iou",
+        "multiview_inside_max_strong_outside_group_ratio",
+        "multiview_inside_max_strong_outside_frame_ratio",
+        "multiview_outside_min_strong_outside_group_ratio",
         "slot_boundary_margin_ratio",
     }
     for name in ratio_names:
@@ -153,6 +162,11 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         "stacked_l_angle_tolerance_deg",
         "stacked_candidate_min_protrusion_px",
         "stacked_l_temporal_max_relative_center_jitter_px",
+        "temporal_inside_max_center_jitter_px",
+        "temporal_inside_max_yaw_jitter_deg",
+        "temporal_inside_projection_max_deviation_px",
+        "temporal_inside_min_projection_clearance_px",
+        "temporal_inside_base_only_min_clearance_px",
     ):
         values[name] = _finite_number(values[name], f"wafer_quality.{name}")
         if values[name] < 0.0:
@@ -182,6 +196,16 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         > values["stacked_l_temporal_window_size"]
     ):
         raise ValueError("stacked_l_temporal_min_support不能超过窗口大小")
+    if (
+        values["temporal_inside_min_weak_contour_frames"]
+        > values["temporal_inside_window_size"]
+    ):
+        raise ValueError("temporal_inside_min_weak_contour_frames不能超过窗口大小")
+    if (
+        values["multiview_inside_min_occupied_groups"]
+        > values["multiview_inside_min_groups"]
+    ):
+        raise ValueError("multiview_inside_min_occupied_groups不能超过最少多视角组数")
     return WaferQualityConfig(**values)
 
 

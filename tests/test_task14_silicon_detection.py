@@ -207,6 +207,7 @@ class CameraCaptureSettingTests(unittest.TestCase):
                 self.released = True
 
         capture = FakeCapture()
+        opened_sources = []
 
         class FakeCv2:
             CAP_DSHOW = 700
@@ -217,12 +218,26 @@ class CameraCaptureSettingTests(unittest.TestCase):
 
             @staticmethod
             def VideoCapture(_source, _backend):
+                opened_sources.append((_source, _backend))
                 return capture
 
-        pool = CameraSourcePool()
+        resolved = SimpleNamespace(
+            physical_index=42,
+            backend=700,
+            to_json=lambda: {
+                "logical_index": 1,
+                "physical_source_index": 42,
+            },
+        )
+        pool = CameraSourcePool(source_resolver=lambda _sources: {1: resolved})
         with patch.dict(sys.modules, {"cv2": FakeCv2}):
             ok, reason = pool.open_sources([1])
         self.assertTrue(ok, reason)
+        self.assertEqual([(42, 700)], opened_sources)
+        self.assertEqual(
+            42,
+            pool.camera_sources_report()["1"]["physical_source_index"],
+        )
         report = pool.capture_settings_report()["1"]["applied"]
         self.assertTrue(report["auto_mode_request_accepted"])
         self.assertTrue(report["auto_mode_effective"])
@@ -239,6 +254,103 @@ class CameraCaptureSettingTests(unittest.TestCase):
 
 
 class Task14ReportTests(unittest.TestCase):
+    @staticmethod
+    def _temporal_slot_result(state: str, *, clearance: float) -> dict:
+        strong = state == "outside_slot"
+        return {
+            "decision": {"state": state, "flags": []},
+            "wafer": {
+                "found": True,
+                "center_patch_px": [95.0, 95.0],
+                "box_patch_px": [[45.0, 45.0], [145.0, 45.0], [145.0, 145.0], [45.0, 145.0]],
+                "yaw_relative_to_tray_deg": 1.0,
+                "flags": ["outside_slot"] if strong else ["boundary_uncertain"],
+                "boundary_evidence": "strong_outside" if strong else "uncertain",
+                "base_projection_clearance_px": clearance,
+                "refined_projection_clearance_px": clearance,
+                "base_projection_boundary_evidence": "strong_outside" if strong else "inside",
+                "refined_projection_boundary_evidence": "strong_outside" if strong else "inside",
+                "base_contour_outside_depth_px": 3.0 if strong else 0.5,
+                "base_contour_outside_support_px": 10 if strong else 2,
+                "base_contour_outside_area_ratio": 0.03 if strong else 0.001,
+                "refined_contour_outside_depth_px": 3.0 if strong else 0.5,
+                "refined_contour_outside_support_px": 10 if strong else 2,
+                "refined_contour_outside_area_ratio": 0.03 if strong else 0.001,
+                "contour_outside_depth_px": 3.0 if strong else 0.5,
+                "contour_outside_support_px": 10 if strong else 2,
+                "contour_outside_area_ratio": 0.03 if strong else 0.001,
+                "secondary_candidates": [],
+            },
+        }
+
+    def test_multiview_latch_promotes_only_warning_frames(self) -> None:
+        from scara.vision.task14_silicon_detection import summarize_task14_slot
+
+        records = []
+        sequence = 0
+        for group_index, capture_target in enumerate(("P00", "P01", "P02", "P03", "P04")):
+            state = "occupied" if group_index < 2 else "warning"
+            for _frame_index in range(5):
+                sequence += 1
+                records.append(
+                    {
+                        "filename": f"1_{sequence:03d}.jpg",
+                        "point_sequence": sequence,
+                        "target_name": capture_target,
+                        "slot_results": {
+                            "P20": self._temporal_slot_result(state, clearance=6.0)
+                        },
+                    }
+                )
+        summary = summarize_task14_slot(
+            "P20",
+            (0.0, 0.0, 0.0),
+            records,
+            expected_occupied=True,
+            expected_frames=25,
+            expected_label="normal_wafer",
+        )
+        self.assertTrue(summary["temporal_inside_multiview_latch"]["authorized"])
+        self.assertEqual(15, summary["warning_promoted_to_occupied_count"])
+        self.assertEqual({"occupied": 25}, summary["temporal_effective_state_counts"])
+
+    def test_outside_dominant_multiview_latch_never_promotes_warning(self) -> None:
+        from scara.vision.task14_silicon_detection import summarize_task14_slot
+
+        records = []
+        sequence = 0
+        for group_index, capture_target in enumerate(("P00", "P01", "P02", "P03", "P04")):
+            for frame_index in range(5):
+                state = (
+                    "outside_slot"
+                    if group_index < 4 or frame_index < 3
+                    else "warning"
+                )
+                clearance = -6.0 if state == "outside_slot" else 2.5
+                sequence += 1
+                records.append(
+                    {
+                        "filename": f"1_{sequence:03d}.jpg",
+                        "point_sequence": sequence,
+                        "target_name": capture_target,
+                        "slot_results": {
+                            "P50": self._temporal_slot_result(state, clearance=clearance)
+                        },
+                    }
+                )
+        summary = summarize_task14_slot(
+            "P50",
+            (0.0, 0.0, 0.0),
+            records,
+            expected_occupied=True,
+            expected_frames=25,
+            expected_label="outside_wafer",
+        )
+        self.assertFalse(summary["temporal_inside_multiview_latch"]["authorized"])
+        self.assertEqual(0, summary["warning_promoted_to_occupied_count"])
+        self.assertEqual(2, summary["warning_promoted_to_outside_slot_count"])
+        self.assertEqual(25, summary["temporal_effective_state_counts"]["outside_slot"])
+
     def test_five_frame_group_consistency_requires_coherent_boundary_evidence(self) -> None:
         from scara.vision.task14_silicon_detection import (
             _five_frame_group_consistency,
@@ -662,7 +774,7 @@ class Task14ReportTests(unittest.TestCase):
 
             report = json.loads((output / RESULT_FILENAME).read_text(encoding="utf-8"))
             self.assertEqual("expected_wafers_acceptable", report["status"])
-            self.assertEqual(5, report["schema_version"])
+            self.assertEqual(6, report["schema_version"])
             self.assertTrue(report["camera"]["exposure"]["verified_before_motion"])
             self.assertEqual(8, report["summary"]["acceptable_normal_wafer_count"])
             self.assertEqual(8, report["summary"]["acceptable_outside_wafer_count"])
@@ -728,7 +840,7 @@ class Task14ReportTests(unittest.TestCase):
             )
             markdown = (output / SUMMARY_FILENAME).read_text(encoding="utf-8")
             self.assertIn("每一个槽都使用全部36张照片", markdown)
-            self.assertIn("| P01 | 35/36 | 0 | 35 |", markdown)
+            self.assertIn("| P01 | 35/36 | 0 | 0 | 0 | 35 |", markdown)
             self.assertIn("预期有正常硅片的8槽", markdown)
             self.assertIn("预期有槽外硅片的8槽", markdown)
             self.assertIn("预期为空槽的20槽", markdown)

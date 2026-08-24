@@ -44,6 +44,11 @@ from .tray_pose_estimator import (
 )
 from .tray_pose_tracker import TrayPoseTracker
 from .tray_vision_fusion import TrayVisionAnalyzer
+from .wafer_temporal_inside import (
+    TemporalInsideFrameEvidence,
+    evaluate_multiview_inside_latch,
+    evaluate_temporal_inside_window,
+)
 from .wafer_shape_quality import DEFAULT_WAFER_QUALITY, WaferQualityConfig
 
 
@@ -55,6 +60,8 @@ ANNOTATED_DIRECTORY = "annotated_task14"
 RAW_DIRECTORY = "raw_task14"
 MINIMUM_ACCEPTABLE_FRAME_RATE = 0.60
 MINIMUM_VALID_OBSERVATIONS_PER_SLOT = 5
+TEMPORAL_NORMAL_ACCURACY_TARGET = 0.90
+TEMPORAL_OUTSIDE_ACCURACY_FLOOR = 0.92
 
 _POINT_NAME_RE = re.compile(r"^TASK14\|(P[0-5][0-5])\|frame=(\d{2})/(\d{2})$")
 _PHOTO_NAME_RE = re.compile(r"^1_(\d+)\.jpg$", re.IGNORECASE)
@@ -272,16 +279,33 @@ def _five_frame_group_consistency(
                 evidence = "strong_outside"
             elif state == "occupied":
                 evidence = "inside"
-        l_shape_evidence = LShapeFrameEvidence(
-            frame_id=str(
-                record.get("filename")
-                or record.get("point_sequence")
-                or f"{capture_target}:{len(grouped[capture_target])}"
-            )
+        frame_id = str(
+            record.get("filename")
+            or record.get("point_sequence")
+            or f"{capture_target}:{len(grouped[capture_target])}"
+        )
+        l_shape_evidence = LShapeFrameEvidence(frame_id=frame_id)
+        inside_evidence = TemporalInsideFrameEvidence(
+            frame_id=frame_id,
+            raw_state=state,
+            found=False,
+            boundary_evidence=evidence,
         )
         if isinstance(slot_result, Mapping):
             wafer = slot_result.get("wafer")
             if isinstance(wafer, Mapping):
+                decision = slot_result.get("decision")
+                decision_flags = (
+                    decision.get("flags", ())
+                    if isinstance(decision, Mapping)
+                    else ()
+                )
+                inside_evidence = TemporalInsideFrameEvidence.from_json(
+                    frame_id,
+                    state,
+                    wafer,
+                    decision_flags=decision_flags,
+                )
                 candidates = wafer.get("secondary_candidates")
                 if isinstance(candidates, Sequence) and not isinstance(
                     candidates, (str, bytes)
@@ -318,16 +342,52 @@ def _five_frame_group_consistency(
             {
                 "state": state,
                 "evidence": evidence,
+                "frame_id": frame_id,
                 "l_shape_evidence": l_shape_evidence,
+                "temporal_inside_evidence": inside_evidence,
             }
         )
 
-    rows: list[dict[str, Any]] = []
-    consensus_counts: Counter[str] = Counter()
+    evaluated: list[dict[str, Any]] = []
     for capture_target in sorted(grouped):
         observations = grouped[capture_target]
         state_counts = Counter(str(row["state"]) for row in observations)
         evidence_counts = Counter(str(row["evidence"]) for row in observations)
+        temporal_inside = evaluate_temporal_inside_window(
+            f"{slot_name}@{capture_target}",
+            [row["temporal_inside_evidence"] for row in observations],
+            wafer_quality_config,
+        )
+        l_shape_temporal = evaluate_l_shape_window(
+            f"{slot_name}@{capture_target}",
+            [row["l_shape_evidence"] for row in observations],
+            wafer_quality_config,
+        )
+        evaluated.append(
+            {
+                "capture_target": capture_target,
+                "observations": observations,
+                "state_counts": state_counts,
+                "evidence_counts": evidence_counts,
+                "temporal_inside": temporal_inside,
+                "l_shape_temporal": l_shape_temporal,
+            }
+        )
+
+    multiview_latch = evaluate_multiview_inside_latch(
+        slot_name,
+        [row["temporal_inside"] for row in evaluated],
+        wafer_quality_config,
+    )
+    rows: list[dict[str, Any]] = []
+    consensus_counts: Counter[str] = Counter()
+    for evaluated_row in evaluated:
+        capture_target = str(evaluated_row["capture_target"])
+        observations = evaluated_row["observations"]
+        state_counts = evaluated_row["state_counts"]
+        evidence_counts = evaluated_row["evidence_counts"]
+        temporal_inside = evaluated_row["temporal_inside"]
+        temporal = evaluated_row["l_shape_temporal"]
         strong_outside_count = int(evidence_counts.get("strong_outside", 0))
         confident_inside_count = int(
             sum(
@@ -338,20 +398,73 @@ def _five_frame_group_consistency(
         empty_count = int(
             state_counts.get("empty", 0) + state_counts.get("empty_unread_marker", 0)
         )
-        temporal = evaluate_l_shape_window(
-            f"{slot_name}@{capture_target}",
-            [row["l_shape_evidence"] for row in observations],
-            wafer_quality_config,
+        promotion_authorized = bool(
+            multiview_latch.authorized
+            and temporal_inside.candidate
+            and not temporal.confirmed
         )
-        if temporal.confirmed and strong_outside_count >= 2:
+        selected_strong_outside_count = int(
+            temporal_inside.projection.strong_outside_frame_count
+            if temporal_inside.projection.reliable
+            else strong_outside_count
+        )
+        outside_dominant = bool(
+            multiview_latch.valid_group_count
+            >= int(wafer_quality_config.multiview_inside_min_groups)
+            and multiview_latch.strong_outside_group_ratio
+            >= float(
+                wafer_quality_config.multiview_outside_min_strong_outside_group_ratio
+            )
+        )
+        outside_promotion_authorized = bool(
+            outside_dominant and selected_strong_outside_count >= 2
+        )
+        frame_states: list[dict[str, Any]] = []
+        effective_state_counts: Counter[str] = Counter()
+        for observation in observations:
+            raw_state = str(observation["state"])
+            promoted_inside = bool(
+                promotion_authorized and raw_state == "warning"
+            )
+            promoted_outside = bool(
+                not promoted_inside
+                and outside_promotion_authorized
+                and raw_state == "warning"
+            )
+            effective_state = (
+                "occupied"
+                if promoted_inside
+                else "outside_slot"
+                if promoted_outside
+                else raw_state
+            )
+            effective_state_counts[effective_state] += 1
+            frame_states.append(
+                {
+                    "frame_id": str(observation["frame_id"]),
+                    "raw_state": raw_state,
+                    "temporal_effective_state": effective_state,
+                    "warning_promoted_to_occupied": promoted_inside,
+                    "warning_promoted_to_outside_slot": promoted_outside,
+                    "promotion_reason": (
+                        "five_frame_geometry_and_multiview_inside_latch"
+                        if promoted_inside
+                        else "five_frame_strong_outside_and_multiview_outside_dominance"
+                        if promoted_outside
+                        else None
+                    ),
+                }
+            )
+        effective_inside_count = int(effective_state_counts.get("occupied", 0))
+        if temporal.confirmed and selected_strong_outside_count >= 2:
             consensus = "stacked_outside_slot"
         elif temporal.confirmed:
             consensus = "stacked"
-        elif strong_outside_count >= 2:
+        elif selected_strong_outside_count >= 2:
             consensus = "outside_slot"
-        elif confident_inside_count >= 3 and strong_outside_count == 0:
+        elif effective_inside_count >= 3 and selected_strong_outside_count == 0:
             consensus = "occupied"
-        elif empty_count >= 3 and strong_outside_count == 0:
+        elif empty_count >= 3 and selected_strong_outside_count == 0:
             consensus = "empty"
         else:
             consensus = "warning"
@@ -363,7 +476,25 @@ def _five_frame_group_consistency(
                 "state_counts": dict(sorted(state_counts.items())),
                 "boundary_evidence_counts": dict(sorted(evidence_counts.items())),
                 "strong_outside_frame_count": strong_outside_count,
+                "selected_projection_strong_outside_frame_count": (
+                    selected_strong_outside_count
+                ),
                 "confident_inside_frame_count": confident_inside_count,
+                "temporal_effective_state_counts": dict(
+                    sorted(effective_state_counts.items())
+                ),
+                "warning_promoted_to_occupied_count": sum(
+                    bool(row["warning_promoted_to_occupied"])
+                    for row in frame_states
+                ),
+                "warning_promoted_to_outside_slot_count": sum(
+                    bool(row["warning_promoted_to_outside_slot"])
+                    for row in frame_states
+                ),
+                "multiview_outside_dominant": outside_dominant,
+                "frame_states": frame_states,
+                "temporal_inside_consistency": temporal_inside.to_json(),
+                "multiview_inside_latch": multiview_latch.to_json(),
                 "l_shape_temporal_consistency": temporal.to_json(),
                 "consensus": consensus,
             }
@@ -437,6 +568,54 @@ def summarize_task14_slot(
         ordered,
         wafer_quality_config=wafer_quality_config,
     )
+    effective_state_by_frame = {
+        str(frame.get("frame_id")): str(
+            frame.get("temporal_effective_state") or frame.get("raw_state")
+        )
+        for group in five_frame_groups
+        for frame in (
+            group.get("frame_states", [])
+            if isinstance(group.get("frame_states"), Sequence)
+            else []
+        )
+        if isinstance(frame, Mapping) and frame.get("frame_id") is not None
+    }
+    effective_states: list[str] = []
+    for record, _slot, state, _reason in valid:
+        frame_id = str(
+            record.get("filename")
+            or record.get("point_sequence")
+            or "unavailable"
+        )
+        effective_states.append(effective_state_by_frame.get(frame_id, state))
+    effective_counts = Counter(effective_states)
+    strict_expected_states = (
+        {"occupied"}
+        if resolved_expected_label == "normal_wafer"
+        else _OUTSIDE_STATES
+        if resolved_expected_label == "outside_wafer"
+        else _EMPTY_STATES
+    )
+    raw_strict_correct_count = sum(
+        state in strict_expected_states for state in states
+    )
+    effective_strict_correct_count = sum(
+        state in strict_expected_states for state in effective_states
+    )
+    temporal_promoted_count = sum(
+        int(group.get("warning_promoted_to_occupied_count", 0))
+        for group in five_frame_groups
+    )
+    temporal_outside_promoted_count = sum(
+        int(group.get("warning_promoted_to_outside_slot_count", 0))
+        for group in five_frame_groups
+    )
+    multiview_latch = (
+        five_frame_groups[0].get("multiview_inside_latch")
+        if five_frame_groups
+        and isinstance(five_frame_groups[0].get("multiview_inside_latch"), Mapping)
+        else None
+    )
     other_counts = {
         state: int(count)
         for state, count in sorted(counts.items())
@@ -457,8 +636,12 @@ def summarize_task14_slot(
         "exclusion_counts": dict(sorted(exclusions.items())),
         "raw_state_counts": dict(sorted(raw_counts.items())),
         "state_counts": dict(sorted(counts.items())),
+        "temporal_effective_state_counts": dict(sorted(effective_counts.items())),
         "representative_state": representative_state,
         "normal_frame_count": int(counts.get("occupied", 0)),
+        "temporal_effective_normal_frame_count": int(
+            effective_counts.get("occupied", 0)
+        ),
         "outside_frame_count": int(
             counts.get("outside_slot", 0)
             + counts.get("stacked_outside_slot", 0)
@@ -470,6 +653,21 @@ def summarize_task14_slot(
         "acceptable_frame_rate_of_expected": float(
             acceptable_count / max(int(expected_frames), 1)
         ),
+        "raw_strict_correct_frame_count": int(raw_strict_correct_count),
+        "raw_strict_accuracy_of_valid": float(
+            raw_strict_correct_count / max(len(valid), 1)
+        ),
+        "temporal_effective_strict_correct_frame_count": int(
+            effective_strict_correct_count
+        ),
+        "temporal_effective_strict_accuracy_of_valid": float(
+            effective_strict_correct_count / max(len(valid), 1)
+        ),
+        "warning_promoted_to_occupied_count": int(temporal_promoted_count),
+        "warning_promoted_to_outside_slot_count": int(
+            temporal_outside_promoted_count
+        ),
+        "temporal_inside_multiview_latch": multiview_latch,
         "baseline_passed": baseline_passed,
         "five_frame_group_consistency": five_frame_groups,
         "five_frame_group_consensus_counts": five_frame_consensus_counts,
@@ -613,6 +811,70 @@ def _group_slots_by_state(
         state = str(row.get("representative_state") or "unavailable")
         grouped.setdefault(state, []).append(str(row["target_name"]))
     return {state: sorted(names) for state, names in sorted(grouped.items())}
+
+
+def _annotate_frame_records_with_temporal_states(
+    records: Sequence[Mapping[str, Any]],
+    summaries: Sequence[Mapping[str, Any]],
+) -> None:
+    """Attach read-only effective states without overwriting raw decisions."""
+
+    by_slot_and_frame: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for summary in summaries:
+        slot_name = str(summary.get("target_name") or "")
+        groups = summary.get("five_frame_group_consistency", ())
+        if not isinstance(groups, Sequence):
+            continue
+        for group in groups:
+            if not isinstance(group, Mapping):
+                continue
+            frames = group.get("frame_states", ())
+            if not isinstance(frames, Sequence):
+                continue
+            for frame in frames:
+                if isinstance(frame, Mapping) and frame.get("frame_id") is not None:
+                    by_slot_and_frame[(slot_name, str(frame["frame_id"]))] = frame
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        frame_id = str(
+            record.get("filename")
+            or record.get("point_sequence")
+            or "unavailable"
+        )
+        slot_results = record.get("slot_results")
+        if not isinstance(slot_results, dict):
+            continue
+        for slot_name, slot_result in slot_results.items():
+            if not isinstance(slot_result, dict):
+                continue
+            decision = slot_result.get("decision")
+            raw_state = (
+                str(decision.get("state") or "unavailable")
+                if isinstance(decision, Mapping)
+                else "unavailable"
+            )
+            temporal = by_slot_and_frame.get((str(slot_name), frame_id))
+            slot_result["raw_frame_state"] = raw_state
+            slot_result["temporal_effective_state"] = (
+                str(temporal.get("temporal_effective_state") or raw_state)
+                if isinstance(temporal, Mapping)
+                else raw_state
+            )
+            slot_result["warning_promoted_to_occupied"] = bool(
+                isinstance(temporal, Mapping)
+                and temporal.get("warning_promoted_to_occupied")
+            )
+            slot_result["warning_promoted_to_outside_slot"] = bool(
+                isinstance(temporal, Mapping)
+                and temporal.get("warning_promoted_to_outside_slot")
+            )
+            slot_result["temporal_promotion_reason"] = (
+                temporal.get("promotion_reason")
+                if isinstance(temporal, Mapping)
+                else None
+            )
 
 
 def _target_wafer_flags(
@@ -1005,6 +1267,11 @@ def _state_count(row: Mapping[str, Any], state: str) -> int:
     return int(counts.get(state, 0)) if isinstance(counts, Mapping) else 0
 
 
+def _temporal_state_count(row: Mapping[str, Any], state: str) -> int:
+    counts = row.get("temporal_effective_state_counts", {})
+    return int(counts.get(state, 0)) if isinstance(counts, Mapping) else 0
+
+
 def _markdown_summary(
     report: Mapping[str, Any],
     changes: Sequence[Mapping[str, Any]],
@@ -1042,19 +1309,46 @@ def _markdown_summary(
         f"排除{report['summary']['excluded_slot_observation_count']}。",
         "- 根目录 `1_XXX.jpg` 是标注图；离线复算读取 `raw_task14/` 中的无标记原图。",
         "- 本次只生成报告和建议配置；不会自动修改正式配置，也不会根据视觉结果控制机械臂。",
+        "- `temporal_effective_state` 仅用于Task14只读报告；原始 `decision.state` 不被覆盖，也不进入实时运动、标定或拾取授权。",
         "- 槽尺寸、槽图定义和槽边界保持锁定。",
+        "- 严格正常槽准确率："
+        f"{report['summary']['raw_normal_correct_frame_count']}/"
+        f"{report['summary']['normal_valid_frame_count']}="
+        f"{100.0 * float(report['summary']['raw_normal_accuracy']):.2f}%；"
+        "五帧+多视角只读结论："
+        f"{report['summary']['temporal_normal_correct_frame_count']}/"
+        f"{report['summary']['normal_valid_frame_count']}="
+        f"{100.0 * float(report['summary']['temporal_normal_accuracy']):.2f}%。",
+        "- 严格槽外准确率："
+        f"{report['summary']['raw_outside_correct_frame_count']}/"
+        f"{report['summary']['outside_valid_frame_count']}="
+        f"{100.0 * float(report['summary']['raw_outside_accuracy']):.2f}%；"
+        "五帧+多视角只读结论："
+        f"{report['summary']['temporal_outside_correct_frame_count']}/"
+        f"{report['summary']['outside_valid_frame_count']}="
+        f"{100.0 * float(report['summary']['temporal_outside_accuracy']):.2f}%。",
+        "- warning→occupied恢复："
+        f"{report['summary']['warning_promoted_to_occupied_count']}帧；"
+        "warning→outside_slot恢复："
+        f"{report['summary']['warning_promoted_to_outside_slot_count']}帧；"
+        "槽外→occupied危险结论："
+        f"{report['summary']['raw_outside_as_occupied_count']}→"
+        f"{report['summary']['temporal_outside_as_occupied_count']}。",
         "",
         f"## 预期有正常硅片的{len(normal_rows)}槽",
         "",
-        "| 槽位 | 有效/总帧 | 正常 | 警告 | 叠片 | 槽外 | 叠片且槽外 | 被判空槽 | 排除明细 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| 槽位 | 有效/总帧 | 原始正常 | 时序正常 | 恢复 | 时序警告 | 槽外 | 叠片且槽外 | 被判空槽 | 排除明细 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in normal_rows:
         empty_count = _state_count(row, "empty")
         lines.append(
             f"| {row['target_name']} | {row['valid_observation_count']}/{total_frames} | "
-            f"{_state_count(row, 'occupied')} | {_state_count(row, 'warning')} | "
-            f"{_state_count(row, 'stacked')} | {_state_count(row, 'outside_slot')} | "
+            f"{_state_count(row, 'occupied')} | "
+            f"{_temporal_state_count(row, 'occupied')} | "
+            f"{int(row.get('warning_promoted_to_occupied_count', 0))} | "
+            f"{_temporal_state_count(row, 'warning')} | "
+            f"{_state_count(row, 'outside_slot')} | "
             f"{_state_count(row, 'stacked_outside_slot')} | {empty_count} | "
             f"{_exclusion_text(row)} |"
         )
@@ -1064,16 +1358,19 @@ def _markdown_summary(
             "",
             f"## 预期有槽外硅片的{len(outside_rows)}槽",
             "",
-            "| 槽位 | 有效/总帧 | 槽外 | 叠片且槽外 | 正常 | 警告 | 叠片 | 被判空槽 | 排除明细 |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| 槽位 | 有效/总帧 | 原始槽外 | 时序槽外 | 恢复 | 叠片且槽外 | 正常 | 时序警告 | 叠片 | 被判空槽 | 排除明细 |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
     )
     for row in outside_rows:
         lines.append(
             f"| {row['target_name']} | {row['valid_observation_count']}/{total_frames} | "
             f"{_state_count(row, 'outside_slot')} | "
+            f"{_temporal_state_count(row, 'outside_slot')} | "
+            f"{int(row.get('warning_promoted_to_outside_slot_count', 0))} | "
             f"{_state_count(row, 'stacked_outside_slot')} | "
-            f"{_state_count(row, 'occupied')} | {_state_count(row, 'warning')} | "
+            f"{_state_count(row, 'occupied')} | "
+            f"{_temporal_state_count(row, 'warning')} | "
             f"{_state_count(row, 'stacked')} | {_state_count(row, 'empty')} | "
             f"{_exclusion_text(row)} |"
         )
@@ -1105,20 +1402,29 @@ def _markdown_summary(
             "",
             "## 五帧停留组边界一致性",
             "",
-            "- 槽外确认要求同一停留组至少2帧具有强槽外证据；槽内确认要求至少3帧确定槽内且没有强槽外帧。",
+            "- 每组保留原始状态；只在五帧主框稳定、所选投影稳定、至少4帧没有连续轮廓越界且没有确认叠片时，形成槽内候选。",
+            "- 多视角安全闩至少需要5个独立停留组、2个已有确定槽内支持组和5帧确定槽内；强槽外组/帧比例均不得超过20%。未授权时绝不恢复warning。",
+            "- refined投影稳定时优先；若其跨帧不稳定才退回base。每组最多丢弃一个投影离群帧，且这种修剪结果必须由多视角安全闩授权。",
             "- L形候选必须在完整五帧中至少3帧通过重叠/外露门，且相对中心最大抖动不超过5 px、候选框两两IoU中位数不低于0.60，才确认叠片。",
             "- 下表只汇总预期有硅片的槽；每帧原始状态和证据仍完整保留在JSON中。",
             "",
-            "| 槽位 | 组判槽外 | 组判槽内 | 组判警告 | L确认叠片 | L确认叠片且槽外 |",
-            "|---|---:|---:|---:|---:|---:|",
+            "| 槽位 | 安全闩 | 强槽外组/总组 | 恢复帧 | 组判槽外 | 组判槽内 | 组判警告 | L确认叠片 | L确认叠片且槽外 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in normal_rows + outside_rows:
         group_counts = row.get("five_frame_group_consensus_counts", {})
         if not isinstance(group_counts, Mapping):
             group_counts = {}
+        latch = row.get("temporal_inside_multiview_latch")
+        latch = latch if isinstance(latch, Mapping) else {}
         lines.append(
-            f"| {row['target_name']} | {int(group_counts.get('outside_slot', 0))} | "
+            f"| {row['target_name']} | "
+            f"{'PASS' if latch.get('authorized') else 'BLOCK'} | "
+            f"{int(latch.get('strong_outside_group_count', 0))}/"
+            f"{int(latch.get('valid_group_count', 0))} | "
+            f"{int(row.get('warning_promoted_to_occupied_count', 0))} | "
+            f"{int(group_counts.get('outside_slot', 0))} | "
             f"{int(group_counts.get('occupied', 0))} | "
             f"{int(group_counts.get('warning', 0))} | "
             f"{int(group_counts.get('stacked', 0))} | "
@@ -1329,6 +1635,7 @@ class Task14SiliconDetectionRuntime(QObject):
             "temporal_quality": None,
             "analysis_quality_passed": False,
             "projection_source": "unavailable",
+            "projection_diagnostics": None,
             "planar_registration": None,
             "coordinate_mapping_allowed": False,
             "robot_correction_allowed": False,
@@ -1377,6 +1684,9 @@ class Task14SiliconDetectionRuntime(QObject):
                     "projection_source",
                     "strict_pnp" if strict_quality_passed else "unavailable",
                 )
+            )
+            record["projection_diagnostics"] = dict(
+                getattr(result, "projection_diagnostics", {})
             )
             record["planar_registration"] = (
                 None
@@ -1615,6 +1925,7 @@ class Task14SiliconDetectionRuntime(QObject):
                 )
                 for target in sorted(self.slot_points)
             ]
+            _annotate_frame_records_with_temporal_states(records, summaries)
             normal_pass = [
                 row["target_name"]
                 for row in summaries
@@ -1658,6 +1969,71 @@ class Task14SiliconDetectionRuntime(QObject):
             )
             exposure = self._exposure_evidence(manifest)
             frame_registration = _frame_registration_summary(records)
+            normal_summary_rows = [
+                row
+                for row in summaries
+                if _row_expected_label(row) == "normal_wafer"
+            ]
+            outside_summary_rows = [
+                row
+                for row in summaries
+                if _row_expected_label(row) == "outside_wafer"
+            ]
+            normal_valid_count = sum(
+                int(row["valid_observation_count"])
+                for row in normal_summary_rows
+            )
+            outside_valid_count = sum(
+                int(row["valid_observation_count"])
+                for row in outside_summary_rows
+            )
+            raw_normal_correct_count = sum(
+                int(row["raw_strict_correct_frame_count"])
+                for row in normal_summary_rows
+            )
+            temporal_normal_correct_count = sum(
+                int(row["temporal_effective_strict_correct_frame_count"])
+                for row in normal_summary_rows
+            )
+            raw_outside_correct_count = sum(
+                int(row["raw_strict_correct_frame_count"])
+                for row in outside_summary_rows
+            )
+            temporal_outside_correct_count = sum(
+                int(row["temporal_effective_strict_correct_frame_count"])
+                for row in outside_summary_rows
+            )
+            raw_normal_accuracy = float(
+                raw_normal_correct_count / max(normal_valid_count, 1)
+            )
+            temporal_normal_accuracy = float(
+                temporal_normal_correct_count / max(normal_valid_count, 1)
+            )
+            raw_outside_accuracy = float(
+                raw_outside_correct_count / max(outside_valid_count, 1)
+            )
+            temporal_outside_accuracy = float(
+                temporal_outside_correct_count / max(outside_valid_count, 1)
+            )
+            temporal_normal_accuracy_passed = bool(
+                temporal_normal_accuracy > TEMPORAL_NORMAL_ACCURACY_TARGET
+            )
+            temporal_outside_accuracy_passed = bool(
+                not outside_summary_rows
+                or temporal_outside_accuracy >= TEMPORAL_OUTSIDE_ACCURACY_FLOOR
+            )
+            raw_outside_as_occupied_count = sum(
+                int(row.get("state_counts", {}).get("occupied", 0))
+                for row in outside_summary_rows
+            )
+            temporal_outside_as_occupied_count = sum(
+                int(
+                    row.get("temporal_effective_state_counts", {}).get(
+                        "occupied", 0
+                    )
+                )
+                for row in outside_summary_rows
+            )
             if not ok:
                 status = "acquisition_stopped"
             elif not exposure["verified_before_motion"]:
@@ -1668,8 +2044,37 @@ class Task14SiliconDetectionRuntime(QObject):
                 status = "expected_wafers_acceptable"
             else:
                 status = "normal_wafers_acceptable"
+            resolved_camera = (
+                manifest.get("camera_sources_resolved", {}).get("1", {})
+                if isinstance(manifest.get("camera_sources_resolved"), Mapping)
+                else {}
+            )
+            camera_report = {
+                "logical_name": "camera1_forearm_fixed",
+                "source_index": 1,
+                "resolution": {
+                    "width": self.intrinsics.image_size[0],
+                    "height": self.intrinsics.image_size[1],
+                },
+                "exposure": exposure,
+            }
+            if isinstance(resolved_camera, Mapping) and resolved_camera:
+                camera_report.update(
+                    {
+                        "physical_source_index": resolved_camera.get(
+                            "physical_source_index"
+                        ),
+                        "configured_physical_index": resolved_camera.get(
+                            "configured_physical_index"
+                        ),
+                        "configured_index_stale": resolved_camera.get(
+                            "configured_index_stale"
+                        ),
+                        "usb_identity": resolved_camera.get("camera_identity"),
+                    }
+                )
             report = {
-                "schema_version": 5,
+                "schema_version": 6,
                 "status": status,
                 "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "message": str(message),
@@ -1677,15 +2082,7 @@ class Task14SiliconDetectionRuntime(QObject):
                     "Task14 automatic-exposure wafer-detection baseline; diagnostic only and "
                     "never used to command robot motion."
                 ),
-                "camera": {
-                    "logical_name": "camera1_forearm_fixed",
-                    "source_index": 1,
-                    "resolution": {
-                        "width": self.intrinsics.image_size[0],
-                        "height": self.intrinsics.image_size[1],
-                    },
-                    "exposure": exposure,
-                },
+                "camera": camera_report,
                 "locked_inputs": {
                     "camera_intrinsics_path": str(self.intrinsics_path.resolve()),
                     "camera_intrinsics_sha256": _sha256(self.intrinsics_path),
@@ -1724,6 +2121,12 @@ class Task14SiliconDetectionRuntime(QObject):
                     "minimum_acceptable_frame_rate": MINIMUM_ACCEPTABLE_FRAME_RATE,
                     "acceptable_normal_states": sorted(_NORMAL_STATES),
                     "acceptable_outside_states": sorted(_OUTSIDE_STATES),
+                    "temporal_normal_accuracy_target_exclusive": (
+                        TEMPORAL_NORMAL_ACCURACY_TARGET
+                    ),
+                    "temporal_outside_accuracy_floor_inclusive": (
+                        TEMPORAL_OUTSIDE_ACCURACY_FLOOR
+                    ),
                 },
                 "tuning_scope": _tuning_scope(
                     self.silicon_detection_config.fusion_config.wafer_quality
@@ -1739,6 +2142,48 @@ class Task14SiliconDetectionRuntime(QObject):
                         int(row["excluded_observation_count"]) for row in summaries
                     ),
                     "processing_error_count": sum(bool(row.get("processing_error")) for row in records),
+                    "raw_normal_correct_frame_count": raw_normal_correct_count,
+                    "temporal_normal_correct_frame_count": (
+                        temporal_normal_correct_count
+                    ),
+                    "normal_valid_frame_count": normal_valid_count,
+                    "raw_normal_accuracy": raw_normal_accuracy,
+                    "temporal_normal_accuracy": temporal_normal_accuracy,
+                    "temporal_normal_accuracy_passed": (
+                        temporal_normal_accuracy_passed
+                    ),
+                    "raw_outside_correct_frame_count": raw_outside_correct_count,
+                    "temporal_outside_correct_frame_count": (
+                        temporal_outside_correct_count
+                    ),
+                    "outside_valid_frame_count": outside_valid_count,
+                    "raw_outside_accuracy": raw_outside_accuracy,
+                    "temporal_outside_accuracy": temporal_outside_accuracy,
+                    "temporal_outside_accuracy_passed": (
+                        temporal_outside_accuracy_passed
+                    ),
+                    "warning_promoted_to_occupied_count": sum(
+                        int(row.get("warning_promoted_to_occupied_count", 0))
+                        for row in summaries
+                    ),
+                    "warning_promoted_to_outside_slot_count": sum(
+                        int(
+                            row.get(
+                                "warning_promoted_to_outside_slot_count", 0
+                            )
+                        )
+                        for row in summaries
+                    ),
+                    "raw_outside_as_occupied_count": (
+                        raw_outside_as_occupied_count
+                    ),
+                    "temporal_outside_as_occupied_count": (
+                        temporal_outside_as_occupied_count
+                    ),
+                    "dangerous_outside_as_occupied_not_increased": bool(
+                        temporal_outside_as_occupied_count
+                        <= raw_outside_as_occupied_count
+                    ),
                     "expected_normal_wafer_count": len(self.expected_normal_slots),
                     "acceptable_normal_wafer_count": len(normal_pass),
                     "acceptable_normal_wafer_slots": sorted(normal_pass),

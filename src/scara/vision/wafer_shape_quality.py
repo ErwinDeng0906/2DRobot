@@ -58,6 +58,20 @@ class WaferQualityConfig:
     stacked_l_temporal_min_support: int = 3
     stacked_l_temporal_max_relative_center_jitter_px: float = 5.0
     stacked_l_temporal_min_pairwise_iou: float = 0.60
+    temporal_inside_window_size: int = 5
+    temporal_inside_min_weak_contour_frames: int = 4
+    temporal_inside_max_center_jitter_px: float = 15.0
+    temporal_inside_max_yaw_jitter_deg: float = 5.0
+    temporal_inside_min_pairwise_iou: float = 0.80
+    temporal_inside_projection_max_deviation_px: float = 3.0
+    temporal_inside_min_projection_clearance_px: float = 0.0
+    temporal_inside_base_only_min_clearance_px: float = 3.0
+    multiview_inside_min_groups: int = 5
+    multiview_inside_min_occupied_groups: int = 2
+    multiview_inside_min_occupied_frames: int = 5
+    multiview_inside_max_strong_outside_group_ratio: float = 0.20
+    multiview_inside_max_strong_outside_frame_ratio: float = 0.20
+    multiview_outside_min_strong_outside_group_ratio: float = 0.50
     slot_boundary_margin_ratio: float = 0.161
 
 
@@ -136,6 +150,14 @@ class WaferObservation:
     boundary_evidence: str = "unobservable"
     base_projection_clearance_px: Optional[float] = None
     refined_projection_clearance_px: Optional[float] = None
+    base_projection_boundary_evidence: str = "unobservable"
+    refined_projection_boundary_evidence: str = "unobservable"
+    base_contour_outside_depth_px: Optional[float] = None
+    base_contour_outside_support_px: Optional[int] = None
+    base_contour_outside_area_ratio: Optional[float] = None
+    refined_contour_outside_depth_px: Optional[float] = None
+    refined_contour_outside_support_px: Optional[int] = None
+    refined_contour_outside_area_ratio: Optional[float] = None
     projection_disagreement_px: Optional[float] = None
     base_boundary_crossed_sides: tuple[str, ...] = ()
     refined_boundary_crossed_sides: tuple[str, ...] = ()
@@ -200,6 +222,14 @@ class WaferObservation:
             "boundary_evidence": self.boundary_evidence,
             "base_projection_clearance_px": self.base_projection_clearance_px,
             "refined_projection_clearance_px": self.refined_projection_clearance_px,
+            "base_projection_boundary_evidence": self.base_projection_boundary_evidence,
+            "refined_projection_boundary_evidence": self.refined_projection_boundary_evidence,
+            "base_contour_outside_depth_px": self.base_contour_outside_depth_px,
+            "base_contour_outside_support_px": self.base_contour_outside_support_px,
+            "base_contour_outside_area_ratio": self.base_contour_outside_area_ratio,
+            "refined_contour_outside_depth_px": self.refined_contour_outside_depth_px,
+            "refined_contour_outside_support_px": self.refined_contour_outside_support_px,
+            "refined_contour_outside_area_ratio": self.refined_contour_outside_area_ratio,
             "projection_disagreement_px": self.projection_disagreement_px,
             "base_boundary_crossed_sides": list(self.base_boundary_crossed_sides),
             "refined_boundary_crossed_sides": list(self.refined_boundary_crossed_sides),
@@ -443,6 +473,46 @@ def reconcile_projection_boundary_evidence(
             None
             if refined_observation is None
             else refined_observation.minimum_slot_clearance_px
+        ),
+        base_projection_boundary_evidence=(
+            "unobservable"
+            if base_observation is None
+            else base_observation.boundary_evidence
+        ),
+        refined_projection_boundary_evidence=(
+            "unobservable"
+            if refined_observation is None
+            else refined_observation.boundary_evidence
+        ),
+        base_contour_outside_depth_px=(
+            None
+            if base_observation is None
+            else base_observation.contour_outside_depth_px
+        ),
+        base_contour_outside_support_px=(
+            None
+            if base_observation is None
+            else base_observation.contour_outside_support_px
+        ),
+        base_contour_outside_area_ratio=(
+            None
+            if base_observation is None
+            else base_observation.contour_outside_area_ratio
+        ),
+        refined_contour_outside_depth_px=(
+            None
+            if refined_observation is None
+            else refined_observation.contour_outside_depth_px
+        ),
+        refined_contour_outside_support_px=(
+            None
+            if refined_observation is None
+            else refined_observation.contour_outside_support_px
+        ),
+        refined_contour_outside_area_ratio=(
+            None
+            if refined_observation is None
+            else refined_observation.contour_outside_area_ratio
         ),
         projection_disagreement_px=projection_disagreement_px,
         base_boundary_crossed_sides=(
