@@ -108,7 +108,12 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         values[name] = _integer(values[name], f"wafer_quality.{name}")
         if not 0 <= values[name] <= 255:
             raise ValueError(f"wafer_quality.{name}必须在0..255范围内")
-    for name in ("stacked_internal_line_count", "irregular_outline_vertex_threshold"):
+    for name in (
+        "stacked_internal_line_count",
+        "irregular_outline_vertex_threshold",
+        "stacked_l_temporal_window_size",
+        "stacked_l_temporal_min_support",
+    ):
         values[name] = _integer(values[name], f"wafer_quality.{name}")
         if values[name] < 1:
             raise ValueError(f"wafer_quality.{name}必须为正整数")
@@ -131,6 +136,9 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         "stacked_quadrilateral_min_rectangularity",
         "stacked_quadrilateral_min_solidity",
         "stacked_l_min_leg_ratio",
+        "stacked_candidate_min_overlap_ratio",
+        "stacked_candidate_max_overlap_ratio",
+        "stacked_l_temporal_min_pairwise_iou",
         "slot_boundary_margin_ratio",
     }
     for name in ratio_names:
@@ -143,6 +151,8 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         "warning_max_yaw_deg",
         "stacked_quadrilateral_max_aspect_ratio",
         "stacked_l_angle_tolerance_deg",
+        "stacked_candidate_min_protrusion_px",
+        "stacked_l_temporal_max_relative_center_jitter_px",
     ):
         values[name] = _finite_number(values[name], f"wafer_quality.{name}")
         if values[name] < 0.0:
@@ -162,6 +172,16 @@ def _wafer_quality(payload: Mapping[str, Any]) -> WaferQualityConfig:
         raise ValueError("normal_max_center_offset_ratio不能高于warning_max_center_offset_ratio")
     if values["normal_max_yaw_deg"] > values["warning_max_yaw_deg"]:
         raise ValueError("normal_max_yaw_deg不能高于warning_max_yaw_deg")
+    if (
+        values["stacked_candidate_min_overlap_ratio"]
+        > values["stacked_candidate_max_overlap_ratio"]
+    ):
+        raise ValueError("stacked_candidate_min_overlap_ratio不能高于最大重叠率")
+    if (
+        values["stacked_l_temporal_min_support"]
+        > values["stacked_l_temporal_window_size"]
+    ):
+        raise ValueError("stacked_l_temporal_min_support不能超过窗口大小")
     return WaferQualityConfig(**values)
 
 

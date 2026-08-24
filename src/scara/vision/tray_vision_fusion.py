@@ -144,6 +144,7 @@ class TrayVisionResult:
     projection_source: str = "unavailable"
     planar_registration: Optional[PlanarTrayRegistration] = None
     projection_diagnostics: dict[str, Any] = field(default_factory=dict)
+    stacking_temporal: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -167,6 +168,12 @@ class TrayVisionResult:
                 else self.planar_registration.to_json()
             ),
             "projection_diagnostics": dict(self.projection_diagnostics),
+            "stacking_temporal": {
+                str(slot_key): (
+                    value.to_json() if hasattr(value, "to_json") else value
+                )
+                for slot_key, value in sorted(self.stacking_temporal.items())
+            },
         }
 
 
@@ -566,6 +573,11 @@ class TrayVisionAnalyzer:
                     2,
                     cv2.LINE_AA,
                 )
+        l_shape_candidate = bool(
+            wafer is not None
+            and "l_shape_stacking_candidate" in wafer.flags
+            and "second_quadrilateral" not in wafer.flags
+        )
         for index, secondary_box_raw in enumerate(
             analysis.wafer_secondary_boxes_image_px,
             start=2,
@@ -582,7 +594,7 @@ class TrayVisionAnalyzer:
             )
             cv2.putText(
                 canvas,
-                f"W{index}",
+                "L?" if l_shape_candidate else f"W{index}",
                 tuple(secondary_box[0]),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,

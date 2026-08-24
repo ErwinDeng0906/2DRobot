@@ -37,6 +37,13 @@
     "stacked_quadrilateral_min_solidity": 0.86,
     "stacked_l_min_leg_ratio": 0.22,
     "stacked_l_angle_tolerance_deg": 20.0,
+    "stacked_candidate_min_overlap_ratio": 0.2,
+    "stacked_candidate_max_overlap_ratio": 0.92,
+    "stacked_candidate_min_protrusion_px": 3.0,
+    "stacked_l_temporal_window_size": 5,
+    "stacked_l_temporal_min_support": 3,
+    "stacked_l_temporal_max_relative_center_jitter_px": 5.0,
+    "stacked_l_temporal_min_pairwise_iou": 0.6,
     "slot_boundary_margin_ratio": 0.161
   },
   "slot_decision": {

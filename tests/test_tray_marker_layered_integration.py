@@ -257,28 +257,36 @@ class WaferQualityTests(unittest.TestCase):
         self.assertFalse(result.outside_slot)
         self.assertIn("boundary_crossing_unconfirmed", result.flags)
 
-    def test_l_corner_confirms_stacking_and_produces_second_outline(self) -> None:
+    def test_contained_l_corner_is_reflection_not_stacking(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
         _draw_square(patch, (78.0, 78.0), 80.0, 0.0, _purple(140, 100))
         _draw_square(patch, (112.0, 112.0), 80.0, 0.0, _purple(150, 145))
         result = analyze_wafer_patch(patch)
         self.assertTrue(result.found)
-        self.assertEqual(result.quality, "abnormal", result.flags)
-        self.assertIn("l_shaped_overlap_corner", result.flags)
-        self.assertIn("stacked_geometry_confirmed", result.flags)
-        self.assertEqual(len(result.secondary_boxes_patch_px), 1)
-        self.assertEqual(len(result.secondary_boxes_patch_px[0]), 4)
+        self.assertNotIn("l_shaped_overlap_corner", result.flags)
+        self.assertNotIn("stacked_geometry_confirmed", result.flags)
+        self.assertIn("secondary_candidate_contained_reflection", result.flags)
+        self.assertEqual(result.secondary_boxes_patch_px, ())
+        self.assertTrue(
+            any(
+                candidate.source == "l_shape"
+                and not candidate.accepted
+                and candidate.rejection_reason == "contained_reflection"
+                for candidate in result.secondary_candidates
+            )
+        )
 
-    def test_second_quadrilateral_confirms_stacking(self) -> None:
+    def test_disjoint_second_quadrilateral_is_neighbour_interference(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
         _draw_square(patch, (58.0, 96.0), 52.0, 0.0, _purple(140, 100))
         _draw_square(patch, (134.0, 96.0), 52.0, 0.0, _purple(150, 145))
         result = analyze_wafer_patch(patch)
         self.assertTrue(result.found)
-        self.assertIn("second_quadrilateral", result.flags)
-        self.assertIn("stacked_geometry_confirmed", result.flags)
-        self.assertEqual(len(result.secondary_boxes_patch_px), 1)
-        self.assertEqual(len(result.to_json()["secondary_boxes_patch_px"]), 1)
+        self.assertNotIn("second_quadrilateral", result.flags)
+        self.assertNotIn("stacked_geometry_confirmed", result.flags)
+        self.assertIn("secondary_candidate_adjacent_slot_interference", result.flags)
+        self.assertEqual(result.secondary_boxes_patch_px, ())
+        self.assertEqual(len(result.to_json()["secondary_boxes_patch_px"]), 0)
 
     def test_boundary_crossing_wafer_records_outside_slot_evidence(self) -> None:
         patch = np.full((192, 192, 3), 185, dtype=np.uint8)
@@ -484,7 +492,7 @@ class OccupancyDecisionTests(unittest.TestCase):
         self.assertFalse(contained.outside_slot)
         self.assertEqual(
             decide_slot_state(self._projection(), self._marker(), contained).state,
-            SlotState.STACKED,
+            SlotState.OCCUPIED,
         )
 
         outside_patch = np.full((192, 192, 3), 185, dtype=np.uint8)

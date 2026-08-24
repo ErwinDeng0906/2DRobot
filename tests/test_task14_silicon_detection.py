@@ -271,6 +271,93 @@ class Task14ReportTests(unittest.TestCase):
         self.assertEqual(2, groups[0]["strong_outside_frame_count"])
         self.assertEqual({"outside_slot": 1}, counts)
 
+    def test_five_frame_group_confirms_only_stable_l_shape_candidates(self) -> None:
+        from scara.vision.task14_silicon_detection import (
+            _five_frame_group_consistency,
+        )
+
+        records = []
+        candidate_box = [[40.0, 40.0], [90.0, 40.0], [90.0, 90.0], [40.0, 90.0]]
+        for index in range(1, 6):
+            candidates = []
+            if index in {1, 3, 5}:
+                candidates.append(
+                    {
+                        "source": "l_shape",
+                        "box_patch_px": candidate_box,
+                        "relative_center_offset_px": [20.0, 10.0],
+                        "accepted": True,
+                        "rejection_reason": None,
+                    }
+                )
+            records.append(
+                {
+                    "filename": f"1_{index:03d}.jpg",
+                    "point_sequence": index,
+                    "target_name": "P02",
+                    "slot_results": {
+                        "P52": {
+                            "decision": {"state": "warning"},
+                            "wafer": {
+                                "boundary_evidence": "inside",
+                                "secondary_candidates": candidates,
+                            },
+                        }
+                    },
+                }
+            )
+        groups, counts = _five_frame_group_consistency("P52", records)
+        self.assertEqual("stacked", groups[0]["consensus"])
+        temporal = groups[0]["l_shape_temporal_consistency"]
+        self.assertTrue(temporal["confirmed"])
+        self.assertEqual(3, temporal["l_shape_support_count"])
+        self.assertAlmostEqual(0.0, temporal["max_relative_center_jitter_px"])
+        self.assertAlmostEqual(1.0, temporal["median_pairwise_iou"])
+        self.assertEqual({"stacked": 1}, counts)
+
+    def test_five_frame_group_rejects_unstable_l_shape_candidates(self) -> None:
+        from scara.vision.task14_silicon_detection import (
+            _five_frame_group_consistency,
+        )
+
+        records = []
+        offsets = ([20.0, 10.0], [20.0, 10.0], [30.48, 10.0])
+        for index in range(1, 6):
+            candidates = []
+            if index <= 3:
+                candidates.append(
+                    {
+                        "source": "l_shape",
+                        "box_patch_px": [[40.0, 40.0], [90.0, 40.0], [90.0, 90.0], [40.0, 90.0]],
+                        "relative_center_offset_px": offsets[index - 1],
+                        "accepted": True,
+                        "rejection_reason": None,
+                    }
+                )
+            records.append(
+                {
+                    "filename": f"1_{index:03d}.jpg",
+                    "point_sequence": index,
+                    "target_name": "P50",
+                    "slot_results": {
+                        "P52": {
+                            "decision": {"state": "warning"},
+                            "wafer": {
+                                "boundary_evidence": "inside",
+                                "secondary_candidates": candidates,
+                            },
+                        }
+                    },
+                }
+            )
+        groups, counts = _five_frame_group_consistency("P52", records)
+        temporal = groups[0]["l_shape_temporal_consistency"]
+        self.assertFalse(temporal["confirmed"])
+        self.assertEqual("relative_center_unstable", temporal["status"])
+        self.assertAlmostEqual(10.48, temporal["max_relative_center_jitter_px"], places=2)
+        self.assertEqual("warning", groups[0]["consensus"])
+        self.assertEqual({"warning": 1}, counts)
+
     def test_frame_registration_summary_separates_three_analysis_paths(self) -> None:
         from scara.vision.task14_silicon_detection import (
             _frame_registration_summary,
@@ -575,7 +662,7 @@ class Task14ReportTests(unittest.TestCase):
 
             report = json.loads((output / RESULT_FILENAME).read_text(encoding="utf-8"))
             self.assertEqual("expected_wafers_acceptable", report["status"])
-            self.assertEqual(4, report["schema_version"])
+            self.assertEqual(5, report["schema_version"])
             self.assertTrue(report["camera"]["exposure"]["verified_before_motion"])
             self.assertEqual(8, report["summary"]["acceptable_normal_wafer_count"])
             self.assertEqual(8, report["summary"]["acceptable_outside_wafer_count"])

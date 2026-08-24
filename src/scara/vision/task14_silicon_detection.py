@@ -33,6 +33,10 @@ from .silicon_detection_config import (
     default_silicon_detection_config_path,
     load_silicon_detection_config,
 )
+from .stacking_temporal_consensus import (
+    LShapeFrameEvidence,
+    evaluate_l_shape_window,
+)
 from .tray_pose_estimator import (
     TrayBoardPoseEstimator,
     load_camera_intrinsics,
@@ -40,7 +44,7 @@ from .tray_pose_estimator import (
 )
 from .tray_pose_tracker import TrayPoseTracker
 from .tray_vision_fusion import TrayVisionAnalyzer
-from .wafer_shape_quality import WaferQualityConfig
+from .wafer_shape_quality import DEFAULT_WAFER_QUALITY, WaferQualityConfig
 
 
 RESULT_FILENAME = "task14_silicon_detection.json"
@@ -246,10 +250,12 @@ def _iter_slot_observations(
 def _five_frame_group_consistency(
     slot_name: str,
     records: Sequence[Mapping[str, Any]],
+    *,
+    wafer_quality_config: WaferQualityConfig = DEFAULT_WAFER_QUALITY,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Summarize each stationary capture burst without hiding frame evidence."""
 
-    grouped: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in sorted(records, key=lambda row: int(row.get("point_sequence") or 0)):
         capture_target = str(record.get("target_name") or "unavailable")
         slot_result = _slot_result_from_record(record, slot_name)
@@ -266,25 +272,82 @@ def _five_frame_group_consistency(
                 evidence = "strong_outside"
             elif state == "occupied":
                 evidence = "inside"
-        grouped[capture_target].append((state, evidence))
+        l_shape_evidence = LShapeFrameEvidence(
+            frame_id=str(
+                record.get("filename")
+                or record.get("point_sequence")
+                or f"{capture_target}:{len(grouped[capture_target])}"
+            )
+        )
+        if isinstance(slot_result, Mapping):
+            wafer = slot_result.get("wafer")
+            if isinstance(wafer, Mapping):
+                candidates = wafer.get("secondary_candidates")
+                if isinstance(candidates, Sequence) and not isinstance(
+                    candidates, (str, bytes)
+                ):
+                    for candidate in candidates:
+                        if not isinstance(candidate, Mapping):
+                            continue
+                        if (
+                            candidate.get("source") != "l_shape"
+                            or not bool(candidate.get("accepted"))
+                        ):
+                            continue
+                        box = candidate.get("box_patch_px")
+                        offset = candidate.get("relative_center_offset_px")
+                        if (
+                            isinstance(box, Sequence)
+                            and len(box) == 4
+                            and isinstance(offset, Sequence)
+                            and len(offset) == 2
+                        ):
+                            l_shape_evidence = LShapeFrameEvidence(
+                                frame_id=l_shape_evidence.frame_id,
+                                candidate_box_patch_px=tuple(
+                                    (float(point[0]), float(point[1]))
+                                    for point in box
+                                ),
+                                relative_center_offset_px=(
+                                    float(offset[0]),
+                                    float(offset[1]),
+                                ),
+                            )
+                        break
+        grouped[capture_target].append(
+            {
+                "state": state,
+                "evidence": evidence,
+                "l_shape_evidence": l_shape_evidence,
+            }
+        )
 
     rows: list[dict[str, Any]] = []
     consensus_counts: Counter[str] = Counter()
     for capture_target in sorted(grouped):
         observations = grouped[capture_target]
-        state_counts = Counter(state for state, _evidence in observations)
-        evidence_counts = Counter(evidence for _state, evidence in observations)
+        state_counts = Counter(str(row["state"]) for row in observations)
+        evidence_counts = Counter(str(row["evidence"]) for row in observations)
         strong_outside_count = int(evidence_counts.get("strong_outside", 0))
         confident_inside_count = int(
             sum(
-                state == "occupied" and evidence == "inside"
-                for state, evidence in observations
+                row["state"] == "occupied" and row["evidence"] == "inside"
+                for row in observations
             )
         )
         empty_count = int(
             state_counts.get("empty", 0) + state_counts.get("empty_unread_marker", 0)
         )
-        if strong_outside_count >= 2:
+        temporal = evaluate_l_shape_window(
+            f"{slot_name}@{capture_target}",
+            [row["l_shape_evidence"] for row in observations],
+            wafer_quality_config,
+        )
+        if temporal.confirmed and strong_outside_count >= 2:
+            consensus = "stacked_outside_slot"
+        elif temporal.confirmed:
+            consensus = "stacked"
+        elif strong_outside_count >= 2:
             consensus = "outside_slot"
         elif confident_inside_count >= 3 and strong_outside_count == 0:
             consensus = "occupied"
@@ -301,6 +364,7 @@ def _five_frame_group_consistency(
                 "boundary_evidence_counts": dict(sorted(evidence_counts.items())),
                 "strong_outside_frame_count": strong_outside_count,
                 "confident_inside_frame_count": confident_inside_count,
+                "l_shape_temporal_consistency": temporal.to_json(),
                 "consensus": consensus,
             }
         )
@@ -315,6 +379,7 @@ def summarize_task14_slot(
     expected_occupied: bool,
     expected_frames: int,
     expected_label: Optional[str] = None,
+    wafer_quality_config: WaferQualityConfig = DEFAULT_WAFER_QUALITY,
 ) -> dict[str, Any]:
     ordered = sorted(records, key=lambda row: int(row.get("point_sequence") or 0))
     observations = list(
@@ -356,8 +421,21 @@ def summarize_task14_slot(
     )
     slots = [slot for _row, slot, _state, _reason in valid if isinstance(slot, Mapping)]
     wafers = [slot.get("wafer") for slot in slots if isinstance(slot.get("wafer"), Mapping)]
+    secondary_candidates = [
+        candidate
+        for wafer in wafers
+        for candidate in (
+            wafer.get("secondary_candidates", [])
+            if isinstance(wafer.get("secondary_candidates"), Sequence)
+            and not isinstance(wafer.get("secondary_candidates"), (str, bytes))
+            else []
+        )
+        if isinstance(candidate, Mapping)
+    ]
     five_frame_groups, five_frame_consensus_counts = _five_frame_group_consistency(
-        target_name, ordered
+        target_name,
+        ordered,
+        wafer_quality_config=wafer_quality_config,
     )
     other_counts = {
         state: int(count)
@@ -440,6 +518,37 @@ def summarize_task14_slot(
             ),
             "projection_disagreement_px": _numeric_summary(
                 [wafer.get("projection_disagreement_px") for wafer in wafers]
+            ),
+            "secondary_candidate_overlap_ratio": _numeric_summary(
+                [candidate.get("overlap_ratio") for candidate in secondary_candidates]
+            ),
+            "secondary_candidate_protrusion_depth_px": _numeric_summary(
+                [
+                    candidate.get("protrusion_depth_px")
+                    for candidate in secondary_candidates
+                ]
+            ),
+        },
+        "secondary_candidate_diagnostics": {
+            "total_count": len(secondary_candidates),
+            "accepted_count": sum(
+                bool(candidate.get("accepted")) for candidate in secondary_candidates
+            ),
+            "source_counts": dict(
+                sorted(
+                    Counter(
+                        str(candidate.get("source") or "unknown")
+                        for candidate in secondary_candidates
+                    ).items()
+                )
+            ),
+            "rejection_reason_counts": dict(
+                sorted(
+                    Counter(
+                        str(candidate.get("rejection_reason") or "accepted")
+                        for candidate in secondary_candidates
+                    ).items()
+                )
             ),
         },
         "processing_errors": [
@@ -835,38 +944,16 @@ def _recommended_config(
     if normal_stacked:
         names = "、".join(str(row["target_name"]) for row in normal_stacked)
         if "l_shaped_overlap_corner" in stacked_flags:
-            suggest(
-                "stacked_l_min_leg_ratio",
-                round(min(0.35, float(wafer["stacked_l_min_leg_ratio"]) + 0.03), 3),
-                f"已知正常硅片{names}由L形证据误判叠片；要求更长的两条边确认第二硅片。",
-            )
-            suggest(
-                "stacked_l_angle_tolerance_deg",
-                round(max(10.0, float(wafer["stacked_l_angle_tolerance_deg"]) - 3.0), 1),
-                f"已知正常硅片{names}由反光边形成近似L角；收紧直角容差。",
+            notes.append(
+                f"已知正常硅片{names}出现L形候选；L形现在仅作单帧警告，"
+                "必须通过3/5支持、相对中心抖动和候选框IoU门槛才确认叠片，"
+                "因此不自动收紧单帧L形参数。"
             )
         if "second_quadrilateral" in stacked_flags:
-            suggest(
-                "stacked_second_quadrilateral_ratio",
-                round(
-                    min(
-                        0.35,
-                        float(wafer["stacked_second_quadrilateral_ratio"]) + 0.04,
-                    ),
-                    3,
-                ),
-                f"已知正常硅片{names}出现第二四边形误判；提高第二轮廓最小面积比例。",
-            )
-            suggest(
-                "stacked_quadrilateral_min_rectangularity",
-                round(
-                    min(
-                        0.90,
-                        float(wafer["stacked_quadrilateral_min_rectangularity"]) + 0.03,
-                    ),
-                    3,
-                ),
-                f"已知正常硅片{names}出现反光四边形；要求第二轮廓更接近真实矩形。",
+            notes.append(
+                f"已知正常硅片{names}出现第二四边形；先检查重叠率20%–92%与"
+                "至少3 canonical px外露深度诊断。矩形度门槛固定为0.72，"
+                "Task14不再因该误报自动提高矩形度。"
             )
         if not stacked_flags & {"l_shaped_overlap_corner", "second_quadrilateral"}:
             notes.append(
@@ -1019,10 +1106,11 @@ def _markdown_summary(
             "## 五帧停留组边界一致性",
             "",
             "- 槽外确认要求同一停留组至少2帧具有强槽外证据；槽内确认要求至少3帧确定槽内且没有强槽外帧。",
+            "- L形候选必须在完整五帧中至少3帧通过重叠/外露门，且相对中心最大抖动不超过5 px、候选框两两IoU中位数不低于0.60，才确认叠片。",
             "- 下表只汇总预期有硅片的槽；每帧原始状态和证据仍完整保留在JSON中。",
             "",
-            "| 槽位 | 组判槽外 | 组判槽内 | 组判警告 |",
-            "|---|---:|---:|---:|",
+            "| 槽位 | 组判槽外 | 组判槽内 | 组判警告 | L确认叠片 | L确认叠片且槽外 |",
+            "|---|---:|---:|---:|---:|---:|",
         ]
     )
     for row in normal_rows + outside_rows:
@@ -1032,8 +1120,48 @@ def _markdown_summary(
         lines.append(
             f"| {row['target_name']} | {int(group_counts.get('outside_slot', 0))} | "
             f"{int(group_counts.get('occupied', 0))} | "
-            f"{int(group_counts.get('warning', 0))} |"
+            f"{int(group_counts.get('warning', 0))} | "
+            f"{int(group_counts.get('stacked', 0))} | "
+            f"{int(group_counts.get('stacked_outside_slot', 0))} |"
         )
+
+    l_shape_group_rows: list[tuple[str, Mapping[str, Any], Mapping[str, Any]]] = []
+    for row in normal_rows + outside_rows:
+        groups = row.get("five_frame_group_consistency", [])
+        if not isinstance(groups, Sequence):
+            continue
+        for group in groups:
+            if not isinstance(group, Mapping):
+                continue
+            temporal = group.get("l_shape_temporal_consistency")
+            if (
+                isinstance(temporal, Mapping)
+                and int(temporal.get("l_shape_support_count", 0)) > 0
+            ):
+                l_shape_group_rows.append((str(row["target_name"]), group, temporal))
+    if l_shape_group_rows:
+        lines.extend(
+            [
+                "",
+                "### 含L形候选的五帧组",
+                "",
+                "| 槽位 | 拍摄停留位 | 有效帧 | L支持 | 最大相对抖动px | IoU中位数 | 状态 | 最终结论 |",
+                "|---|---|---:|---:|---:|---:|---|---|",
+            ]
+        )
+        for slot_name, group, temporal in l_shape_group_rows:
+            jitter = temporal.get("max_relative_center_jitter_px")
+            iou = temporal.get("median_pairwise_iou")
+            jitter_text = "NA" if jitter is None else f"{float(jitter):.2f}"
+            iou_text = "NA" if iou is None else f"{float(iou):.3f}"
+            lines.append(
+                f"| {slot_name} | {group.get('capture_target', 'NA')} | "
+                f"{int(temporal.get('valid_frame_count', 0))}/"
+                f"{int(temporal.get('window_size', 5))} | "
+                f"{int(temporal.get('l_shape_support_count', 0))} | "
+                f"{jitter_text} | {iou_text} | {temporal.get('status', 'NA')} | "
+                f"{group.get('consensus', 'warning')} |"
+            )
 
     lines.extend(["", "## 建议参数变更", ""])
     if changes:
@@ -1481,6 +1609,9 @@ class Task14SiliconDetectionRuntime(QObject):
                     expected_occupied=target in self.expected_wafer_slots,
                     expected_frames=expected_total_frames,
                     expected_label=self._expected_label(target),
+                    wafer_quality_config=(
+                        self.silicon_detection_config.fusion_config.wafer_quality
+                    ),
                 )
                 for target in sorted(self.slot_points)
             ]
@@ -1538,7 +1669,7 @@ class Task14SiliconDetectionRuntime(QObject):
             else:
                 status = "normal_wafers_acceptable"
             report = {
-                "schema_version": 4,
+                "schema_version": 5,
                 "status": status,
                 "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "message": str(message),
