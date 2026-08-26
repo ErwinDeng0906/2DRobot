@@ -77,6 +77,15 @@ python main.py --no-services
 
 识别参数、标注图和回归命令见 [`docs/wafer_recognition_0820_validation.md`](docs/wafer_recognition_0820_validation.md)；实时坐标链和安全门见 [`docs/wafer_transfer_runtime_integration.md`](docs/wafer_transfer_runtime_integration.md)。
 
+### 相机2到J4外参标定
+
+- `Tasks/task18_camera2_extrinsic_capture.py` 只记录静止机器人状态并拍摄相机1/2，不发送运动、J3、J4、DO或真空指令。
+- `tools/create_camera2_board_pose.py` 由人工测量的ChArUco板三个世界坐标生成 `T_W_B`。
+- `tools/analyze_camera2_extrinsics.py` 离线求解完整 `T_J4_C2`；任一观测、姿态覆盖或残差质量门失败都会拒绝安装。
+- 本流程不会将点击目标转为机器人命令，也不用单帧图像估计绝对Z。
+
+现场操作、质量门和命令见 [`docs/camera2_j4_extrinsic_calibration.md`](docs/camera2_j4_extrinsic_calibration.md)；本分支实施范围见 [`docs/camera2_guided_transfer_implementation_log.md`](docs/camera2_guided_transfer_implementation_log.md)。
+
 ## 安全提示
 
 - 首次运动务必低速（速度比例调小），急停按钮保持在手边。

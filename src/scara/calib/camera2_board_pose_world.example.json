@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "status": "unmeasured",
+  "measurement_method": "Replace with an independently measured board pose before calibration",
+  "coordinate_definition": {
+    "transform_W_B": "Maps OpenCV ChArUco board coordinates into SCARA controller world coordinates",
+    "board_origin": "Top-left outer corner of the printed ChArUco chessboard, excluding paper margin",
+    "board_x_positive": "Across the printed board from left to right when viewing its front",
+    "board_y_positive": "Down the printed board when viewing its front",
+    "board_z_positive": "board_x cross board_y; normally into a horizontal upward-facing board"
+  },
+  "board": {
+    "type": "ChArUco",
+    "squares_x": 10,
+    "squares_y": 8,
+    "square_length_mm": 18.8,
+    "marker_length_mm": 9.87,
+    "dictionary": "DICT_4X4_50",
+    "legacy_pattern": true
+  },
+  "transform_W_B": null,
+  "uncertainty": {
+    "translation_mm": null,
+    "rotation_deg": null
+  },
+  "notes": [
+    "Do not change status to measured until the physical board pose and uncertainty have been checked.",
+    "A copied identity matrix is not a calibration and will be rejected by the workflow review."
+  ]
+}
