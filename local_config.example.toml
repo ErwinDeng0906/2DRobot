@@ -36,3 +36,8 @@ allow_t2_mode = false
 robot_ip = "192.168.1.10"
 rpc_port = 7003
 armweb_base_url = "http://127.0.0.1:8080"
+
+# 相机物理Index和USB身份必须由以下工具在本机生成；不要照抄其他电脑的值：
+# conda run --no-capture-output -n scara_cvdev python tools/camera_identity_binding.py --write-current-map --mapping "0=<概览Index>,1=<前臂Index>,2=<J4Index>" --verify --preview
+# 工具会在local_config.toml末尾写入[cameras.camera0..2]。
+# 后续仅Index重排时运行：camera_identity_binding.py --refresh-indices --verify

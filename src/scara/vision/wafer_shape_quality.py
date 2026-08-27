@@ -51,6 +51,27 @@ class WaferQualityConfig:
     stacked_quadrilateral_min_solidity: float = 0.86
     stacked_l_min_leg_ratio: float = 0.22
     stacked_l_angle_tolerance_deg: float = 20.0
+    stacked_candidate_min_overlap_ratio: float = 0.20
+    stacked_candidate_max_overlap_ratio: float = 0.92
+    stacked_candidate_min_protrusion_px: float = 3.0
+    stacked_l_temporal_window_size: int = 5
+    stacked_l_temporal_min_support: int = 3
+    stacked_l_temporal_max_relative_center_jitter_px: float = 5.0
+    stacked_l_temporal_min_pairwise_iou: float = 0.60
+    temporal_inside_window_size: int = 5
+    temporal_inside_min_weak_contour_frames: int = 4
+    temporal_inside_max_center_jitter_px: float = 15.0
+    temporal_inside_max_yaw_jitter_deg: float = 5.0
+    temporal_inside_min_pairwise_iou: float = 0.80
+    temporal_inside_projection_max_deviation_px: float = 3.0
+    temporal_inside_min_projection_clearance_px: float = 0.0
+    temporal_inside_base_only_min_clearance_px: float = 3.0
+    multiview_inside_min_groups: int = 5
+    multiview_inside_min_occupied_groups: int = 2
+    multiview_inside_min_occupied_frames: int = 5
+    multiview_inside_max_strong_outside_group_ratio: float = 0.20
+    multiview_inside_max_strong_outside_frame_ratio: float = 0.20
+    multiview_outside_min_strong_outside_group_ratio: float = 0.50
     slot_boundary_margin_ratio: float = 0.161
 
 
@@ -65,6 +86,36 @@ BOUNDARY_UNCERTAINTY_PX = 3.0
 BOUNDARY_CONTOUR_MIN_DEPTH_PX = 2.0
 BOUNDARY_CONTOUR_MIN_SUPPORT_PX = 8
 BOUNDARY_CONTOUR_MIN_AREA_RATIO = 0.015
+
+
+@dataclass(frozen=True)
+class SecondaryWaferCandidate:
+    """One observed or inferred second-wafer outline with fail-closed gates."""
+
+    source: str
+    box_patch_px: tuple[tuple[float, float], ...]
+    rectangularity: Optional[float]
+    solidity: Optional[float]
+    aspect_ratio: Optional[float]
+    overlap_ratio: float
+    protrusion_depth_px: float
+    relative_center_offset_px: tuple[float, float]
+    accepted: bool
+    rejection_reason: Optional[str]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "box_patch_px": [list(point) for point in self.box_patch_px],
+            "rectangularity": self.rectangularity,
+            "solidity": self.solidity,
+            "aspect_ratio": self.aspect_ratio,
+            "overlap_ratio": self.overlap_ratio,
+            "protrusion_depth_px": self.protrusion_depth_px,
+            "relative_center_offset_px": list(self.relative_center_offset_px),
+            "accepted": self.accepted,
+            "rejection_reason": self.rejection_reason,
+        }
 
 
 @dataclass(frozen=True)
@@ -99,9 +150,18 @@ class WaferObservation:
     boundary_evidence: str = "unobservable"
     base_projection_clearance_px: Optional[float] = None
     refined_projection_clearance_px: Optional[float] = None
+    base_projection_boundary_evidence: str = "unobservable"
+    refined_projection_boundary_evidence: str = "unobservable"
+    base_contour_outside_depth_px: Optional[float] = None
+    base_contour_outside_support_px: Optional[int] = None
+    base_contour_outside_area_ratio: Optional[float] = None
+    refined_contour_outside_depth_px: Optional[float] = None
+    refined_contour_outside_support_px: Optional[int] = None
+    refined_contour_outside_area_ratio: Optional[float] = None
     projection_disagreement_px: Optional[float] = None
     base_boundary_crossed_sides: tuple[str, ...] = ()
     refined_boundary_crossed_sides: tuple[str, ...] = ()
+    secondary_candidates: tuple[SecondaryWaferCandidate, ...] = ()
 
     @classmethod
     def not_found(
@@ -162,12 +222,23 @@ class WaferObservation:
             "boundary_evidence": self.boundary_evidence,
             "base_projection_clearance_px": self.base_projection_clearance_px,
             "refined_projection_clearance_px": self.refined_projection_clearance_px,
+            "base_projection_boundary_evidence": self.base_projection_boundary_evidence,
+            "refined_projection_boundary_evidence": self.refined_projection_boundary_evidence,
+            "base_contour_outside_depth_px": self.base_contour_outside_depth_px,
+            "base_contour_outside_support_px": self.base_contour_outside_support_px,
+            "base_contour_outside_area_ratio": self.base_contour_outside_area_ratio,
+            "refined_contour_outside_depth_px": self.refined_contour_outside_depth_px,
+            "refined_contour_outside_support_px": self.refined_contour_outside_support_px,
+            "refined_contour_outside_area_ratio": self.refined_contour_outside_area_ratio,
             "projection_disagreement_px": self.projection_disagreement_px,
             "base_boundary_crossed_sides": list(self.base_boundary_crossed_sides),
             "refined_boundary_crossed_sides": list(self.refined_boundary_crossed_sides),
             "secondary_boxes_patch_px": [
                 [list(point) for point in box]
                 for box in self.secondary_boxes_patch_px
+            ],
+            "secondary_candidates": [
+                candidate.to_json() for candidate in self.secondary_candidates
             ],
         }
 
@@ -402,6 +473,46 @@ def reconcile_projection_boundary_evidence(
             None
             if refined_observation is None
             else refined_observation.minimum_slot_clearance_px
+        ),
+        base_projection_boundary_evidence=(
+            "unobservable"
+            if base_observation is None
+            else base_observation.boundary_evidence
+        ),
+        refined_projection_boundary_evidence=(
+            "unobservable"
+            if refined_observation is None
+            else refined_observation.boundary_evidence
+        ),
+        base_contour_outside_depth_px=(
+            None
+            if base_observation is None
+            else base_observation.contour_outside_depth_px
+        ),
+        base_contour_outside_support_px=(
+            None
+            if base_observation is None
+            else base_observation.contour_outside_support_px
+        ),
+        base_contour_outside_area_ratio=(
+            None
+            if base_observation is None
+            else base_observation.contour_outside_area_ratio
+        ),
+        refined_contour_outside_depth_px=(
+            None
+            if refined_observation is None
+            else refined_observation.contour_outside_depth_px
+        ),
+        refined_contour_outside_support_px=(
+            None
+            if refined_observation is None
+            else refined_observation.contour_outside_support_px
+        ),
+        refined_contour_outside_area_ratio=(
+            None
+            if refined_observation is None
+            else refined_observation.contour_outside_area_ratio
         ),
         projection_disagreement_px=projection_disagreement_px,
         base_boundary_crossed_sides=(
@@ -819,7 +930,14 @@ def _second_quadrilateral_box(
     primary_area: float,
     side_px: float,
     config: WaferQualityConfig,
-) -> Optional[tuple[tuple[float, float], ...]]:
+) -> Optional[
+    tuple[
+        tuple[tuple[float, float], ...],
+        float,
+        float,
+        float,
+    ]
+]:
     """Return a separate square-like chromatic component, never a thin glare split."""
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if count <= 2:
@@ -829,7 +947,15 @@ def _second_quadrilateral_box(
         for label in range(count)
     ]
     primary_label = int(np.argmax(overlap_by_label))
-    candidates: list[tuple[float, tuple[tuple[float, float], ...]]] = []
+    candidates: list[
+        tuple[
+            float,
+            tuple[tuple[float, float], ...],
+            float,
+            float,
+            float,
+        ]
+    ] = []
     for label in range(1, count):
         if label == primary_label:
             continue
@@ -860,11 +986,76 @@ def _second_quadrilateral_box(
             continue
         box = cv2.boxPoints(rect).astype(np.float64)
         serialized = tuple(tuple(float(value) for value in point) for point in box)
-        candidates.append((area, serialized))
+        candidates.append(
+            (area, serialized, rectangularity, solidity, aspect)
+        )
     if not candidates:
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    _area, box, rectangularity, solidity, aspect = candidates[0]
+    return box, rectangularity, solidity, aspect
+
+
+def _secondary_candidate_geometry(
+    source: str,
+    box: tuple[tuple[float, float], ...],
+    primary_box: np.ndarray,
+    config: WaferQualityConfig,
+    *,
+    rectangularity: Optional[float] = None,
+    solidity: Optional[float] = None,
+    aspect_ratio: Optional[float] = None,
+) -> SecondaryWaferCandidate:
+    """Measure candidate overlap in canonical pixels and classify it safely."""
+
+    primary = np.asarray(primary_box, dtype=np.float32).reshape(4, 2)
+    secondary = np.asarray(box, dtype=np.float32).reshape(4, 2)
+    secondary_area = max(abs(float(cv2.contourArea(secondary))), 1.0)
+    intersection_area, _intersection = cv2.intersectConvexConvex(
+        cv2.convexHull(primary),
+        cv2.convexHull(secondary),
+    )
+    overlap_ratio = float(intersection_area / secondary_area)
+    signed_distances = [
+        float(
+            cv2.pointPolygonTest(
+                primary,
+                (float(point[0]), float(point[1])),
+                True,
+            )
+        )
+        for point in secondary
+    ]
+    protrusion_depth_px = max(0.0, -min(signed_distances, default=0.0))
+    relative_center = np.mean(secondary, axis=0) - np.mean(primary, axis=0)
+
+    rejection_reason: Optional[str] = None
+    if overlap_ratio < float(config.stacked_candidate_min_overlap_ratio):
+        rejection_reason = "adjacent_slot_interference"
+    elif overlap_ratio > float(config.stacked_candidate_max_overlap_ratio):
+        rejection_reason = "contained_reflection"
+    elif protrusion_depth_px < float(config.stacked_candidate_min_protrusion_px):
+        rejection_reason = "insufficient_protrusion"
+
+    return SecondaryWaferCandidate(
+        source=str(source),
+        box_patch_px=tuple(
+            tuple(float(value) for value in point) for point in secondary
+        ),
+        rectangularity=(
+            None if rectangularity is None else float(rectangularity)
+        ),
+        solidity=None if solidity is None else float(solidity),
+        aspect_ratio=None if aspect_ratio is None else float(aspect_ratio),
+        overlap_ratio=float(overlap_ratio),
+        protrusion_depth_px=float(protrusion_depth_px),
+        relative_center_offset_px=(
+            float(relative_center[0]),
+            float(relative_center[1]),
+        ),
+        accepted=rejection_reason is None,
+        rejection_reason=rejection_reason,
+    )
 
 
 def analyze_wafer_patch(
@@ -974,18 +1165,55 @@ def analyze_wafer_patch(
         max(short_side, long_side),
         config,
     )
-    second_quadrilateral_box = _second_quadrilateral_box(
+    second_quadrilateral_raw = _second_quadrilateral_box(
         mask,
         diagnostic_primary_mask,
         area,
         max(short_side, long_side),
         config,
     )
+    secondary_candidates_list: list[SecondaryWaferCandidate] = []
+    second_quadrilateral_candidate: Optional[SecondaryWaferCandidate] = None
+    if second_quadrilateral_raw is not None:
+        (
+            second_quadrilateral_box,
+            second_quadrilateral_rectangularity,
+            second_quadrilateral_solidity,
+            second_quadrilateral_aspect,
+        ) = second_quadrilateral_raw
+        second_quadrilateral_candidate = _secondary_candidate_geometry(
+            "second_quadrilateral",
+            second_quadrilateral_box,
+            box,
+            config,
+            rectangularity=second_quadrilateral_rectangularity,
+            solidity=second_quadrilateral_solidity,
+            aspect_ratio=second_quadrilateral_aspect,
+        )
+        secondary_candidates_list.append(second_quadrilateral_candidate)
+    l_shaped_candidate: Optional[SecondaryWaferCandidate] = None
+    if l_shaped_box is not None:
+        l_shaped_candidate = _secondary_candidate_geometry(
+            "l_shape",
+            l_shaped_box,
+            box,
+            config,
+        )
+        secondary_candidates_list.append(l_shaped_candidate)
+    accepted_second_quadrilateral = bool(
+        second_quadrilateral_candidate is not None
+        and second_quadrilateral_candidate.accepted
+    )
+    accepted_l_shape = bool(
+        l_shaped_candidate is not None and l_shaped_candidate.accepted
+    )
     secondary_boxes: tuple[tuple[tuple[float, float], ...], ...] = ()
-    if second_quadrilateral_box is not None:
-        secondary_boxes = (second_quadrilateral_box,)
-    elif l_shaped_box is not None:
-        secondary_boxes = (l_shaped_box,)
+    if accepted_second_quadrilateral:
+        assert second_quadrilateral_candidate is not None
+        secondary_boxes = (second_quadrilateral_candidate.box_patch_px,)
+    elif accepted_l_shape:
+        assert l_shaped_candidate is not None
+        secondary_boxes = (l_shaped_candidate.box_patch_px,)
     boundary_margin = max(
         1.0,
         float(config.slot_boundary_margin_ratio) * float(min(height, width)),
@@ -1097,13 +1325,20 @@ def analyze_wafer_patch(
         flags.append("multiple_components")
     if internal_count >= config.stacked_internal_line_count and internal_score >= config.stacked_internal_line_score:
         flags.append("internal_overlap_edges")
-    if l_shaped_box is not None:
+    if accepted_l_shape:
         flags.append("l_shaped_overlap_corner")
-    if second_quadrilateral_box is not None:
+        flags.append("l_shape_stacking_candidate")
+        warning = True
+    if accepted_second_quadrilateral:
         flags.append("second_quadrilateral")
-    if secondary_boxes:
         flags.append("stacked_geometry_confirmed")
         severe = True
+    for candidate in secondary_candidates_list:
+        if candidate.accepted or candidate.rejection_reason is None:
+            continue
+        flags.append(
+            "secondary_candidate_" + candidate.rejection_reason
+        )
     if (
         len(polygon) > config.irregular_outline_vertex_threshold
         and solidity < config.irregular_outline_max_solidity
@@ -1160,6 +1395,7 @@ def analyze_wafer_patch(
         contour_outside_area_ratio=contour_outside_area_ratio,
         boundary_evidence=boundary_evidence,
         base_boundary_crossed_sides=boundary_crossed_sides,
+        secondary_candidates=tuple(secondary_candidates_list),
     )
 
 
@@ -1370,6 +1606,7 @@ __all__ = [
     "BOUNDARY_CONTOUR_MIN_SUPPORT_PX",
     "BOUNDARY_UNCERTAINTY_PX",
     "DEFAULT_WAFER_QUALITY",
+    "SecondaryWaferCandidate",
     "WaferObservation",
     "WaferQualityConfig",
     "analyze_dark_wafer_patch",

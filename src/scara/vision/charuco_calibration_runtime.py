@@ -399,7 +399,17 @@ class CharucoCalibrationRuntime(QObject):
             self._report_fatal_photo_error(path, exc)
 
     def _camera_identity(self, resolution: tuple[int, int]) -> dict[str, Any]:
-        return {
+        resolved: dict[str, Any] = {}
+        manifest_path = self.output_dir / "points.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+            camera_sources = manifest.get("camera_sources_resolved") or {}
+            candidate = camera_sources.get(str(self.runtime_config.camera_source))
+            if isinstance(candidate, dict):
+                resolved = dict(candidate)
+        except (OSError, ValueError, TypeError):
+            resolved = {}
+        payload = {
             "logical_name": self.runtime_config.logical_name,
             "source_index": self.runtime_config.camera_source,
             "capture_backend": self.runtime_config.capture_backend,
@@ -409,11 +419,27 @@ class CharucoCalibrationRuntime(QObject):
                 "height": resolution[1],
             },
             "identity_note": (
-                "OpenCV/DirectShow index does not expose a stable USB serial "
-                "number. Keep this logical mapping unchanged or add the "
-                "physical serial manually."
+                "source_index is the stable logical camera number; the "
+                "machine-local DirectShow index and USB identity come from "
+                "the pre-motion points.json camera identity check."
             ),
         }
+        if resolved:
+            payload.update(
+                {
+                    "physical_source_index": resolved.get(
+                        "physical_source_index"
+                    ),
+                    "configured_physical_index": resolved.get(
+                        "configured_physical_index"
+                    ),
+                    "configured_index_stale": resolved.get(
+                        "configured_index_stale"
+                    ),
+                    "usb_identity": resolved.get("camera_identity"),
+                }
+            )
+        return payload
 
     def _base_report(self, status: str) -> dict[str, Any]:
         quality = self.session.quality

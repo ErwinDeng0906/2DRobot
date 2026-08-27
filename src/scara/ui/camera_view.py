@@ -11,11 +11,14 @@ import math
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 
 from utils import get_logger
+
+from scara.config.camera_config import ResolvedCameraSource, resolve_camera_source
 
 logger = get_logger("scara.camera")
 
@@ -71,9 +74,12 @@ class ScaraCameraThread(QThread):
         height: int = 720,
         parent=None,
         connection_generation: int = 1,
+        source_resolver: Callable[[int], ResolvedCameraSource] = resolve_camera_source,
     ):
         super().__init__(parent)
         self._index = index
+        self._source_resolver = source_resolver
+        self._resolved_camera: ResolvedCameraSource | None = None
         self._connection_generation = max(1, int(connection_generation))
         self._w, self._h = width, height
         self._running = False
@@ -92,7 +98,27 @@ class ScaraCameraThread(QThread):
 
     @property
     def source_index(self) -> int:
+        """Stable logical camera number used by tasks and calibrations."""
+
         return self._index
+
+    @property
+    def physical_source_index(self) -> int | None:
+        """Current machine-local DirectShow index, once resolution succeeds."""
+
+        return (
+            None
+            if self._resolved_camera is None
+            else int(self._resolved_camera.physical_index)
+        )
+
+    @property
+    def camera_identity(self) -> dict:
+        return (
+            {}
+            if self._resolved_camera is None
+            else self._resolved_camera.to_json()
+        )
 
     @property
     def connection_generation(self) -> int:
@@ -106,20 +132,43 @@ class ScaraCameraThread(QThread):
         except Exception as exc:
             self.error.emit(f"未安装 opencv-python: {exc}")
             return
-        cap = cv2.VideoCapture(self._index, cv2.CAP_DSHOW)
+        try:
+            resolved = self._source_resolver(int(self._index))
+        except Exception as exc:
+            self.error.emit(f"逻辑相机{self._index}身份解析失败：{exc}")
+            return
+        self._resolved_camera = resolved
+        cap = cv2.VideoCapture(resolved.physical_index, resolved.backend)
         if not cap.isOpened():
-            self.error.emit(f"无法打开相机 index={self._index}")
+            self.error.emit(
+                f"无法打开逻辑相机{self._index}（物理Index "
+                f"{resolved.physical_index}）"
+            )
             return
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._h)
         auto_ok, auto_message = self._recover_auto_exposure(cap, cv2)
         if not auto_ok:
             self.error.emit(
-                f"相机 index={self._index} 默认自动曝光初始化失败：{auto_message}"
+                f"逻辑相机{self._index}/物理Index {resolved.physical_index} "
+                f"默认自动曝光初始化失败：{auto_message}"
             )
             cap.release()
             return
-        logger.info("camera %s default exposure: %s", self._index, auto_message)
+        logger.info(
+            "logical camera %s -> physical %s default exposure: %s",
+            self._index,
+            resolved.physical_index,
+            auto_message,
+        )
+        if resolved.configured_index_stale:
+            logger.warning(
+                "logical camera %s moved from configured physical index %s to %s; "
+                "run camera_identity_binding.py to refresh local_config.toml",
+                self._index,
+                resolved.configured_physical_index,
+                resolved.physical_index,
+            )
         self._running = True
         while self._running and not self.isInterruptionRequested():
             with self._exposure_lock:

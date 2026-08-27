@@ -8,7 +8,21 @@
 ## 运行环境
 
 - Windows + Python 3.10
-- 依赖：PyQt6、thrift、requests、pyyaml、opencv-python、numpy、pyserial、Pillow、tomli（Python 3.10）
+- 依赖：PyQt6、thrift、requests、pyyaml、opencv-python、numpy、pyserial、Pillow、tomli、cv2-enumerate-cameras==1.3.3（Python 3.10）
+
+三相机的逻辑编号与本机DirectShow物理Index只配置在`local_config.toml`。
+首次绑定或USB端口调整后运行：
+
+```powershell
+conda run --no-capture-output -n scara_cvdev python tools/camera_identity_binding.py --write-current-map --mapping "0=<概览Index>,1=<前臂Index>,2=<J4Index>" --verify --preview
+```
+
+任务和标定文件中的`source`/`source_index`始终表示逻辑相机编号，不表示Windows物理Index。
+如果重启后只发生DirectShow顺序变化，可在关闭UI后安全刷新缓存Index：
+
+```powershell
+conda run --no-capture-output -n scara_cvdev python tools/camera_identity_binding.py --refresh-indices --verify
+```
 
 ## 启动
 

@@ -462,22 +462,48 @@ class ThreadFrameGrabber:
 
 
 class CaptureFrameGrabber:
-    """独立 cv2.VideoCapture 抓一帧（伺服脚本单独跑、UI 相机已停时用；勿与 UI 线程抢同一 index）。"""
+    """独立抓取一个逻辑相机；勿与UI线程同时占用同一物理设备。"""
 
     def __init__(self, index: int = 0, width: int = 1280, height: int = 720,
-                 warmup_frames: int = 10, warmup_sleep_s: float = 0.05):
+                 warmup_frames: int = 10, warmup_sleep_s: float = 0.05,
+                 source_resolver: Optional[Callable[[int], Any]] = None):
         self._index = index
+        self._source_resolver = source_resolver
         self._w, self._h = width, height
         self._warmup = int(warmup_frames)
         self._warmup_sleep = float(warmup_sleep_s)
         self._cap = None
+        self._resolved_camera = None
+
+    @property
+    def source_index(self) -> int:
+        return int(self._index)
+
+    @property
+    def physical_source_index(self) -> Optional[int]:
+        return (
+            None
+            if self._resolved_camera is None
+            else int(self._resolved_camera.physical_index)
+        )
 
     def _ensure(self) -> None:
         if self._cap is None:
             import cv2  # 懒 import：只有真抓帧才拉 cv2
-            cap = cv2.VideoCapture(self._index, getattr(cv2, "CAP_DSHOW", 0))
+            if self._source_resolver is None:
+                from scara.config.camera_config import resolve_camera_source
+
+                resolver = resolve_camera_source
+            else:
+                resolver = self._source_resolver
+            resolved = resolver(int(self._index))
+            self._resolved_camera = resolved
+            cap = cv2.VideoCapture(resolved.physical_index, resolved.backend)
             if not cap.isOpened():
-                raise RuntimeError(f"无法打开相机 index={self._index}")
+                raise RuntimeError(
+                    f"无法打开逻辑相机{self._index}（物理Index "
+                    f"{resolved.physical_index}）"
+                )
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._w)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._h)
             # ★ 必须预热：USB 相机刚打开的前几帧是黑的/半截的（自动曝光还没收敛）。
