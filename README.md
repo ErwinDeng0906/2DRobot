@@ -86,10 +86,12 @@ python main.py --no-services
 1. 连接相机源#1，打开「手眼交互 -> 转移视觉」。
 2. 等待托盘位姿、`W←T` 和拾取稳定证据通过；拾取槽需最近 5 帧中至少 3 帧为正常占用，且最新帧仍正常。
 3. 在画面中点击正常硅片，界面会持续显示点击像素、托盘毫米坐标、匹配槽位及吸盘 XY 偏差。
-4. 「锁定拾取导航」只启动计算和跟踪；窗口始终输出 `robot_motion_authorized=false`，不会发送运动、Z、J4、DO或真空命令。
-5. 相机超时或分析异常会清除旧图、多帧证据和 `W←T`；已锁定会话直接进入 `blocked`。
+4. 「锁定拾取导航」仍只计算和跟踪，不会驱动机械臂。
+5. 需要真实对准时，再点击「启动XY悬空移动」并单独ARM。该模式只在T1、速度读回不超过20%时工作，每步XY终点不超过2 mm，每步前后都重新采5张画面并由 `ActionWorker` 复核。
+6. 全过程锁定J3安全观察高度；J4仅补偿到标定绝对Rz。任务中没有下降、吸取、DO或真空步骤。
+7. 相机超时、目标改变、任一质量门失败、误差不降低、控制器状态改变或超过边界时，会话立即拒绝后续运动。
 
-识别参数、标注图和回归命令见 [`docs/wafer_recognition_0820_validation.md`](docs/wafer_recognition_0820_validation.md)；实时坐标链和安全门见 [`docs/wafer_transfer_runtime_integration.md`](docs/wafer_transfer_runtime_integration.md)。
+识别参数、标注图和回归命令见 [`docs/wafer_recognition_0820_validation.md`](docs/wafer_recognition_0820_validation.md)；实时坐标链和安全门见 [`docs/wafer_transfer_runtime_integration.md`](docs/wafer_transfer_runtime_integration.md)；新的XY悬空对准流程见 [`docs/selected_wafer_xy_overhead_positioning.md`](docs/selected_wafer_xy_overhead_positioning.md)。
 
 ### 相机2到J4外参标定
 

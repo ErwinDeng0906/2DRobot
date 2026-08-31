@@ -1,0 +1,8 @@
+# These installed calibration assets were hashed on the Windows robot host.
+# Preserve CRLF in every checkout so byte-level provenance hashes remain stable.
+src/scara/calib/camera1_intrinsics.json text eol=crlf
+src/scara/calib/tray_board_geometry.json text eol=crlf
+src/scara/calib/camera1_suction_target.json text eol=crlf
+src/scara/calib/camera1_forearm_planar_handeye.json text eol=crlf
+src/scara/calib/camera1_xy_image_jacobian.json text eol=crlf
+src/scara/calib/camera1_wide_xy_jacobian.json text eol=crlf

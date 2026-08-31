@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 import cv2
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QImage, QMouseEvent, QPixmap, QResizeEvent
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -16,6 +17,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -49,6 +51,8 @@ QPushButton:hover { background:#E2E8F0; }
 QPushButton:checked { color:#FFFFFF; background:#2563EB; border-color:#2563EB; }
 QPushButton#trackButton { color:#FFFFFF; background:#047857; border-color:#047857; }
 QPushButton#trackButton:disabled { color:#64748B; background:#E2E8F0; border-color:#CBD5E1; }
+QPushButton#xyMotionButton { color:#FFFFFF; background:#B45309; border-color:#92400E; }
+QPushButton#xyMotionButton:disabled { color:#64748B; background:#E2E8F0; border-color:#CBD5E1; }
 """
 
 
@@ -191,6 +195,9 @@ class WaferTransferMonitorThread(QThread):
 class WaferTransferDialog(QDialog):
     """Click source/destination slots and follow live robot-relative distance."""
 
+    pick_xy_start_requested = pyqtSignal()
+    pick_xy_stop_requested = pyqtSignal()
+
     def __init__(
         self,
         project_root: Path,
@@ -207,10 +214,16 @@ class WaferTransferDialog(QDialog):
         self.project_root = Path(project_root)
         self.camera = camera
         self.runtime = LiveWaferTransferRuntime(self.project_root)
+        self.robot_state_provider = robot_state_provider
         self._last_frame: Optional[WaferTransferFrame] = None
         self._selection_role = "source"
         self._last_interaction_text = ""
         self._stream_invalidated = False
+        self._pick_xy_session: Optional[Any] = None
+        self._pick_xy_active = False
+        self._pick_xy_pending_request: Optional[dict[str, Any]] = None
+        self._pick_xy_pending_responder: Optional[Callable[[dict], None]] = None
+        self._pick_xy_samples: deque[dict[str, Any]] = deque(maxlen=20)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("Wafer Transfer Vision")
         self.resize(1500, 920)
@@ -220,7 +233,8 @@ class WaferTransferDialog(QDialog):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(9)
         banner = QLabel(
-            "只读导航：点击不会驱动机械臂；运动仍须由 ActionWorker 单独审核和执行"
+            "默认只读；XY悬空移动须人工ARM并由ActionWorker逐步复核。"
+            "J3不下降，不开启真空或DO。"
         )
         banner.setObjectName("transferBanner")
         root.addWidget(banner)
@@ -237,6 +251,8 @@ class WaferTransferDialog(QDialog):
         group.addButton(self.destination_button)
         self.track_button = QPushButton("锁定拾取导航")
         self.track_button.setObjectName("trackButton")
+        self.xy_motion_button = QPushButton("启动XY悬空移动")
+        self.xy_motion_button.setObjectName("xyMotionButton")
         self.reset_button = QPushButton("清除选择")
         self.registration_button = QPushButton("重建 W←T")
         self.report_button = QPushButton("保存导航报告")
@@ -245,6 +261,7 @@ class WaferTransferDialog(QDialog):
             self.source_button,
             self.destination_button,
             self.track_button,
+            self.xy_motion_button,
             self.reset_button,
             self.registration_button,
             self.report_button,
@@ -272,6 +289,7 @@ class WaferTransferDialog(QDialog):
         )
         self.preview.image_clicked.connect(self._on_image_clicked)
         self.track_button.clicked.connect(self._start_tracking)
+        self.xy_motion_button.clicked.connect(self._on_xy_motion_button)
         self.reset_button.clicked.connect(self._reset_selection)
         self.registration_button.clicked.connect(self._reset_registration)
         self.report_button.clicked.connect(self._save_report)
@@ -294,6 +312,9 @@ class WaferTransferDialog(QDialog):
         self._refresh_status(self.runtime.snapshot())
 
     def _on_image_clicked(self, x: float, y: float) -> None:
+        if self._pick_xy_active:
+            self._show_error("XY悬空定位已ARM，不允许在运动会话中更换目标")
+            return
         try:
             slot, point_T, distance = self.runtime.select_pixel(
                 (x, y),
@@ -355,7 +376,264 @@ class WaferTransferDialog(QDialog):
             self._last_interaction_text = ""
             self._stream_invalidated = False
         self.preview.set_image(image)
+        if self._pick_xy_active and self._pick_xy_pending_request is not None:
+            self._pick_xy_samples.append(self._pick_xy_sample(frame))
+            self._try_pick_xy_response()
         self._refresh_status(frame.session_snapshot)
+
+    def _on_xy_motion_button(self) -> None:
+        if self._pick_xy_active:
+            confirmation = QMessageBox.question(
+                self,
+                "停止XY悬空移动",
+                "停止会阻止后续XY步骤，并触发执行器安全停止。是否停止？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirmation == QMessageBox.StandardButton.Yes:
+                self.pick_xy_stop_requested.emit()
+            return
+
+        snapshot = self.runtime.snapshot()
+        target = str(snapshot.get("source_slot") or "")
+        if not target:
+            self._show_error("请先点击并锁定一个正常 occupied 硅片")
+            return
+        if snapshot.get("tracking_ready") is not True:
+            self._show_error("当前视觉、W<-T或机械臂同步状态尚未通过")
+            return
+        delta = snapshot.get("active_delta_world_xy_mm") or [math.nan, math.nan]
+        distance = float(snapshot.get("active_distance_mm", math.nan))
+        robot_state = snapshot.get("robot_state") or {}
+        joints = robot_state.get("joints") or [math.nan] * 4
+        prompt = QMessageBox(self)
+        prompt.setWindowTitle(f"确认移动到 {target} 正上方")
+        prompt.setIcon(QMessageBox.Icon.Warning)
+        prompt.setText(
+            f"目标：{target}\n"
+            f"当前估计：ΔX={float(delta[0]):+.3f} mm，"
+            f"ΔY={float(delta[1]):+.3f} mm，距离={distance:.3f} mm\n"
+            f"当前J3={float(joints[2]):.4f} mm\n\n"
+            "启动后会真实移动机械臂：\n"
+            "1. 仅执行分段XY运动，每步不超过2 mm；\n"
+            "2. J3保持相机1安全观察高度，不执行下降；\n"
+            "3. J4只用于维持标定绝对Rz；\n"
+            "4. 不发送DO、真空或吸取命令；\n"
+            "5. 每步后重新采5帧，误差不减小或任一质量门失败立即停止。\n\n"
+            "请确认托盘上方和逐轴扫掠路径无障碍、控制器T1模式且速度不超过20%、"
+            "软限位正确且急停可用。"
+        )
+        prompt.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        prompt.setDefaultButton(QMessageBox.StandardButton.No)
+        if prompt.exec() == QMessageBox.StandardButton.Yes:
+            self.pick_xy_start_requested.emit()
+
+    def prepare_pick_xy_session(self, output_dir: Path) -> dict[str, Any]:
+        """Arm one selected-slot session; controller ownership stays external."""
+
+        if self._pick_xy_active:
+            raise RuntimeError("XY悬空定位会话已经运行")
+        snapshot = self.runtime.snapshot()
+        target = str(snapshot.get("source_slot") or "")
+        if not target or snapshot.get("tracking_ready") is not True:
+            raise RuntimeError("当前拾取目标或视觉质量门无效")
+        if self.robot_state_provider is None:
+            raise RuntimeError("缺少机械臂只读状态")
+        initial_state = self.robot_state_provider()
+        if not isinstance(initial_state, Mapping):
+            raise RuntimeError("没有可用的新鲜机械臂状态")
+        from scara.vision.wafer_pick_xy_positioning import (
+            WaferPickXYPositioningSession,
+        )
+
+        session = WaferPickXYPositioningSession(
+            self.project_root,
+            Path(output_dir),
+            initial_state,
+            snapshot,
+            target_name=target,
+        )
+        self.runtime.start_tracking()
+        self._pick_xy_session = session
+        self._pick_xy_active = True
+        self._pick_xy_pending_request = None
+        self._pick_xy_pending_responder = None
+        self._pick_xy_samples.clear()
+        self._set_pick_xy_controls(True)
+        self._last_interaction_text = (
+            f"{target} XY悬空定位已ARM；等待ActionWorker请求后的5张新鲜帧。"
+        )
+        self._refresh_status(self.runtime.snapshot())
+        return session.action_task()
+
+    def _set_pick_xy_controls(self, active: bool) -> None:
+        self.xy_motion_button.setText(
+            "停止XY悬空移动" if active else "启动XY悬空移动"
+        )
+        for widget in (
+            self.source_button,
+            self.destination_button,
+            self.track_button,
+            self.reset_button,
+            self.registration_button,
+        ):
+            widget.setEnabled(not active)
+
+    def begin_pick_xy_request(
+        self,
+        request: Mapping[str, Any],
+        responder: Callable[[dict], None],
+    ) -> None:
+        """Collect five frames captured after one ActionWorker request."""
+
+        request_id = str(request.get("request_id") or "")
+        if not self._pick_xy_active or self._pick_xy_session is None:
+            responder(
+                {
+                    "request_id": request_id,
+                    "decision": "abort",
+                    "reason": "XY悬空定位会话未ARM",
+                }
+            )
+            return
+        if self._pick_xy_pending_request is not None:
+            responder(
+                {
+                    "request_id": request_id,
+                    "decision": "abort",
+                    "reason": "已有未完成的XY悬空定位帧窗口",
+                }
+            )
+            return
+        self._pick_xy_pending_request = dict(request)
+        self._pick_xy_pending_responder = responder
+        self._pick_xy_samples.clear()
+        self._last_interaction_text = (
+            f"执行请求 {request_id}：等待请求之后的5张合格帧；此时尚未运动。"
+        )
+        self._refresh_status(self.runtime.snapshot())
+        QTimer.singleShot(5000, lambda: self._pick_xy_timeout(request_id))
+
+    def _pick_xy_sample(self, frame: WaferTransferFrame) -> dict[str, Any]:
+        snapshot = frame.session_snapshot
+        gates = snapshot.get("selection_gates") or {}
+        accepted = bool(
+            frame.result.quality_passed
+            and frame.result.coordinate_mapping_allowed
+            and gates
+            and all(
+                isinstance(gate, Mapping) and gate.get("passed") is True
+                for gate in gates.values()
+            )
+        )
+        return {
+            "measurement_id": f"camera1-sequence-{frame.frame_sequence}",
+            "frame_sequence": int(frame.frame_sequence),
+            "captured_monotonic_s": frame.captured_monotonic_s,
+            "accepted": accepted,
+            "target_name": snapshot.get("source_slot"),
+            "source_state": snapshot.get("source_state"),
+            "source_consensus": snapshot.get("source_consensus"),
+            "selection_gates": gates,
+            "robot_state": snapshot.get("robot_state"),
+            "registration": snapshot.get("registration"),
+            "reprojection_rms_px": frame.result.pose.reprojection_rms_px,
+            "used_marker_count": len(frame.result.pose.used_marker_ids),
+            "annotated_bgr": frame.annotated_bgr.copy(),
+        }
+
+    def _eligible_pick_xy_samples(self) -> list[dict[str, Any]]:
+        request = self._pick_xy_pending_request
+        if request is None:
+            return []
+        requested_at = float(request.get("requested_monotonic_s") or math.inf)
+        rows = [
+            sample
+            for sample in self._pick_xy_samples
+            if float(sample.get("captured_monotonic_s") or -math.inf)
+            >= requested_at
+        ]
+        # The first five processed post-request frames form one indivisible
+        # evidence window. Do not skip a failed frame and later assemble five
+        # passing samples from a longer interval.
+        return rows[:5]
+
+    def _try_pick_xy_response(self) -> None:
+        if self._pick_xy_pending_request is None or self._pick_xy_session is None:
+            return
+        samples = self._eligible_pick_xy_samples()
+        if len(samples) < 5:
+            return
+        request = self._pick_xy_pending_request
+        responder = self._pick_xy_pending_responder
+        self._pick_xy_pending_request = None
+        self._pick_xy_pending_responder = None
+        self._pick_xy_samples.clear()
+        try:
+            response = self._pick_xy_session.build_response(request, samples)
+        except Exception as exc:  # noqa: BLE001 - fail closed at UI boundary
+            response = {
+                "request_id": str(request.get("request_id") or ""),
+                "decision": "abort",
+                "reason": f"XY悬空定位计算失败：{exc}",
+            }
+        if callable(responder):
+            responder(response)
+        decision = str(response.get("decision") or "")
+        if decision == "approve":
+            proposal = response.get("proposal") or {}
+            command = (proposal.get("calculation") or {}).get(
+                "commanded_correction_xy_mm"
+            ) or [0.0, 0.0]
+            self._last_interaction_text = (
+                "本轮5帧通过，候选已交ActionWorker独立复核："
+                f"ΔX={float(command[0]):+.3f} mm，"
+                f"ΔY={float(command[1]):+.3f} mm。"
+            )
+        elif decision == "complete":
+            self._last_interaction_text = str(
+                response.get("reason") or "XY已到达目标正上方"
+            )
+        else:
+            self._last_interaction_text = "已停止：" + str(
+                response.get("reason") or "安全门拒绝"
+            )
+        self._refresh_status(self.runtime.snapshot())
+
+    def _pick_xy_timeout(self, request_id: str) -> None:
+        request = self._pick_xy_pending_request
+        if request is None or str(request.get("request_id") or "") != request_id:
+            return
+        responder = self._pick_xy_pending_responder
+        self._pick_xy_pending_request = None
+        self._pick_xy_pending_responder = None
+        self._pick_xy_samples.clear()
+        if callable(responder):
+            responder(
+                {
+                    "request_id": request_id,
+                    "decision": "abort",
+                    "reason": "5秒内未获得5张请求之后的合格相机1画面",
+                }
+            )
+        self._last_interaction_text = "XY悬空定位已因新鲜帧超时停止。"
+        self._refresh_status(self.runtime.snapshot())
+
+    def finish_pick_xy_session(self, ok: bool, message: str) -> tuple[bool, str]:
+        session = self._pick_xy_session
+        self._pick_xy_active = False
+        self._pick_xy_pending_request = None
+        self._pick_xy_pending_responder = None
+        self._pick_xy_samples.clear()
+        self._pick_xy_session = None
+        self._set_pick_xy_controls(False)
+        if session is not None:
+            ok, message = session.finish(ok, message)
+        self._last_interaction_text = str(message)
+        self._refresh_status(self.runtime.snapshot())
+        return bool(ok), str(message)
 
     @staticmethod
     def _gate_lines(gates: Mapping[str, Any]) -> list[str]:
@@ -415,8 +693,12 @@ class WaferTransferDialog(QDialog):
                 or ["等待近距观测"]
             ),
             "",
-            "机械臂运动授权：NO",
-            "本窗口不会发送运动、Z、J4、真空或DO指令。",
+            (
+                "XY悬空移动：ARMED（候选仍须ActionWorker复核）"
+                if self._pick_xy_active
+                else "XY悬空移动：未ARM"
+            ),
+            "硬限制：J3不下降；无吸取、真空或DO；J4仅维持固定绝对Rz。",
         ]
         registration_error = snapshot.get("registration_error")
         sync_error = snapshot.get("robot_state_sync_error")
@@ -426,7 +708,12 @@ class WaferTransferDialog(QDialog):
             lines.extend(["", f"时间同步：{sync_error}"])
         self.status.setPlainText("\n".join(lines))
         self.status.verticalScrollBar().setValue(0)
-        self.track_button.setEnabled(bool(snapshot.get("tracking_ready")))
+        if not self._pick_xy_active:
+            ready = bool(snapshot.get("tracking_ready"))
+            self.track_button.setEnabled(ready)
+            self.xy_motion_button.setEnabled(ready)
+        else:
+            self.xy_motion_button.setEnabled(True)
 
     def _show_error(self, message: str) -> None:
         snapshot = self.runtime.snapshot()
@@ -438,9 +725,17 @@ class WaferTransferDialog(QDialog):
         self._stream_invalidated = True
         self.preview.clear_image("当前没有可用的新鲜相机1画面")
         self._last_interaction_text = f"当前判断已失效：{message}"
+        if self._pick_xy_active:
+            self._last_interaction_text += "；已请求XY悬空定位安全停止"
+            self.pick_xy_stop_requested.emit()
         self._refresh_status(self.runtime.snapshot())
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._pick_xy_active:
+            self.pick_xy_stop_requested.emit()
+            self._show_error("XY悬空定位正在安全停止；执行线程结束后才能关闭窗口")
+            event.ignore()
+            return
         if self.monitor.isRunning() and not self.monitor.stop(5000):
             self._show_error("后台视觉线程尚未退出")
             event.ignore()

@@ -1115,7 +1115,7 @@ class ScaraControlWidget(QWidget):
             self._append("手眼交互", f"启动失败：{exc}", _D["error"])
 
     def _open_wafer_transfer(self) -> None:
-        """Open the observation-only, target-locked wafer transfer view."""
+        """Open target-locked vision and the supervised XY-only handoff."""
 
         if self._action_worker is not None and self._action_worker.isRunning():
             self._append(
@@ -1156,10 +1156,12 @@ class ScaraControlWidget(QWidget):
             )
             self._wafer_transfer_dialog = dialog
             dialog.destroyed.connect(self._on_wafer_transfer_dialog_destroyed)
+            dialog.pick_xy_start_requested.connect(self._start_wafer_pick_xy)
+            dialog.pick_xy_stop_requested.connect(self._stop_wafer_pick_xy)
             dialog.show()
             self._append(
                 "转移视觉",
-                "实时转移视觉已打开：只计算，不移动机械臂",
+                "实时转移视觉已打开：默认只读；XY悬空移动需单独ARM",
                 _D["success"],
             )
         except Exception as exc:
@@ -1172,6 +1174,131 @@ class ScaraControlWidget(QWidget):
 
     def _on_wafer_transfer_dialog_destroyed(self, _object=None) -> None:
         self._wafer_transfer_dialog = None
+
+    def _start_wafer_pick_xy(self) -> None:
+        """Start selected-wafer XY-only motion through the sole hardware owner."""
+
+        dialog = self._wafer_transfer_dialog
+        if dialog is None:
+            return
+        if self._action_worker is not None and self._action_worker.isRunning():
+            self._append("XY悬空定位", "已有任务或运动会话正在运行", _D["warning"])
+            return
+        if self._cam is None or self._cam.source_index != 1 or not self._cam.isRunning():
+            self._append("XY悬空定位", "相机1未运行，已拒绝启动", _D["error"])
+            return
+        if not self._ctrl.motion_ready():
+            return
+
+        project_root = Path(__file__).resolve().parents[3]
+        output_dir = (
+            project_root
+            / "Trajectory Photos"
+            / datetime.now().strftime("%y%m%d%H%M%S")
+        )
+        prepared = False
+        try:
+            raw_task = dialog.prepare_pick_xy_session(output_dir)
+            prepared = True
+            task = normalize_action_task(raw_task)
+        except Exception as exc:
+            if prepared or bool(getattr(dialog, "_pick_xy_active", False)):
+                try:
+                    dialog.finish_pick_xy_session(False, f"准备失败：{exc}")
+                except Exception:
+                    pass
+            QMessageBox.critical(self, "XY悬空定位准备失败", str(exc))
+            self._append("XY悬空定位", f"准备失败：{exc}", _D["error"])
+            return
+
+        worker = ActionWorker(
+            self._ctrl,
+            task,
+            output_dir,
+            camera_position_calculator=self._action_camera_calculator,
+            source_position_calculators=self._action_source_position_calculators,
+            parent=self,
+        )
+        self._action_task = task
+        self._action_worker = worker
+        self._handeye_motion_mode = "wafer_pick_xy"
+        worker.progress.connect(
+            lambda message: self._append("XY悬空定位", message, _D["accent"])
+        )
+        worker.runtime_move_joints_requested.connect(
+            self._on_wafer_pick_xy_runtime_move
+        )
+        worker.run_finished.connect(self._on_wafer_pick_xy_finished)
+        self._set_action_controls_locked(True)
+        self._btn_run_action.setEnabled(False)
+        self._btn_cam.setEnabled(False)
+        self._cam_idx.setEnabled(False)
+        self._btn_snap.setEnabled(False)
+        self._append(
+            "XY悬空定位",
+            f"会话已启动；只允许XY与固定Rz补偿，输出文件夹 {output_dir}",
+            _D["warning"],
+        )
+        worker.start()
+
+    def _on_wafer_pick_xy_runtime_move(self, request: dict) -> None:
+        worker = self._action_worker
+        dialog = self._wafer_transfer_dialog
+        if worker is None or not worker.isRunning():
+            return
+        if dialog is None:
+            worker.respond_runtime_move_joints(
+                {
+                    "request_id": str(request.get("request_id") or ""),
+                    "decision": "abort",
+                    "reason": "转移视觉窗口已失效",
+                }
+            )
+            return
+
+        def respond(response: dict) -> None:
+            current = self._action_worker
+            if current is worker and current.isRunning():
+                current.respond_runtime_move_joints(response)
+
+        dialog.begin_pick_xy_request(dict(request), respond)
+
+    def _stop_wafer_pick_xy(self) -> None:
+        worker = self._action_worker
+        if (
+            self._handeye_motion_mode == "wafer_pick_xy"
+            and worker is not None
+            and worker.isRunning()
+        ):
+            worker.request_stop()
+            self._append(
+                "XY悬空定位",
+                "已请求安全停止；不会再授权新的XY步骤",
+                _D["warning"],
+            )
+
+    def _on_wafer_pick_xy_finished(
+        self, ok: bool, message: str, output_dir: str
+    ) -> None:
+        dialog = self._wafer_transfer_dialog
+        if dialog is not None:
+            try:
+                ok, message = dialog.finish_pick_xy_session(ok, message)
+            except Exception as exc:
+                ok = False
+                message = f"{message}；XY悬空定位报告收尾失败：{exc}"
+        self._set_action_controls_locked(False)
+        self._btn_cam.setEnabled(True)
+        self._cam_idx.setEnabled(True)
+        self._btn_snap.setEnabled(True)
+        self._btn_run_action.setEnabled(self._action_builder is not None)
+        self._action_worker = None
+        self._handeye_motion_mode = None
+        self._append(
+            "XY悬空定位完成" if ok else "XY悬空定位停止",
+            f"{message}；文件夹：{output_dir}",
+            _D["success"] if ok else _D["error"],
+        )
 
     def _restore_one_shot_action(self) -> None:
         """Restore the task-panel import after a hand-eye one-shot Task9 run."""
@@ -1930,6 +2057,16 @@ class ScaraControlWidget(QWidget):
             if self._action_worker is not None and self._action_worker.isRunning():
                 self._action_worker.request_stop()
                 self._action_worker.wait(15000)
+            transfer_dialog = self._wafer_transfer_dialog
+            if transfer_dialog is not None and getattr(
+                transfer_dialog, "_pick_xy_active", False
+            ):
+                try:
+                    transfer_dialog.finish_pick_xy_session(
+                        False, "应用退出时安全停止"
+                    )
+                except Exception:
+                    pass
             dialog = self._handeye_dialog
             if dialog is not None and getattr(dialog, "stage7b_active", False):
                 try:

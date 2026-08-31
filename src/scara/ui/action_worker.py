@@ -80,6 +80,16 @@ MOVED_TRAY_MAXIMUM_RZ_TOLERANCE_DEG = 0.30
 MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 15.0
 MOVED_TRAY_MAXIMUM_STATE_DRIFT_XY_MM = 0.20
 MOVED_TRAY_MAXIMUM_STATE_DRIFT_JOINT = 0.20
+WAFER_PICK_XY_RUNTIME_REQUEST_KEY = "wafer_pick_xy_overhead_positioning"
+WAFER_PICK_XY_MAXIMUM_STEP_NORM_MM = 2.0
+WAFER_PICK_XY_MAXIMUM_AXIS_STEP_MM = 2.0
+WAFER_PICK_XY_MAXIMUM_LOCAL_EXTENT_MM = 70.0
+WAFER_PICK_XY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM = 5.0
+WAFER_PICK_XY_MAXIMUM_RZ_TOLERANCE_DEG = 0.30
+WAFER_PICK_XY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 1.0
+WAFER_PICK_XY_MAXIMUM_STATE_DRIFT_XY_MM = 0.10
+WAFER_PICK_XY_MAXIMUM_STATE_DRIFT_JOINT = 0.10
+WAFER_PICK_XY_MAXIMUM_SPEED_PERCENT = 20.0
 
 
 def _finite(value: object, label: str) -> float:
@@ -262,16 +272,28 @@ def normalize_action_task(raw_task: object) -> dict:
                 raise ValueError(
                     f"第 {index} 步 runtime_move_joints.request_key 不能为空"
                 )
-            target_name = str(raw.get("target_name") or "P22").strip()
-            if target_name != "P22":
-                raise ValueError(
-                    f"第 {index} 步 runtime_move_joints目前只允许target_name=P22"
-                )
             is_stage7b = request_key == STAGE7B_RUNTIME_REQUEST_KEY
             is_full_tray_geometry = (
                 request_key == FULL_TRAY_GEOMETRY_REQUEST_KEY
             )
             is_moved_tray = request_key == MOVED_TRAY_RUNTIME_REQUEST_KEY
+            is_wafer_pick_xy = request_key == WAFER_PICK_XY_RUNTIME_REQUEST_KEY
+            target_name = str(raw.get("target_name") or "P22").strip()
+            is_valid_tray_slot = bool(
+                len(target_name) == 3
+                and target_name[0] == "P"
+                and target_name[1] in "012345"
+                and target_name[2] in "012345"
+            )
+            if is_wafer_pick_xy:
+                if not is_valid_tray_slot:
+                    raise ValueError(
+                        f"第 {index} 步XY悬空定位target_name必须是P00到P55"
+                    )
+            elif target_name != "P22":
+                raise ValueError(
+                    f"第 {index} 步该runtime_move_joints请求只允许target_name=P22"
+                )
             calibration_sha256 = str(
                 raw.get("calibration_sha256") or ""
             ).strip().upper()
@@ -299,9 +321,13 @@ def normalize_action_task(raw_task: object) -> dict:
                     MOVED_TRAY_MAXIMUM_LOCAL_EXTENT_MM
                     if is_moved_tray
                     else (
-                    FULL_TRAY_GEOMETRY_MAXIMUM_LOCAL_EXTENT_MM
-                    if is_full_tray_geometry
-                    else RUNTIME_MOVE_MAXIMUM_LOCAL_EXTENT_MM
+                        WAFER_PICK_XY_MAXIMUM_LOCAL_EXTENT_MM
+                        if is_wafer_pick_xy
+                        else (
+                            FULL_TRAY_GEOMETRY_MAXIMUM_LOCAL_EXTENT_MM
+                            if is_full_tray_geometry
+                            else RUNTIME_MOVE_MAXIMUM_LOCAL_EXTENT_MM
+                        )
                     )
                 )
             )
@@ -312,9 +338,13 @@ def normalize_action_task(raw_task: object) -> dict:
                     MOVED_TRAY_MAXIMUM_STEP_NORM_MM
                     if is_moved_tray
                     else (
-                    FULL_TRAY_GEOMETRY_MAXIMUM_STEP_NORM_MM
-                    if is_full_tray_geometry
-                    else RUNTIME_MOVE_MAXIMUM_STEP_NORM_MM
+                        WAFER_PICK_XY_MAXIMUM_STEP_NORM_MM
+                        if is_wafer_pick_xy
+                        else (
+                            FULL_TRAY_GEOMETRY_MAXIMUM_STEP_NORM_MM
+                            if is_full_tray_geometry
+                            else RUNTIME_MOVE_MAXIMUM_STEP_NORM_MM
+                        )
                     )
                 )
             )
@@ -325,9 +355,13 @@ def normalize_action_task(raw_task: object) -> dict:
                     MOVED_TRAY_MAXIMUM_AXIS_STEP_MM
                     if is_moved_tray
                     else (
-                    FULL_TRAY_GEOMETRY_MAXIMUM_AXIS_STEP_MM
-                    if is_full_tray_geometry
-                    else RUNTIME_MOVE_MAXIMUM_AXIS_STEP_MM
+                        WAFER_PICK_XY_MAXIMUM_AXIS_STEP_MM
+                        if is_wafer_pick_xy
+                        else (
+                            FULL_TRAY_GEOMETRY_MAXIMUM_AXIS_STEP_MM
+                            if is_full_tray_geometry
+                            else RUNTIME_MOVE_MAXIMUM_AXIS_STEP_MM
+                        )
                     )
                 )
             )
@@ -338,9 +372,13 @@ def normalize_action_task(raw_task: object) -> dict:
                     MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
                     if is_moved_tray
                     else (
-                    FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
-                    if is_full_tray_geometry
-                    else RUNTIME_MOVE_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
+                        WAFER_PICK_XY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
+                        if is_wafer_pick_xy
+                        else (
+                            FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
+                            if is_full_tray_geometry
+                            else RUNTIME_MOVE_MAXIMUM_SEQUENTIAL_TRANSIENT_MM
+                        )
                     )
                 )
             )
@@ -351,6 +389,8 @@ def normalize_action_task(raw_task: object) -> dict:
             )
             if is_full_tray_geometry:
                 maximum_rz_tolerance = FULL_TRAY_GEOMETRY_MAXIMUM_RZ_TOLERANCE_DEG
+            if is_wafer_pick_xy:
+                maximum_rz_tolerance = WAFER_PICK_XY_MAXIMUM_RZ_TOLERANCE_DEG
             maximum_transient_rz = (
                 MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
                 if is_moved_tray
@@ -358,6 +398,8 @@ def normalize_action_task(raw_task: object) -> dict:
             )
             if is_full_tray_geometry:
                 maximum_transient_rz = FULL_TRAY_GEOMETRY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
+            if is_wafer_pick_xy:
+                maximum_transient_rz = WAFER_PICK_XY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG
             maximum_state_drift_xy = (
                 MOVED_TRAY_MAXIMUM_STATE_DRIFT_XY_MM
                 if is_moved_tray
@@ -365,6 +407,8 @@ def normalize_action_task(raw_task: object) -> dict:
             )
             if is_full_tray_geometry:
                 maximum_state_drift_xy = FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_XY_MM
+            if is_wafer_pick_xy:
+                maximum_state_drift_xy = WAFER_PICK_XY_MAXIMUM_STATE_DRIFT_XY_MM
             maximum_state_drift_joint = (
                 MOVED_TRAY_MAXIMUM_STATE_DRIFT_JOINT
                 if is_moved_tray
@@ -372,6 +416,8 @@ def normalize_action_task(raw_task: object) -> dict:
             )
             if is_full_tray_geometry:
                 maximum_state_drift_joint = FULL_TRAY_GEOMETRY_MAXIMUM_STATE_DRIFT_JOINT
+            if is_wafer_pick_xy:
+                maximum_state_drift_joint = WAFER_PICK_XY_MAXIMUM_STATE_DRIFT_JOINT
             extent = _positive_at_most(
                 raw.get("local_extent_mm"),
                 f"第 {index} 步 local_extent_mm",
@@ -471,7 +517,10 @@ def normalize_action_task(raw_task: object) -> dict:
                     # derived from the recognized request key, not trusted
                     # from an imported task field.
                     "enforce_sequential_intermediate_domain": not (
-                        is_stage7b or is_full_tray_geometry or is_moved_tray
+                        is_stage7b
+                        or is_full_tray_geometry
+                        or is_moved_tray
+                        or is_wafer_pick_xy
                     ),
                     "max_state_drift_xy_mm": _positive_at_most(
                         raw.get(
@@ -1239,6 +1288,12 @@ class ActionWorker(QThread):
         soft_estop = status.get("soft_estop") is True
         need_clear = status.get("need_clear") is True
         enabled = status.get("effectively_enabled") is True
+        try:
+            speed_percent = float(status.get("speed"))
+        except (TypeError, ValueError, OverflowError):
+            speed_percent = None
+        if speed_percent is not None and not math.isfinite(speed_percent):
+            speed_percent = None
         return {
             "captured_monotonic_s": time.monotonic(),
             "joints": joints,
@@ -1254,6 +1309,7 @@ class ActionWorker(QThread):
             "soft_estop_clear": not soft_estop,
             "controller_idle": controller_idle,
             "mode": str(status.get("mode") or "?"),
+            "speed_percent": speed_percent,
         }
 
     def _record_point(self, name: str) -> None:
@@ -1471,8 +1527,11 @@ class ActionWorker(QThread):
         return {key: step[key] for key in keys}
 
     @staticmethod
-    def _runtime_controller_gates(state: dict) -> dict[str, bool]:
-        return {
+    def _runtime_controller_gates(
+        state: dict,
+        request_key: str | None = None,
+    ) -> dict[str, bool]:
+        gates = {
             "controller_connected": state.get("controller_connected") is True,
             "controller_enabled": state.get("controller_enabled") is True,
             "alarm_clear": state.get("alarm_clear") is True,
@@ -1481,6 +1540,22 @@ class ActionWorker(QThread):
             "controller_idle": state.get("controller_idle") is True,
             "worker_not_stopped": True,
         }
+        if request_key == WAFER_PICK_XY_RUNTIME_REQUEST_KEY:
+            try:
+                speed = float(state.get("speed_percent"))
+            except (TypeError, ValueError, OverflowError):
+                speed = math.nan
+            gates.update(
+                {
+                    "controller_mode_is_t1": state.get("mode") == "T1",
+                    "controller_speed_at_most_20_percent": (
+                        math.isfinite(speed)
+                        and speed > 0.0
+                        and speed <= WAFER_PICK_XY_MAXIMUM_SPEED_PERCENT
+                    ),
+                }
+            )
+        return gates
 
     @staticmethod
     def _runtime_state_drift(
@@ -1570,6 +1645,8 @@ class ActionWorker(QThread):
             runtime_label = "可移动托盘P22全盘定位"
         elif step["request_key"] == FULL_TRAY_GEOMETRY_REQUEST_KEY:
             runtime_label = "全盘定位Stage3毫米几何修正"
+        elif step["request_key"] == WAFER_PICK_XY_RUNTIME_REQUEST_KEY:
+            runtime_label = f"{step['target_name']}硅片XY悬空定位"
         else:
             runtime_label = "Stage7A"
         displayed_state = self._read_runtime_motion_state(
@@ -1596,7 +1673,9 @@ class ActionWorker(QThread):
             "limits": self._runtime_move_limits(step),
             "controller_state": displayed_state,
             "external_safety_gates": {
-                **self._runtime_controller_gates(displayed_state),
+                **self._runtime_controller_gates(
+                    displayed_state, step["request_key"]
+                ),
                 "camera_fresh": False,
                 "operator_consent": False,
             },
@@ -1649,6 +1728,7 @@ class ActionWorker(QThread):
             if step["request_key"] in {
                 STAGE7B_RUNTIME_REQUEST_KEY,
                 MOVED_TRAY_RUNTIME_REQUEST_KEY,
+                WAFER_PICK_XY_RUNTIME_REQUEST_KEY,
             }:
                 allowed_decisions.update({"complete", "observe"})
             if decision not in allowed_decisions:
@@ -1709,7 +1789,7 @@ class ActionWorker(QThread):
             if not str(proposal.get("proposal_id") or "").strip():
                 raise RuntimeError(f"{runtime_label} proposal缺少proposal_id")
             if str(proposal.get("target_name") or "") != step["target_name"]:
-                raise RuntimeError(f"{runtime_label} proposal目标不是本任务锁定的P22")
+                raise RuntimeError(f"{runtime_label} proposal目标不是本任务锁定槽位")
             audit_step = step
             if step["request_key"] == STAGE7B_RUNTIME_REQUEST_KEY:
                 tier = str(proposal.get("model_tier") or "")
@@ -1730,6 +1810,44 @@ class ActionWorker(QThread):
                             step["max_sequential_transient_xy_mm"], 0.50
                         ),
                     )
+            if step["request_key"] == WAFER_PICK_XY_RUNTIME_REQUEST_KEY:
+                if str(proposal.get("phase") or "") != "wafer_pick_xy_overhead":
+                    raise RuntimeError(f"{runtime_label} proposal阶段标识无效")
+                if proposal.get("xy_only") is not True:
+                    raise RuntimeError(f"{runtime_label} proposal未声明XY-only")
+                forbidden_authorizations = {
+                    "z_motion_authorized": proposal.get("z_motion_authorized"),
+                    "vacuum_authorized": proposal.get("vacuum_authorized"),
+                    "do_authorized": proposal.get("do_authorized"),
+                }
+                if any(value is not False for value in forbidden_authorizations.values()):
+                    raise RuntimeError(
+                        f"{runtime_label} proposal包含下降、真空或DO授权，已拒绝"
+                    )
+                try:
+                    locked_j3 = float(proposal.get("locked_j3_mm"))
+                    locked_rz = float(proposal.get("locked_rz_deg"))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise RuntimeError(
+                        f"{runtime_label} proposal缺少有效J3/Rz锁定值"
+                    ) from exc
+                if abs(locked_j3 - step["required_j3_mm"]) > 1e-9:
+                    raise RuntimeError(f"{runtime_label} proposal改变了J3安全高度")
+                if (
+                    abs(
+                        (locked_rz - step["required_rz_deg"] + 180.0)
+                        % 360.0
+                        - 180.0
+                    )
+                    > 1e-9
+                ):
+                    raise RuntimeError(f"{runtime_label} proposal改变了锁定绝对Rz")
+                proposal_gates = proposal.get("safety_gates") or {}
+                if not proposal_gates or any(
+                    not isinstance(gate, dict) or gate.get("passed") is not True
+                    for gate in proposal_gates.values()
+                ):
+                    raise RuntimeError(f"{runtime_label} proposal存在未通过的视觉安全门")
             proposal_command_xy = _vector_values(
                 (proposal.get("calculation") or {}).get(
                     "commanded_correction_xy_mm"
@@ -1793,7 +1911,9 @@ class ActionWorker(QThread):
                 f"{step['name']} 下发前重新检查"
             )
             audit_entry["fresh_controller_state"] = fresh_state
-            fresh_gates = self._runtime_controller_gates(fresh_state)
+            fresh_gates = self._runtime_controller_gates(
+                fresh_state, step["request_key"]
+            )
             audit_entry["fresh_controller_gates"] = fresh_gates
             failed_controller = [
                 name for name, passed in fresh_gates.items() if not passed
@@ -1897,7 +2017,7 @@ class ActionWorker(QThread):
                     precompensated_state
                 )
                 precompensation_controller_gates = self._runtime_controller_gates(
-                    precompensated_state
+                    precompensated_state, step["request_key"]
                 )
                 precompensation_controller_gates["worker_not_stopped"] = (
                     not self._stop_requested.is_set()
@@ -1960,7 +2080,9 @@ class ActionWorker(QThread):
             )
 
             audit_entry["final_controller_state"] = final_state
-            final_controller_gates = self._runtime_controller_gates(final_state)
+            final_controller_gates = self._runtime_controller_gates(
+                final_state, step["request_key"]
+            )
             final_controller_gates["worker_not_stopped"] = (
                 not self._stop_requested.is_set()
             )
