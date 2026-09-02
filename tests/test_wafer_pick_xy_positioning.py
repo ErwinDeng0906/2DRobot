@@ -20,8 +20,13 @@ from scara.vision.handeye_interaction import load_latest_suction_target  # noqa:
 from scara.vision.moved_tray_servo import registered_slot_world_xy_mm  # noqa: E402
 from scara.vision.tray_pose_estimator import load_tray_board_geometry  # noqa: E402
 from scara.vision.wafer_pick_xy_positioning import (  # noqa: E402
+    CONTROLLER_QUANTIZATION_HEADROOM_MM,
+    MAXIMUM_OBSERVATION_GAP_S,
+    MAXIMUM_STEP_MM,
+    OBSERVATION_WINDOW_SIZE,
     WAFER_PICK_XY_RUNTIME_REQUEST_KEY,
     WaferPickXYPositioningSession,
+    select_bounded_observation_window,
 )
 
 
@@ -90,8 +95,8 @@ class WaferPickXYPositioningTests(unittest.TestCase):
             "source_state": {"state": "occupied"},
             "source_consensus": {
                 "passed": True,
-                "occupied_frame_count": 5,
-                "window_frame_count": 5,
+                "occupied_frame_count": 2,
+                "window_frame_count": 2,
             },
             "tracking_ready": True,
             "selection_gates": gates,
@@ -108,7 +113,7 @@ class WaferPickXYPositioningTests(unittest.TestCase):
     ) -> list[dict]:
         gates = cls._snapshot(target, state)["selection_gates"]
         rows = []
-        for index in range(5):
+        for index in range(OBSERVATION_WINDOW_SIZE):
             captured = requested_at + 0.02 * (index + 1)
             frame_state = {
                 **state,
@@ -179,14 +184,16 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                 for step in runtime_steps
             )
         )
-        self.assertLessEqual(runtime_steps[0]["max_xy_step_norm_mm"], 2.0)
+        self.assertLessEqual(runtime_steps[0]["max_xy_step_norm_mm"], 10.0)
+        self.assertIn("final_rz_deg", runtime_steps[0])
+        self.assertLessEqual(runtime_steps[0]["max_j4_rotation_deg"], 30.0)
         self.assertLessEqual(runtime_steps[0]["local_extent_mm"], 70.0)
         forbidden = {"move_xyzr", "set_do", "capture", "start_video", "stop_video"}
         self.assertFalse(
             forbidden.intersection(step["type"] for step in task["actions"])
         )
 
-    def test_five_frames_produce_xy_only_candidate_with_fixed_j3(self) -> None:
+    def test_two_frames_produce_xy_only_candidate_with_fixed_j3(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session, state = self._session(temporary)
             request = self._request(session, state)
@@ -205,8 +212,91 @@ class WaferPickXYPositioningTests(unittest.TestCase):
         self.assertFalse(proposal["vacuum_authorized"])
         self.assertFalse(proposal["do_authorized"])
         command = np.asarray(proposal["commanded_correction_xy_mm"])
-        self.assertLessEqual(float(np.linalg.norm(command)), 2.0 + 1e-9)
+        self.assertLessEqual(
+            float(np.linalg.norm(command)),
+            MAXIMUM_STEP_MM - CONTROLLER_QUANTIZATION_HEADROOM_MM + 1e-9,
+        )
+        self.assertGreater(float(np.linalg.norm(command)), 5.0)
         self.assertAlmostEqual(response["target_joints"][2], state["joints"][2], places=9)
+
+    def test_runtime_pnp_drift_is_a_gate_not_a_moving_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session, state = self._session(temporary)
+            request = self._request(session, state)
+            samples = self._samples(
+                session.target_name,
+                state,
+                float(request["requested_monotonic_s"]),
+            )
+            drifted = dict(self.registration)
+            transform = np.asarray(
+                self.registration["transform_W_T"], dtype=np.float64
+            ).copy()
+            transform[0, 3] += 0.50
+            drifted["transform_W_T"] = transform.tolist()
+            drifted["origin_world_xy_mm"] = [
+                float(self.registration["origin_world_xy_mm"][0]) + 0.50,
+                float(self.registration["origin_world_xy_mm"][1]),
+            ]
+            for sample in samples:
+                sample["registration"] = drifted
+            response = session.build_response(request, samples)
+
+        self.assertEqual("approve", response["decision"])
+        window = response["proposal"]["window"]
+        self.assertTrue(
+            np.allclose(
+                window["target_world_xy_mm"],
+                session.locked_target_world_xy_mm,
+                atol=1e-9,
+            )
+        )
+        self.assertAlmostEqual(
+            0.50,
+            float(window["observed_target_world_xy_mm"][0])
+            - float(window["target_world_xy_mm"][0]),
+            places=9,
+        )
+        self.assertTrue(
+            response["proposal"]["safety_gates"][
+                "registration_locked_to_armed_session"
+            ]["passed"]
+        )
+
+    def test_bounded_window_tolerates_brief_rejected_frames(self) -> None:
+        requested = 100.0
+        rows = [
+            {"captured_monotonic_s": 100.0, "accepted": True, "id": "good-0"},
+            {"captured_monotonic_s": 100.5, "accepted": False, "id": "bad-0"},
+            {"captured_monotonic_s": 101.0, "accepted": True, "id": "good-1"},
+            {"captured_monotonic_s": 101.5, "accepted": True, "id": "good-2"},
+            {"captured_monotonic_s": 102.0, "accepted": False, "id": "bad-1"},
+            {"captured_monotonic_s": 102.5, "accepted": True, "id": "good-3"},
+            {"captured_monotonic_s": 103.0, "accepted": True, "id": "good-4"},
+        ]
+        selected = select_bounded_observation_window(
+            rows, requested_monotonic_s=requested
+        )
+        self.assertEqual(
+            ["good-0", "good-1"],
+            [row["id"] for row in selected],
+        )
+
+    def test_bounded_window_resets_after_long_recognition_gap(self) -> None:
+        requested = 200.0
+        rows = [
+            {"captured_monotonic_s": 200.0, "accepted": True, "id": "old-0"},
+            {
+                "captured_monotonic_s": 200.0 + MAXIMUM_OBSERVATION_GAP_S + 0.01,
+                "accepted": True,
+                "id": "new-0",
+            },
+            {"captured_monotonic_s": 202.0, "accepted": True, "id": "new-1"},
+        ]
+        selected = select_bounded_observation_window(
+            rows, requested_monotonic_s=requested
+        )
+        self.assertEqual(["new-0", "new-1"], [row["id"] for row in selected])
 
     def test_no_measured_progress_aborts_before_second_motion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -235,7 +325,7 @@ class WaferPickXYPositioningTests(unittest.TestCase):
         progress = second["evaluation"]["safety_gates"]["post_motion_progress"]
         self.assertFalse(progress["passed"])
 
-    def test_one_failed_frame_rejects_the_entire_five_frame_window(self) -> None:
+    def test_one_failed_frame_rejects_the_two_frame_window(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session, state = self._session(temporary)
             request = self._request(session, state)
@@ -244,7 +334,7 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                 state,
                 float(request["requested_monotonic_s"]),
             )
-            samples[2]["accepted"] = False
+            samples[1]["accepted"] = False
             response = session.build_response(request, samples)
         self.assertEqual("abort", response["decision"])
         gate = response["evaluation"]["safety_gates"][
@@ -261,15 +351,15 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                 state,
                 float(request["requested_monotonic_s"]),
             )
-            samples[3]["frame_sequence"] = samples[2]["frame_sequence"]
+            samples[1]["frame_sequence"] = samples[0]["frame_sequence"]
             response = session.build_response(request, samples)
         self.assertEqual("abort", response["decision"])
         gate = response["evaluation"]["safety_gates"][
-            "five_distinct_ordered_frames"
+            "distinct_ordered_frames"
         ]
         self.assertFalse(gate["passed"])
 
-    def test_independent_five_frame_hold_completes_without_motion(self) -> None:
+    def test_independent_two_frame_hold_then_j4_aligns_to_tray(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session, state = self._session(
                 temporary,
@@ -277,7 +367,7 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                 current="P31",
             )
             request = self._request(session, state)
-            response = session.build_response(
+            orientation = session.build_response(
                 request,
                 self._samples(
                     session.target_name,
@@ -285,8 +375,50 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                     float(request["requested_monotonic_s"]),
                 ),
             )
-        self.assertEqual("complete", response["decision"])
-        self.assertIn("J3未下降", response["reason"])
+            self.assertEqual("approve", orientation["decision"])
+            proposal = orientation["proposal"]
+            self.assertEqual(
+                "wafer_pick_final_tray_orientation", proposal["phase"]
+            )
+            self.assertFalse(proposal["xy_only"])
+            self.assertTrue(proposal["j4_only"])
+            for index in range(3):
+                self.assertAlmostEqual(
+                    state["joints"][index],
+                    orientation["target_joints"][index],
+                    places=9,
+                )
+            self.assertAlmostEqual(
+                self.registration["yaw_world_from_tray_deg"],
+                rz_of(
+                    orientation["target_joints"][0],
+                    orientation["target_joints"][1],
+                    orientation["target_joints"][3],
+                ),
+                places=9,
+            )
+
+            final_joints = list(orientation["target_joints"])
+            final_xy = fk_wrist(final_joints[0], final_joints[1])
+            final_state = {
+                "captured_monotonic_s": time.monotonic(),
+                "joints": final_joints,
+                "pose": [
+                    float(final_xy[0]),
+                    float(final_xy[1]),
+                    float(final_joints[2]),
+                    180.0,
+                    0.0,
+                    rz_of(final_joints[0], final_joints[1], final_joints[3]),
+                ],
+            }
+            completed = session.build_response(
+                self._request(session, final_state),
+                [],
+            )
+        self.assertEqual("complete", completed["decision"])
+        self.assertIn("J4已使工具对齐托盘", completed["reason"])
+        self.assertIn("J3未下降", completed["reason"])
 
 
 if __name__ == "__main__":

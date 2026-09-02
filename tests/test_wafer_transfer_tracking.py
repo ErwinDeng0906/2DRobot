@@ -325,16 +325,102 @@ class WaferTransferSessionTests(unittest.TestCase):
         self.assertEqual(TransferPhase.TRACKING_PICK, session.phase)
         np.testing.assert_allclose(session.active_delta_world_xy(), [5.0, 5.0])
 
-    def test_source_selection_requires_three_of_five_current_normal_frames(self) -> None:
+    def test_source_selection_requires_two_consecutive_normal_frames(self) -> None:
         session = WaferTransferSession(geometry())
-        self._update_overview_frames(session, count=2)
+        self._update_overview_frames(session, count=1)
         with self.assertRaisesRegex(ValueError, "temporally stable"):
             session.select_source("P11")
         self._update_overview_frames(session, count=1)
         session.select_source("P11")
         consensus = session.snapshot()["source_consensus"]
-        self.assertEqual(3, consensus["occupied_frame_count"])
+        self.assertEqual(2, consensus["occupied_frame_count"])
         self.assertTrue(consensus["passed"])
+
+    def test_explicit_warning_breaks_two_frame_source_consensus(self) -> None:
+        session = WaferTransferSession(geometry())
+        self._update_overview_frames(session, count=1)
+        captured = time.monotonic()
+        session.update_overview(
+            result(SlotState.WARNING),
+            frame_sequence=2,
+            frame_captured_monotonic_s=captured,
+            robot_state=robot_state(120.0, 220.0, captured=captured),
+        )
+        self._update_overview_frames(session, count=1)
+        with self.assertRaisesRegex(ValueError, "temporally stable"):
+            session.select_source("P11")
+        self._update_overview_frames(session, count=1)
+        session.select_source("P11")
+
+    def test_brief_quality_dropout_retains_but_does_not_fake_consensus(self) -> None:
+        session = WaferTransferSession(geometry())
+        self._update_overview_frames(session, count=2)
+        bad = replace(
+            result(),
+            quality_passed=False,
+            coordinate_mapping_allowed=False,
+            failure_reason="synthetic one-frame pose dropout",
+        )
+        for sequence in (3, 4):
+            captured = time.monotonic()
+            session.update_overview(
+                bad,
+                frame_sequence=sequence,
+                frame_captured_monotonic_s=captured,
+                robot_state=robot_state(120.0, 220.0, captured=captured),
+            )
+        consensus = session.source_consensus("P11")
+        self.assertTrue(consensus["passed"])
+        self.assertEqual(2, consensus["dropout_frame_count"])
+
+        captured = time.monotonic()
+        session.update_overview(
+            bad,
+            frame_sequence=5,
+            frame_captured_monotonic_s=captured,
+            robot_state=robot_state(120.0, 220.0, captured=captured),
+        )
+        consensus = session.source_consensus("P11")
+        self.assertFalse(consensus["passed"])
+        self.assertEqual([], consensus["states"])
+
+    def test_good_frame_after_brief_dropout_reuses_fresh_positive_evidence(self) -> None:
+        session = WaferTransferSession(geometry())
+        self._update_overview_frames(session, count=2)
+        bad = replace(
+            result(),
+            quality_passed=False,
+            coordinate_mapping_allowed=False,
+            failure_reason="synthetic one-frame pose dropout",
+        )
+        captured = time.monotonic()
+        session.update_overview(
+            bad,
+            frame_sequence=3,
+            frame_captured_monotonic_s=captured,
+            robot_state=robot_state(120.0, 220.0, captured=captured),
+        )
+        self._update_overview_frames(session, count=1)
+        session.select_source("P11")
+        self.assertTrue(session.source_consensus("P11")["passed"])
+
+    def test_coordinate_mapping_dropout_cannot_be_used_for_click_selection(self) -> None:
+        session = WaferTransferSession(geometry())
+        self._update_overview_frames(session, count=2)
+        captured = time.monotonic()
+        session.update_overview(
+            replace(
+                result(),
+                coordinate_mapping_allowed=False,
+                failure_reason="synthetic tracker rejection",
+            ),
+            frame_sequence=3,
+            frame_captured_monotonic_s=captured,
+            robot_state=robot_state(120.0, 220.0, captured=captured),
+        )
+        self.assertTrue(session.source_consensus("P11")["passed"])
+        with self.assertRaisesRegex(ValueError, "coordinate-mappable"):
+            session.select_source("P11")
 
     def test_repeated_frame_sequence_cannot_satisfy_consensus(self) -> None:
         session = WaferTransferSession(geometry())
@@ -547,7 +633,6 @@ class WaferTransferSessionTests(unittest.TestCase):
             "silicon_detection_0820_geometry_robust",
             snapshot["locked_inputs"]["silicon_detection_profile"],
         )
-
 
 if __name__ == "__main__":
     unittest.main()

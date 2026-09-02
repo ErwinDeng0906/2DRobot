@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -29,6 +29,13 @@ from scara.vision.wafer_transfer_runtime import (
     LiveWaferTransferRuntime,
     WaferTransferFrame,
 )
+from scara.vision.wafer_pick_xy_positioning import (
+    OBSERVATION_WINDOW_SIZE,
+    select_bounded_observation_window,
+)
+
+
+_PICK_XY_REQUEST_TIMEOUT_MS = 4000
 
 
 _STYLE = """
@@ -224,6 +231,7 @@ class WaferTransferDialog(QDialog):
         self._pick_xy_pending_request: Optional[dict[str, Any]] = None
         self._pick_xy_pending_responder: Optional[Callable[[dict], None]] = None
         self._pick_xy_samples: deque[dict[str, Any]] = deque(maxlen=20)
+        self._pick_xy_rejection_counts: Counter[str] = Counter()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("Wafer Transfer Vision")
         self.resize(1500, 920)
@@ -377,7 +385,14 @@ class WaferTransferDialog(QDialog):
             self._stream_invalidated = False
         self.preview.set_image(image)
         if self._pick_xy_active and self._pick_xy_pending_request is not None:
-            self._pick_xy_samples.append(self._pick_xy_sample(frame))
+            sample = self._pick_xy_sample(frame)
+            self._pick_xy_samples.append(sample)
+            if sample.get("accepted") is not True:
+                self._pick_xy_rejection_counts.update(
+                    str(reason)
+                    for reason in sample.get("rejection_reasons")
+                    or ["未知质量门"]
+                )
             self._try_pick_xy_response()
         self._refresh_status(frame.session_snapshot)
 
@@ -415,11 +430,12 @@ class WaferTransferDialog(QDialog):
             f"ΔY={float(delta[1]):+.3f} mm，距离={distance:.3f} mm\n"
             f"当前J3={float(joints[2]):.4f} mm\n\n"
             "启动后会真实移动机械臂：\n"
-            "1. 仅执行分段XY运动，每步不超过2 mm；\n"
+            "1. 仅执行分段XY运动：远距离单步最多9.99 mm，接近目标自动减小；\n"
             "2. J3保持相机1安全观察高度，不执行下降；\n"
-            "3. J4只用于维持标定绝对Rz；\n"
+            "3. XY到位后只旋转J4，使工具方向对齐本次相机1测得的托盘方向；\n"
             "4. 不发送DO、真空或吸取命令；\n"
-            "5. 每步后重新采5帧，误差不减小或任一质量门失败立即停止。\n\n"
+            "5. 每步后重新采2张合格帧；4秒内画面不足会跳过本轮并自动重试，"
+            "明确质量门失败或误差不减小仍会停止。\n\n"
             "请确认托盘上方和逐轴扫掠路径无障碍、控制器T1模式且速度不超过20%、"
             "软限位正确且急停可用。"
         )
@@ -463,7 +479,7 @@ class WaferTransferDialog(QDialog):
         self._pick_xy_samples.clear()
         self._set_pick_xy_controls(True)
         self._last_interaction_text = (
-            f"{target} XY悬空定位已ARM；等待ActionWorker请求后的5张新鲜帧。"
+            f"{target} XY悬空定位已ARM；等待ActionWorker请求后的2张合格帧。"
         )
         self._refresh_status(self.runtime.snapshot())
         return session.action_task()
@@ -486,7 +502,7 @@ class WaferTransferDialog(QDialog):
         request: Mapping[str, Any],
         responder: Callable[[dict], None],
     ) -> None:
-        """Collect five frames captured after one ActionWorker request."""
+        """Collect two accepted frames after one ActionWorker request."""
 
         request_id = str(request.get("request_id") or "")
         if not self._pick_xy_active or self._pick_xy_session is None:
@@ -507,14 +523,33 @@ class WaferTransferDialog(QDialog):
                 }
             )
             return
+        if self._pick_xy_session.final_orientation_commanded:
+            try:
+                response = self._pick_xy_session.build_response(request, [])
+            except Exception as exc:  # noqa: BLE001 - fail closed at UI boundary
+                response = {
+                    "request_id": request_id,
+                    "decision": "abort",
+                    "reason": f"最终J4方向到位复核失败：{exc}",
+                }
+            responder(response)
+            self._last_interaction_text = str(
+                response.get("reason") or "最终J4方向已完成到位复核"
+            )
+            self._refresh_status(self.runtime.snapshot())
+            return
         self._pick_xy_pending_request = dict(request)
         self._pick_xy_pending_responder = responder
         self._pick_xy_samples.clear()
+        self._pick_xy_rejection_counts.clear()
         self._last_interaction_text = (
-            f"执行请求 {request_id}：等待请求之后的5张合格帧；此时尚未运动。"
+            f"执行请求 {request_id}：等待请求之后的2张合格帧；此时尚未运动。"
         )
         self._refresh_status(self.runtime.snapshot())
-        QTimer.singleShot(5000, lambda: self._pick_xy_timeout(request_id))
+        QTimer.singleShot(
+            _PICK_XY_REQUEST_TIMEOUT_MS,
+            lambda: self._pick_xy_timeout(request_id),
+        )
 
     def _pick_xy_sample(self, frame: WaferTransferFrame) -> dict[str, Any]:
         snapshot = frame.session_snapshot
@@ -528,11 +563,26 @@ class WaferTransferDialog(QDialog):
                 for gate in gates.values()
             )
         )
+        rejection_reasons: list[str] = []
+        if not frame.result.quality_passed:
+            rejection_reasons.append(
+                frame.result.failure_reason or "托盘位姿质量门未通过"
+            )
+        elif not frame.result.coordinate_mapping_allowed:
+            rejection_reasons.append(
+                frame.result.failure_reason or "坐标映射暂不可用"
+            )
+        rejection_reasons.extend(
+            str(name)
+            for name, gate in gates.items()
+            if not isinstance(gate, Mapping) or gate.get("passed") is not True
+        )
         return {
             "measurement_id": f"camera1-sequence-{frame.frame_sequence}",
             "frame_sequence": int(frame.frame_sequence),
             "captured_monotonic_s": frame.captured_monotonic_s,
             "accepted": accepted,
+            "rejection_reasons": rejection_reasons,
             "target_name": snapshot.get("source_slot"),
             "source_state": snapshot.get("source_state"),
             "source_consensus": snapshot.get("source_consensus"),
@@ -549,28 +599,25 @@ class WaferTransferDialog(QDialog):
         if request is None:
             return []
         requested_at = float(request.get("requested_monotonic_s") or math.inf)
-        rows = [
-            sample
-            for sample in self._pick_xy_samples
-            if float(sample.get("captured_monotonic_s") or -math.inf)
-            >= requested_at
-        ]
-        # The first five processed post-request frames form one indivisible
-        # evidence window. Do not skip a failed frame and later assemble five
-        # passing samples from a longer interval.
-        return rows[:5]
+        return list(
+            select_bounded_observation_window(
+                list(self._pick_xy_samples),
+                requested_monotonic_s=requested_at,
+            )
+        )
 
     def _try_pick_xy_response(self) -> None:
         if self._pick_xy_pending_request is None or self._pick_xy_session is None:
             return
         samples = self._eligible_pick_xy_samples()
-        if len(samples) < 5:
+        if len(samples) < OBSERVATION_WINDOW_SIZE:
             return
         request = self._pick_xy_pending_request
         responder = self._pick_xy_pending_responder
         self._pick_xy_pending_request = None
         self._pick_xy_pending_responder = None
         self._pick_xy_samples.clear()
+        self._pick_xy_rejection_counts.clear()
         try:
             response = self._pick_xy_session.build_response(request, samples)
         except Exception as exc:  # noqa: BLE001 - fail closed at UI boundary
@@ -587,14 +634,26 @@ class WaferTransferDialog(QDialog):
             command = (proposal.get("calculation") or {}).get(
                 "commanded_correction_xy_mm"
             ) or [0.0, 0.0]
-            self._last_interaction_text = (
-                "本轮5帧通过，候选已交ActionWorker独立复核："
-                f"ΔX={float(command[0]):+.3f} mm，"
-                f"ΔY={float(command[1]):+.3f} mm。"
-            )
+            if proposal.get("phase") == "wafer_pick_final_tray_orientation":
+                calculation = proposal.get("calculation") or {}
+                self._last_interaction_text = (
+                    "XY已到位，最终J4-only候选已交ActionWorker独立复核："
+                    f"绝对Rz {float(calculation.get('current_absolute_rz_deg')):+.3f}° → "
+                    f"{float(calculation.get('target_absolute_rz_deg')):+.3f}°。"
+                )
+            else:
+                self._last_interaction_text = (
+                    "本轮2帧通过，候选已交ActionWorker独立复核："
+                    f"ΔX={float(command[0]):+.3f} mm，"
+                    f"ΔY={float(command[1]):+.3f} mm。"
+                )
         elif decision == "complete":
             self._last_interaction_text = str(
                 response.get("reason") or "XY已到达目标正上方"
+            )
+        elif decision == "observe":
+            self._last_interaction_text = str(
+                response.get("reason") or "本轮画面不足，已跳过并自动重试"
             )
         else:
             self._last_interaction_text = "已停止：" + str(
@@ -607,18 +666,34 @@ class WaferTransferDialog(QDialog):
         if request is None or str(request.get("request_id") or "") != request_id:
             return
         responder = self._pick_xy_pending_responder
+        rejection_summary = ", ".join(
+            f"{reason}×{count}"
+            for reason, count in self._pick_xy_rejection_counts.most_common(4)
+        )
         self._pick_xy_pending_request = None
         self._pick_xy_pending_responder = None
         self._pick_xy_samples.clear()
+        self._pick_xy_rejection_counts.clear()
         if callable(responder):
             responder(
                 {
                     "request_id": request_id,
-                    "decision": "abort",
-                    "reason": "5秒内未获得5张请求之后的合格相机1画面",
+                    "decision": "observe",
+                    "calibration_sha256": str(
+                        request.get("calibration_sha256") or ""
+                    ).upper(),
+                    "reason": (
+                        "本轮4秒内未获得2张间隔不超过1.75秒的合格相机1画面；"
+                        "未运动，自动进入下一观察窗口"
+                        + (
+                            f"；拒绝统计：{rejection_summary}"
+                            if rejection_summary
+                            else ""
+                        )
+                    ),
                 }
             )
-        self._last_interaction_text = "XY悬空定位已因新鲜帧超时停止。"
+        self._last_interaction_text = "本轮新鲜帧不足，未运动，正在自动重试。"
         self._refresh_status(self.runtime.snapshot())
 
     def finish_pick_xy_session(self, ok: bool, message: str) -> tuple[bool, str]:
@@ -627,6 +702,7 @@ class WaferTransferDialog(QDialog):
         self._pick_xy_pending_request = None
         self._pick_xy_pending_responder = None
         self._pick_xy_samples.clear()
+        self._pick_xy_rejection_counts.clear()
         self._pick_xy_session = None
         self._set_pick_xy_controls(False)
         if session is not None:
@@ -652,6 +728,19 @@ class WaferTransferDialog(QDialog):
         distance = snapshot.get("active_distance_mm")
         registration = snapshot.get("registration") or {}
         consensus = snapshot.get("source_consensus") or {}
+        pending_evidence = (
+            self._eligible_pick_xy_samples()
+            if self._pick_xy_pending_request is not None
+            else []
+        )
+        latest_rejection = ""
+        if self._pick_xy_samples:
+            latest_sample = self._pick_xy_samples[-1]
+            if latest_sample.get("accepted") is not True:
+                latest_rejection = "；最新忽略=" + ", ".join(
+                    str(item)
+                    for item in latest_sample.get("rejection_reasons") or ["未知质量门"]
+                )
         origin = registration.get("origin_world_xy_mm")
         if delta is None:
             delta_text = "不可用"
@@ -678,7 +767,9 @@ class WaferTransferDialog(QDialog):
             (
                 "拾取稳定证据："
                 f"{consensus.get('occupied_frame_count', 0)}/"
-                f"{consensus.get('window_frame_count', 5)} 帧正常"
+                f"{consensus.get('window_frame_count', 2)} 帧正常 · "
+                f"临时掉检 {consensus.get('dropout_frame_count', 0)}/"
+                f"{consensus.get('maximum_dropout_frame_count', 2)}"
             ),
             f"W←T：{registration_text}",
             f"吸盘到当前目标：{delta_text}",
@@ -698,7 +789,16 @@ class WaferTransferDialog(QDialog):
                 if self._pick_xy_active
                 else "XY悬空移动：未ARM"
             ),
-            "硬限制：J3不下降；无吸取、真空或DO；J4仅维持固定绝对Rz。",
+            (
+                f"本轮有效视觉证据：{len(pending_evidence)}/"
+                f"{OBSERVATION_WINDOW_SIZE}{latest_rejection}"
+                if self._pick_xy_pending_request is not None
+                else "本轮有效视觉证据：未采集"
+            ),
+            (
+                "硬限制：J3不下降；无吸取、真空或DO；XY阶段固定标定Rz，"
+                "到位后仅J4对齐托盘方向。"
+            ),
         ]
         registration_error = snapshot.get("registration_error")
         sync_error = snapshot.get("robot_state_sync_error")

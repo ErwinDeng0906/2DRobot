@@ -1,6 +1,6 @@
 """Fail-closed XY-only positioning above a selected tray wafer.
 
-This module owns no camera, Qt widget, or robot controller.  It consumes five
+This module owns no camera, Qt widget, or robot controller.  It consumes two
 fresh camera-1 observations for each request and may return one candidate joint
 target.  ``ActionWorker`` remains the sole hardware owner and repeats the
 controller and kinematic checks immediately before every physical move.
@@ -18,9 +18,10 @@ import cv2
 import numpy as np
 
 from scara.file_io import atomic_write_text
-from scara.pipeline.kinematics import rz_of
+from scara.pipeline.kinematics import j4_for_rz, rz_of
 from scara.pipeline.xy_correction_planner import (
     angular_difference_deg,
+    audit_j4_only_orientation_target,
     plan_fixed_rz_xy_step,
 )
 
@@ -33,10 +34,16 @@ from .tray_pose_estimator import load_tray_board_geometry
 WAFER_PICK_XY_RUNTIME_REQUEST_KEY = "wafer_pick_xy_overhead_positioning"
 RESULT_FILENAME = "wafer_pick_xy_positioning.json"
 RUNTIME_ACTION_SLOTS = 120
-OBSERVATION_WINDOW_SIZE = 5
+OBSERVATION_WINDOW_SIZE = 2
+MAXIMUM_OBSERVATION_GAP_S = 1.75
+MAXIMUM_OBSERVATION_WINDOW_SPAN_S = 2.0
 MAXIMUM_MOVEMENT_COUNT = 100
 MAXIMUM_CUMULATIVE_PATH_MM = 200.0
-MAXIMUM_STEP_MM = 2.0
+MAXIMUM_STEP_MM = 10.0
+CONTROLLER_QUANTIZATION_HEADROOM_MM = 0.01
+MAXIMUM_SEQUENTIAL_TRANSIENT_XY_MM = 8.0
+MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 5.0
+MAXIMUM_FINAL_J4_ROTATION_DEG = 30.0
 LOCAL_EXTENT_MM = 70.0
 DOMAIN_MARGIN_MM = 5.0
 ARRIVAL_MEDIAN_MM = 0.50
@@ -90,13 +97,59 @@ def _registered_tray_center_world_xy(
 
 def _step_policy(distance_mm: float) -> tuple[float, float]:
     distance = float(distance_mm)
+    if distance > 15.0:
+        return 0.85, 10.0
     if distance > 5.0:
-        return 0.85, 2.0
+        return 0.80, 5.0
     if distance > 2.0:
-        return 0.75, 1.0
+        return 0.75, 2.0
     if distance > 0.75:
         return 0.65, 0.50
     return 0.50, 0.25
+
+
+def select_bounded_observation_window(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    requested_monotonic_s: float,
+) -> list[Mapping[str, Any]]:
+    """Select two accepted observations while tolerating brief dropouts.
+
+    Rejected frames are never used as evidence.  They may occur between good
+    frames only while the accepted-to-accepted gap and total window span stay
+    tightly bounded.  A longer interruption starts a new evidence window.
+    """
+
+    requested = float(requested_monotonic_s)
+    if not math.isfinite(requested):
+        return []
+    accepted: list[Mapping[str, Any]] = []
+    for sample in samples:
+        try:
+            captured = float(sample.get("captured_monotonic_s", math.nan))
+        except (TypeError, ValueError, OverflowError):
+            captured = math.nan
+        if not math.isfinite(captured) or captured < requested:
+            continue
+        if accepted:
+            previous = float(accepted[-1]["captured_monotonic_s"])
+            if (
+                captured <= previous
+                or captured - previous > MAXIMUM_OBSERVATION_GAP_S
+            ):
+                accepted.clear()
+        if sample.get("accepted") is not True:
+            continue
+        accepted.append(sample)
+        while (
+            accepted
+            and captured - float(accepted[0]["captured_monotonic_s"])
+            > MAXIMUM_OBSERVATION_WINDOW_SPAN_S
+        ):
+            accepted.pop(0)
+        if len(accepted) >= OBSERVATION_WINDOW_SIZE:
+            return accepted[-OBSERVATION_WINDOW_SIZE:]
+    return accepted[-OBSERVATION_WINDOW_SIZE:]
 
 
 class WaferPickXYPositioningSession:
@@ -169,11 +222,20 @@ class WaferPickXYPositioningSession:
             2,
             "initial registration origin",
         )
+        self.locked_target_world_xy_mm = registered_slot_world_xy_mm(
+            self.geometry,
+            self.target_name,
+            registration,
+        )
         self.initial_registration_yaw_deg = float(
             registration.get("yaw_world_from_tray_deg", math.nan)
         )
         if not math.isfinite(self.initial_registration_yaw_deg):
             raise RuntimeError("启动时W<-T缺少有效yaw")
+        # "托盘是正的"在本阶段定义为：最终工具绝对Rz与本次相机1登记的
+        # 托盘X轴世界yaw一致。XY搜索期间仍保持吸盘标定Rz，只有视觉到位后
+        # 才允许一次J4-only旋转。
+        self.final_tray_rz_deg = self.initial_registration_yaw_deg
 
         if abs(self.initial_joints[2] - self.required_j3_mm) > 0.20:
             raise RuntimeError(
@@ -196,6 +258,9 @@ class WaferPickXYPositioningSession:
         self.previous_command_norm_mm: float | None = None
         self.iterations: list[dict[str, Any]] = []
         self.final_hold: dict[str, Any] | None = None
+        self.final_orientation_commanded = False
+        self.final_orientation_audit: dict[str, Any] | None = None
+        self.final_orientation_proposal: dict[str, Any] | None = None
         self.evidence_images: list[dict[str, Any]] = []
 
     @property
@@ -226,16 +291,18 @@ class WaferPickXYPositioningSession:
                         "domain_margin_mm": DOMAIN_MARGIN_MM,
                         "required_j3_mm": self.required_j3_mm,
                         "required_rz_deg": self.required_rz_deg,
+                        "final_rz_deg": self.final_tray_rz_deg,
+                        "max_j4_rotation_deg": MAXIMUM_FINAL_J4_ROTATION_DEG,
                         "max_xy_step_norm_mm": MAXIMUM_STEP_MM,
                         "max_xy_axis_mm": MAXIMUM_STEP_MM,
                         "j3_tolerance_mm": 0.20,
                         "rz_tolerance_deg": 0.30,
                         "target_rz_tolerance_deg": 0.15,
-                        "max_sequential_transient_rz_deg": 1.0,
+                        "max_sequential_transient_rz_deg": MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG,
                         "precompensate_rz": True,
                         "max_state_drift_xy_mm": 0.10,
                         "max_state_drift_joint": 0.10,
-                        "max_sequential_transient_xy_mm": 5.0,
+                        "max_sequential_transient_xy_mm": MAXIMUM_SEQUENTIAL_TRANSIENT_XY_MM,
                         "move_tolerance": 0.02,
                         "proposal_max_age_s": 5.0,
                         "fk_pose_xy_tolerance_mm": 0.20,
@@ -246,8 +313,10 @@ class WaferPickXYPositioningSession:
             "api_version": 1,
             "name": f"吸盘移动到{self.target_name}硅片正上方",
             "description": (
-                "使用相机1、本次W<-T和五帧复测做分段XY悬空定位。"
-                "固定J3安全观察高度与绝对Rz；不执行下降、吸取、DO或真空。"
+                "使用相机1、本次W<-T和两帧复测做分段XY悬空定位。"
+                "远距离单步最多9.99mm，接近目标时自动减小；XY阶段固定J3安全"
+                "观察高度与标定Rz，到位后仅旋转J4使工具对齐托盘方向；不执行"
+                "下降、吸取、DO或真空。"
             ),
             "camera_model": {
                 "offset_mm": 0.0,
@@ -286,13 +355,12 @@ class WaferPickXYPositioningSession:
     def _window(self, request: Mapping[str, Any], samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         rows = list(samples)
         if len(rows) != OBSERVATION_WINDOW_SIZE:
-            raise ValueError("XY悬空定位每轮必须恰好使用5张新鲜画面")
+            raise ValueError("XY悬空定位每轮必须恰好使用2张新鲜画面")
         requested_at = float(request.get("requested_monotonic_s", math.nan))
         if not math.isfinite(requested_at):
             raise ValueError("执行请求缺少有效时间戳")
 
-        transforms: list[np.ndarray] = []
-        target_world: list[np.ndarray] = []
+        observed_target_world: list[np.ndarray] = []
         robot_xy: list[np.ndarray] = []
         distances: list[float] = []
         origins: list[np.ndarray] = []
@@ -346,21 +414,27 @@ class WaferPickXYPositioningSession:
             point = registered_slot_world_xy_mm(
                 self.geometry, self.target_name, registration
             )
-            transforms.append(transform)
-            target_world.append(point)
+            observed_target_world.append(point)
             robot_xy.append(pose[:2])
-            distances.append(float(np.linalg.norm(point - pose[:2])))
+            # The robot follows the one W<-T transform accepted when this
+            # session was armed.  Later frames are independent drift evidence,
+            # not permission to move the target every time PnP jitters.
+            distances.append(
+                float(np.linalg.norm(self.locked_target_world_xy_mm - pose[:2]))
+            )
             origins.append(transform[:2, 3])
             yaws.append(_yaw_deg(transform))
             rms_values.append(float(sample.get("reprojection_rms_px", math.inf)))
 
-        target_array = np.asarray(target_world, dtype=np.float64)
+        target_array = np.asarray(observed_target_world, dtype=np.float64)
         robot_array = np.asarray(robot_xy, dtype=np.float64)
         origin_array = np.asarray(origins, dtype=np.float64)
-        target_median = np.median(target_array, axis=0)
+        observed_target_median = np.median(target_array, axis=0)
         robot_median = np.median(robot_array, axis=0)
         distance_array = np.asarray(distances, dtype=np.float64)
-        target_deviation = np.linalg.norm(target_array - target_median, axis=1)
+        target_deviation = np.linalg.norm(
+            target_array - observed_target_median, axis=1
+        )
         robot_deviation = np.linalg.norm(robot_array - robot_median, axis=1)
         origin_deviation = np.linalg.norm(
             origin_array - np.median(origin_array, axis=0), axis=1
@@ -407,15 +481,20 @@ class WaferPickXYPositioningSession:
         registration_yaw_drift = angular_difference_deg(
             yaw_median, self.initial_registration_yaw_deg
         )
+        observation_gaps = [
+            captured_times[index] - captured_times[index - 1]
+            for index in range(1, len(captured_times))
+        ]
+        observation_span = captured_times[-1] - captured_times[0]
 
         gates = {
             "all_frames_explicitly_accepted": _gate(
-                all_accepted, all_accepted, "true for all five frames"
+                all_accepted, all_accepted, "true for both frames"
             ),
-            "five_fresh_post_request_frames": _gate(
+            "fresh_post_request_frames": _gate(
                 all_fresh, [float(row.get("captured_monotonic_s", math.nan)) for row in rows], ">= request timestamp"
             ),
-            "five_distinct_ordered_frames": _gate(
+            "distinct_ordered_frames": _gate(
                 len(set(sequences)) == OBSERVATION_WINDOW_SIZE
                 and all(value >= 0 for value in sequences)
                 and all(
@@ -426,7 +505,23 @@ class WaferPickXYPositioningSession:
                     "frame_sequences": sequences,
                     "captured_monotonic_s": captured_times,
                 },
-                "five unique frame sequences with strictly increasing capture times",
+                "two unique frame sequences with strictly increasing capture times",
+            ),
+            "bounded_observation_timing": _gate(
+                observation_span <= MAXIMUM_OBSERVATION_WINDOW_SPAN_S
+                and all(
+                    0.0 < gap <= MAXIMUM_OBSERVATION_GAP_S
+                    for gap in observation_gaps
+                ),
+                {
+                    "adjacent_accepted_frame_gaps_s": observation_gaps,
+                    "window_span_s": observation_span,
+                },
+                (
+                    f"each accepted gap <= {MAXIMUM_OBSERVATION_GAP_S:.2f}s and "
+                    f"window span <= {MAXIMUM_OBSERVATION_WINDOW_SPAN_S:.1f}s"
+                ),
+                "failed frames may be skipped only inside this bounded interval",
             ),
             "target_name_locked": _gate(
                 all_target_locked,
@@ -439,7 +534,7 @@ class WaferPickXYPositioningSession:
                 "all occupied",
             ),
             "overview_selection_gates": _gate(
-                all_gates_pass, all_gates_pass, "all PASS in all five frames"
+                all_gates_pass, all_gates_pass, "all PASS in both frames"
             ),
             "robot_height_and_rz_locked": _gate(
                 all_states_valid,
@@ -498,7 +593,12 @@ class WaferPickXYPositioningSession:
         }
         return {
             "gates": gates,
-            "target_world_xy_mm": target_median.astype(float).tolist(),
+            "target_world_xy_mm": self.locked_target_world_xy_mm.astype(
+                float
+            ).tolist(),
+            "observed_target_world_xy_mm": observed_target_median.astype(
+                float
+            ).tolist(),
             "robot_world_xy_mm": robot_median.astype(float).tolist(),
             "distance_median_mm": distance_median,
             "distance_maximum_mm": float(np.max(distance_array)),
@@ -517,7 +617,7 @@ class WaferPickXYPositioningSession:
             actual_decrease >= required_decrease,
             actual_decrease,
             f">={required_decrease:.3f} mm",
-            "每次实际移动后，下一独立五帧必须证明距离继续减小",
+            "每次实际移动后，下一独立两帧必须证明距离继续减小",
         )
 
     def build_response(
@@ -532,6 +632,57 @@ class WaferPickXYPositioningSession:
             return self._abort(request_id, "执行请求目标与锁定硅片不一致")
         if str(request.get("calibration_sha256") or "").upper() != self.calibration_hash:
             return self._abort(request_id, "平面手眼标定hash在会话中发生变化")
+
+        # The next ActionWorker request after the J4-only command is a
+        # controller-state verification, not another camera-dependent XY step.
+        # This avoids an unnecessary final visual wait and, importantly, does
+        # not run the imaging-Rz gate after J4 has intentionally left that Rz.
+        if self.final_orientation_commanded:
+            state = request.get("controller_state") or {}
+            try:
+                current_joints = _vector(
+                    state.get("joints"), 4, "final controller joints"
+                )
+                current_pose = _vector(
+                    state.get("pose"), 6, "final controller pose"
+                )
+                final_audit = audit_j4_only_orientation_target(
+                    current_joints.astype(float).tolist(),
+                    current_pose.astype(float).tolist(),
+                    current_joints.astype(float).tolist(),
+                    anchor_robot_xy_mm=self.anchor_robot_xy_mm,
+                    local_extent_mm=LOCAL_EXTENT_MM,
+                    domain_margin_mm=DOMAIN_MARGIN_MM,
+                    required_j3_mm=self.required_j3_mm,
+                    j3_tolerance_mm=0.20,
+                    required_start_rz_deg=self.final_tray_rz_deg,
+                    start_rz_tolerance_deg=0.15,
+                    target_rz_deg=self.final_tray_rz_deg,
+                    target_rz_tolerance_deg=0.15,
+                    maximum_j4_rotation_deg=MAXIMUM_FINAL_J4_ROTATION_DEG,
+                )
+            except Exception as exc:
+                return self._abort(request_id, f"最终J4方向复核失败：{exc}")
+            if final_audit.get("passed") is not True:
+                return self._abort(
+                    request_id,
+                    "最终J4方向未通过到位复核",
+                    final_audit,
+                )
+            self.final_orientation_audit = final_audit
+            self.status = "arrived_above_selected_wafer_and_tray_aligned"
+            self.result_message = (
+                f"吸盘XY已到达{self.target_name}正上方，J4已使工具对齐托盘"
+                f"（绝对Rz={self.final_tray_rz_deg:+.3f}°）；J3未下降，真空未开启"
+            )
+            self._save()
+            return {
+                "request_id": request_id,
+                "decision": "complete",
+                "calibration_sha256": self.calibration_hash,
+                "reason": self.result_message,
+                "evaluation": final_audit,
+            }
         if self.movement_count >= MAXIMUM_MOVEMENT_COUNT:
             return self._abort(request_id, "达到最大XY移动次数，未继续运动")
 
@@ -539,7 +690,7 @@ class WaferPickXYPositioningSession:
             window = self._window(request, samples)
             image_names = self._save_images(samples, request_id)
         except Exception as exc:
-            return self._abort(request_id, f"五帧视觉证据无效：{exc}")
+            return self._abort(request_id, f"两帧视觉证据无效：{exc}")
         window["evidence_image_filenames"] = image_names
         gates = dict(window["gates"])
         gates["post_motion_progress"] = self._progress_gate(
@@ -547,7 +698,7 @@ class WaferPickXYPositioningSession:
         )
         if not all(gate.get("passed") is True for gate in gates.values()):
             window["safety_gates"] = gates
-            return self._abort(request_id, "XY悬空定位五帧质量门拒绝", window)
+            return self._abort(request_id, "XY悬空定位两帧质量门拒绝", window)
 
         distance = float(window["distance_median_mm"])
         if (
@@ -555,18 +706,100 @@ class WaferPickXYPositioningSession:
             and float(window["distance_maximum_mm"]) <= ARRIVAL_MAXIMUM_MM
             and float(window["distance_rms_mm"]) <= ARRIVAL_RMS_MM
         ):
-            self.status = "arrived_above_selected_wafer"
-            self.result_message = (
-                f"吸盘XY已到达{self.target_name}正上方；J3未下降，真空未开启"
-            )
             self.final_hold = {**window, "safety_gates": gates}
+            state = request.get("controller_state") or {}
+            try:
+                current_joints = _vector(
+                    state.get("joints"), 4, "request controller joints"
+                )
+                current_pose = _vector(
+                    state.get("pose"), 6, "request controller pose"
+                )
+                target_joints = current_joints.copy()
+                target_joints[3] = j4_for_rz(
+                    current_joints[0],
+                    current_joints[1],
+                    self.final_tray_rz_deg,
+                )
+                orientation_audit = audit_j4_only_orientation_target(
+                    current_joints.astype(float).tolist(),
+                    current_pose.astype(float).tolist(),
+                    target_joints.astype(float).tolist(),
+                    anchor_robot_xy_mm=self.anchor_robot_xy_mm,
+                    local_extent_mm=LOCAL_EXTENT_MM,
+                    domain_margin_mm=DOMAIN_MARGIN_MM,
+                    required_j3_mm=self.required_j3_mm,
+                    j3_tolerance_mm=0.20,
+                    required_start_rz_deg=self.required_rz_deg,
+                    start_rz_tolerance_deg=0.30,
+                    target_rz_deg=self.final_tray_rz_deg,
+                    target_rz_tolerance_deg=0.15,
+                    maximum_j4_rotation_deg=MAXIMUM_FINAL_J4_ROTATION_DEG,
+                )
+            except Exception as exc:
+                return self._abort(
+                    request_id, f"最终J4托盘对齐规划失败：{exc}", window
+                )
+            gates["final_j4_orientation_planner"] = _gate(
+                orientation_audit.get("passed") is True,
+                orientation_audit.get("passed"),
+                "true",
+            )
+            if not all(gate.get("passed") is True for gate in gates.values()):
+                return self._abort(
+                    request_id,
+                    "最终J4托盘对齐安全门拒绝",
+                    {**window, "safety_gates": gates, "audit": orientation_audit},
+                )
+            proposal = {
+                "proposal_id": f"wafer-pick-final-j4-{request_id}",
+                "target_name": self.target_name,
+                "phase": "wafer_pick_final_tray_orientation",
+                "motion_authorized": True,
+                "xy_only": False,
+                "j4_only": True,
+                "z_motion_authorized": False,
+                "vacuum_authorized": False,
+                "do_authorized": False,
+                "locked_j3_mm": self.required_j3_mm,
+                "locked_rz_deg": self.final_tray_rz_deg,
+                "calculation": {
+                    "commanded_correction_xy_mm": [0.0, 0.0],
+                    "target_world_xy_mm": list(window["target_world_xy_mm"]),
+                    "current_world_xy_mm": current_pose[:2].astype(float).tolist(),
+                    "distance_before_mm": distance,
+                    "current_absolute_rz_deg": float(
+                        rz_of(
+                            current_joints[0], current_joints[1], current_joints[3]
+                        )
+                    ),
+                    "target_absolute_rz_deg": self.final_tray_rz_deg,
+                },
+                "commanded_correction_xy_mm": [0.0, 0.0],
+                "predicted_endpoint_xy_mm": current_pose[:2].astype(float).tolist(),
+                "window": window,
+                "safety_gates": gates,
+                "planner": {
+                    "target_joints": target_joints.astype(float).tolist(),
+                    "audit": orientation_audit,
+                },
+                "movement_index": self.movement_count + 1,
+                "cumulative_path_after_mm": self.cumulative_path_mm,
+            }
+            self.final_orientation_commanded = True
+            self.final_orientation_proposal = proposal
+            self.status = "final_j4_tray_alignment_pending"
+            self.result_message = (
+                f"{self.target_name}的XY已到位；等待ActionWorker独立复核并只旋转J4，"
+                f"目标绝对Rz={self.final_tray_rz_deg:+.3f}°"
+            )
             self._save()
             return {
                 "request_id": request_id,
-                "decision": "complete",
+                "decision": "approve",
                 "calibration_sha256": self.calibration_hash,
-                "reason": self.result_message,
-                "evaluation": self.final_hold,
+                "proposal": proposal,
+                "target_joints": target_joints.astype(float).tolist(),
             }
 
         state = request.get("controller_state") or {}
@@ -576,36 +809,55 @@ class WaferPickXYPositioningSession:
         error = target_xy - current_pose[:2]
         error_norm = float(np.linalg.norm(error))
         gain, maximum_step = _step_policy(error_norm)
+        maximum_step = min(
+            maximum_step,
+            MAXIMUM_STEP_MM - CONTROLLER_QUANTIZATION_HEADROOM_MM,
+        )
         command = error * gain
         command_norm = float(np.linalg.norm(command))
         if command_norm > maximum_step:
             command *= maximum_step / command_norm
             command_norm = maximum_step
+        base_command = command.copy()
+        plan: dict[str, Any] | None = None
+        planner_backoff_scale = 1.0
+        planning_failures: list[str] = []
+        # A 10 mm Cartesian endpoint can cause a larger J1-then-J2 transient
+        # sweep in some arm configurations.  Keep the strict 8 mm transient
+        # gate and automatically shorten only that candidate instead of
+        # aborting the whole positioning session.
+        for scale in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.25):
+            command = base_command * scale
+            command_norm = float(np.linalg.norm(command))
+            try:
+                plan = plan_fixed_rz_xy_step(
+                    current_joints.astype(float).tolist(),
+                    current_pose.astype(float).tolist(),
+                    command.astype(float).tolist(),
+                    anchor_robot_xy_mm=self.anchor_robot_xy_mm,
+                    local_extent_mm=LOCAL_EXTENT_MM,
+                    domain_margin_mm=DOMAIN_MARGIN_MM,
+                    required_j3_mm=self.required_j3_mm,
+                    j3_tolerance_mm=0.20,
+                    required_rz_deg=self.required_rz_deg,
+                    rz_tolerance_deg=0.30,
+                    target_rz_tolerance_deg=0.15,
+                    max_xy_step_norm_mm=MAXIMUM_STEP_MM,
+                    max_xy_axis_mm=MAXIMUM_STEP_MM,
+                    max_sequential_transient_xy_mm=MAXIMUM_SEQUENTIAL_TRANSIENT_XY_MM,
+                    max_sequential_transient_rz_deg=MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG,
+                    precompensate_rz=True,
+                    enforce_sequential_intermediate_domain=False,
+                )
+                planner_backoff_scale = scale
+                break
+            except Exception as exc:
+                planning_failures.append(f"scale={scale:.2f}: {exc}")
+        if plan is None:
+            reason = planning_failures[-1] if planning_failures else "未知规划失败"
+            return self._abort(request_id, f"XY关节规划安全门拒绝：{reason}", window)
         if self.cumulative_path_mm + command_norm > MAXIMUM_CUMULATIVE_PATH_MM:
             return self._abort(request_id, "达到累计XY路径上限，未继续运动", window)
-
-        try:
-            plan = plan_fixed_rz_xy_step(
-                current_joints.astype(float).tolist(),
-                current_pose.astype(float).tolist(),
-                command.astype(float).tolist(),
-                anchor_robot_xy_mm=self.anchor_robot_xy_mm,
-                local_extent_mm=LOCAL_EXTENT_MM,
-                domain_margin_mm=DOMAIN_MARGIN_MM,
-                required_j3_mm=self.required_j3_mm,
-                j3_tolerance_mm=0.20,
-                required_rz_deg=self.required_rz_deg,
-                rz_tolerance_deg=0.30,
-                target_rz_tolerance_deg=0.15,
-                max_xy_step_norm_mm=MAXIMUM_STEP_MM,
-                max_xy_axis_mm=MAXIMUM_STEP_MM,
-                max_sequential_transient_xy_mm=5.0,
-                max_sequential_transient_rz_deg=1.0,
-                precompensate_rz=True,
-                enforce_sequential_intermediate_domain=False,
-            )
-        except Exception as exc:
-            return self._abort(request_id, f"XY关节规划安全门拒绝：{exc}", window)
 
         gates["kinematic_planner"] = _gate(
             (plan.get("audit") or {}).get("passed") is True,
@@ -630,6 +882,8 @@ class WaferPickXYPositioningSession:
                 "target_world_xy_mm": target_xy.astype(float).tolist(),
                 "current_world_xy_mm": current_pose[:2].astype(float).tolist(),
                 "distance_before_mm": error_norm,
+                "planner_backoff_scale": planner_backoff_scale,
+                "rejected_larger_candidate_count": len(planning_failures),
             },
             "commanded_correction_xy_mm": command.astype(float).tolist(),
             "predicted_endpoint_xy_mm": (
@@ -705,11 +959,16 @@ class WaferPickXYPositioningSession:
             "maximum_cumulative_path_mm": MAXIMUM_CUMULATIVE_PATH_MM,
             "iterations": self.iterations,
             "final_hold": self.final_hold,
+            "final_orientation_proposal": self.final_orientation_proposal,
+            "final_orientation_audit": self.final_orientation_audit,
             "evidence_images": self.evidence_images,
             "safety_boundary": {
-                "xy_only": True,
+                "xy_only_during_positioning": True,
                 "fixed_j3_mm": self.required_j3_mm,
-                "fixed_absolute_rz_deg": self.required_rz_deg,
+                "fixed_absolute_rz_during_xy_deg": self.required_rz_deg,
+                "final_j4_only_alignment": True,
+                "final_tray_absolute_rz_deg": self.final_tray_rz_deg,
+                "maximum_final_j4_rotation_deg": MAXIMUM_FINAL_J4_ROTATION_DEG,
                 "maximum_xy_step_mm": MAXIMUM_STEP_MM,
                 "tray_center_domain_half_width_mm": (
                     LOCAL_EXTENT_MM - DOMAIN_MARGIN_MM
@@ -731,13 +990,17 @@ class WaferPickXYPositioningSession:
         )
 
     def finish(self, ok: bool, message: str) -> tuple[bool, str]:
-        if self.status == "arrived_above_selected_wafer" and bool(ok):
+        successful_status = "arrived_above_selected_wafer_and_tray_aligned"
+        if self.status == successful_status and bool(ok):
             final_ok = True
             final_message = self.result_message
         else:
             final_ok = False
-            if self.status == "arrived_above_selected_wafer":
-                self.status = "worker_failed_after_visual_arrival"
+            if self.status in {
+                "final_j4_tray_alignment_pending",
+                successful_status,
+            }:
+                self.status = "worker_failed_during_final_j4_alignment"
                 self.result_message = str(message)
             elif self.status not in {"safety_rejected", "stopped"}:
                 self.status = "stopped" if not ok else "not_converged"
@@ -752,6 +1015,7 @@ class WaferPickXYPositioningSession:
                 "result_file": RESULT_FILENAME,
                 "proposal_count": self.movement_count,
                 "arrived_above_selected_wafer": final_ok,
+                "tray_orientation_aligned_by_j4": final_ok,
                 "descent_executed": False,
                 "vacuum_or_do_executed": False,
             }

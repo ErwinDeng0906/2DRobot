@@ -24,6 +24,8 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 from .kinematics import (
     fk_wrist,
     ik_wrist,
@@ -410,6 +412,154 @@ def audit_fixed_rz_xy_target(
     }
 
 
+def audit_j4_only_orientation_target(
+    current_joints: Sequence[float],
+    current_pose: Sequence[float],
+    target_joints: Sequence[float],
+    *,
+    anchor_robot_xy_mm: Sequence[float],
+    local_extent_mm: float,
+    domain_margin_mm: float,
+    required_j3_mm: float,
+    j3_tolerance_mm: float,
+    required_start_rz_deg: float,
+    start_rz_tolerance_deg: float,
+    target_rz_deg: float,
+    target_rz_tolerance_deg: float,
+    maximum_j4_rotation_deg: float,
+) -> dict[str, Any]:
+    """Audit a final orientation move that may change J4 and nothing else."""
+
+    start = _finite_vector(current_joints, 4, "current_joints")
+    pose = _finite_vector(current_pose, 6, "current_pose")
+    target = _finite_vector(target_joints, 4, "target_joints")
+    anchor = _finite_vector(anchor_robot_xy_mm, 2, "anchor_robot_xy_mm")
+    numeric = {
+        "local_extent_mm": float(local_extent_mm),
+        "domain_margin_mm": float(domain_margin_mm),
+        "required_j3_mm": float(required_j3_mm),
+        "j3_tolerance_mm": float(j3_tolerance_mm),
+        "required_start_rz_deg": float(required_start_rz_deg),
+        "start_rz_tolerance_deg": float(start_rz_tolerance_deg),
+        "target_rz_deg": float(target_rz_deg),
+        "target_rz_tolerance_deg": float(target_rz_tolerance_deg),
+        "maximum_j4_rotation_deg": float(maximum_j4_rotation_deg),
+    }
+    if not all(math.isfinite(value) for value in numeric.values()):
+        raise ValueError("J4 orientation audit limits must be finite")
+    if (
+        numeric["local_extent_mm"] <= 0.0
+        or numeric["domain_margin_mm"] < 0.0
+        or numeric["domain_margin_mm"] >= numeric["local_extent_mm"]
+        or numeric["j3_tolerance_mm"] <= 0.0
+        or numeric["start_rz_tolerance_deg"] <= 0.0
+        or numeric["target_rz_tolerance_deg"] <= 0.0
+        or numeric["maximum_j4_rotation_deg"] <= 0.0
+    ):
+        raise ValueError("J4 orientation audit limits are not positive/consistent")
+
+    current_xy = np.asarray(fk_wrist(start[0], start[1]), dtype=np.float64)
+    target_xy = np.asarray(fk_wrist(target[0], target[1]), dtype=np.float64)
+    pose_xy = np.asarray(pose[:2], dtype=np.float64)
+    step_xy = target_xy - pose_xy
+    current_delta = current_xy - anchor
+    target_delta = target_xy - anchor
+    allowed_domain = numeric["local_extent_mm"] - numeric["domain_margin_mm"]
+    start_rz = rz_of(start[0], start[1], start[3])
+    actual_target_rz = rz_of(target[0], target[1], target[3])
+    # Joint commands are absolute controller values.  Do not treat +179 and
+    # -179 as a harmless 2-degree move: a controller may execute the raw
+    # 358-degree difference instead of choosing a wrapped shortest path.
+    j4_rotation = abs(target[3] - start[3])
+    reachable, reach_note = reach_ok(float(target_xy[0]), float(target_xy[1]))
+    gates = {
+        "controller_pose_matches_fk": _gate(
+            float(np.linalg.norm(current_xy - pose_xy)) <= 0.20 + 1e-12,
+            actual=float(np.linalg.norm(current_xy - pose_xy)),
+            limit="<=0.20 mm",
+        ),
+        "current_j3_at_imaging_height": _gate(
+            abs(start[2] - numeric["required_j3_mm"])
+            <= numeric["j3_tolerance_mm"] + 1e-12,
+            actual=abs(start[2] - numeric["required_j3_mm"]),
+            limit=f"<={numeric['j3_tolerance_mm']:.3f} mm",
+        ),
+        "current_rz_matches_xy_stage": _gate(
+            angular_difference_deg(start_rz, numeric["required_start_rz_deg"])
+            <= numeric["start_rz_tolerance_deg"] + 1e-12,
+            actual=angular_difference_deg(start_rz, numeric["required_start_rz_deg"]),
+            limit=f"<={numeric['start_rz_tolerance_deg']:.3f} deg",
+        ),
+        "j1_unchanged": _gate(
+            abs(target[0] - start[0]) <= 0.002 + 1e-12,
+            actual=abs(target[0] - start[0]),
+            limit="<=0.002 deg",
+        ),
+        "j2_unchanged": _gate(
+            abs(target[1] - start[1]) <= 0.002 + 1e-12,
+            actual=abs(target[1] - start[1]),
+            limit="<=0.002 deg",
+        ),
+        "j3_unchanged": _gate(
+            abs(target[2] - start[2]) <= 0.002 + 1e-12,
+            actual=abs(target[2] - start[2]),
+            limit="<=0.002 mm",
+        ),
+        "xy_held_during_j4_rotation": _gate(
+            float(np.linalg.norm(step_xy)) <= 0.01 + 1e-12,
+            actual=float(np.linalg.norm(step_xy)),
+            limit="<=0.010 mm",
+        ),
+        "target_rz_aligned_to_tray": _gate(
+            angular_difference_deg(actual_target_rz, numeric["target_rz_deg"])
+            <= numeric["target_rz_tolerance_deg"] + 1e-12,
+            actual=angular_difference_deg(actual_target_rz, numeric["target_rz_deg"]),
+            limit=f"<={numeric['target_rz_tolerance_deg']:.3f} deg",
+        ),
+        "j4_rotation_limit": _gate(
+            j4_rotation <= numeric["maximum_j4_rotation_deg"] + 1e-12,
+            actual=j4_rotation,
+            limit=f"<={numeric['maximum_j4_rotation_deg']:.3f} deg",
+        ),
+        "target_reachable": _gate(
+            reachable,
+            actual=float(np.linalg.norm(target_xy)),
+            note=reach_note,
+        ),
+        "current_inside_local_domain": _gate(
+            float(np.max(np.abs(current_delta))) <= allowed_domain + 1e-12,
+            actual=current_delta.astype(float).tolist(),
+            limit=f"each axis <= {allowed_domain:.3f} mm",
+        ),
+        "target_inside_local_domain": _gate(
+            float(np.max(np.abs(target_delta))) <= allowed_domain + 1e-12,
+            actual=target_delta.astype(float).tolist(),
+            limit=f"each axis <= {allowed_domain:.3f} mm",
+        ),
+    }
+    return {
+        "passed": all(gate["passed"] is True for gate in gates.values()),
+        "gates": gates,
+        "current_xy_mm": pose_xy.astype(float).tolist(),
+        "target_xy_mm": target_xy.astype(float).tolist(),
+        "step_xy_mm": step_xy.astype(float).tolist(),
+        "step_norm_mm": float(np.linalg.norm(step_xy)),
+        "current_rz_deg": float(start_rz),
+        "target_rz_deg": float(actual_target_rz),
+        "target_joints": [float(value) for value in target],
+        "rz_precompensation": {
+            "enabled": False,
+            "required": False,
+            "target_joints": [float(value) for value in start],
+            "current_j4_deg": float(start[3]),
+            "target_j4_deg": float(start[3]),
+            "delta_j4_deg": 0.0,
+            "current_rz_deg": float(start_rz),
+            "target_rz_deg": float(start_rz),
+        },
+    }
+
+
 def plan_fixed_rz_xy_step(
     current_joints: Sequence[float],
     current_pose: Sequence[float],
@@ -509,6 +659,7 @@ def plan_fixed_rz_xy_step(
 __all__ = [
     "angular_difference_deg",
     "audit_fixed_rz_xy_target",
+    "audit_j4_only_orientation_target",
     "load_p22_float_preset",
     "load_stage7a_motion_contract",
     "plan_fixed_rz_xy_step",

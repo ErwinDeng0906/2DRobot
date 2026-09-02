@@ -51,8 +51,9 @@ class WaferTransferConfig:
     maximum_close_range_j3_disagreement_mm: float = 0.15
     click_maximum_slot_distance_mm: float = 12.5
     coarse_arrival_distance_mm: float = 2.0
-    source_consensus_window_frames: int = 5
-    source_consensus_minimum_occupied_frames: int = 3
+    source_consensus_window_frames: int = 2
+    source_consensus_minimum_occupied_frames: int = 2
+    source_consensus_maximum_dropout_frames: int = 2
     pick_requires_close_range_alignment: bool = True
     place_requires_close_range_insertability: bool = True
 
@@ -156,6 +157,8 @@ class WaferTransferSession:
             raise ValueError(
                 "source consensus minimum must be within the configured frame window"
             )
+        if config.source_consensus_maximum_dropout_frames < 0:
+            raise ValueError("source consensus dropout allowance cannot be negative")
         self.phase = TransferPhase.IDLE
         self.source_slot: Optional[str] = None
         self.destination_slot: Optional[str] = None
@@ -172,6 +175,7 @@ class WaferTransferSession:
             slot: deque(maxlen=config.source_consensus_window_frames)
             for slot in self.slot_names
         }
+        self._slot_dropout_streak = {slot: 0 for slot in self.slot_names}
 
     def _event(self, name: str, **details: Any) -> None:
         self.events.append(
@@ -217,8 +221,9 @@ class WaferTransferSession:
         self._refresh_ready_phase()
 
     def clear_overview_history(self, reason: str) -> None:
-        for history in self._slot_state_history.values():
+        for slot, history in self._slot_state_history.items():
             history.clear()
+            self._slot_dropout_streak[slot] = 0
         self._event("overview_history_cleared", reason=str(reason))
         self._refresh_ready_phase()
 
@@ -229,8 +234,9 @@ class WaferTransferSession:
         self.latest_frame_sequence = None
         self.latest_frame_captured_monotonic_s = None
         self.latest_robot_state = None
-        for history in self._slot_state_history.values():
+        for slot, history in self._slot_state_history.items():
             history.clear()
+            self._slot_dropout_streak[slot] = 0
         self.close_range = None
         self.close_range_gates = {}
         active = self.phase in {
@@ -278,21 +284,34 @@ class WaferTransferSession:
                     self.latest_robot_state = state
             except (TypeError, ValueError, OverflowError):
                 self.latest_robot_state = None
-        if (
-            is_new_frame
-            and result.quality_passed
-            and result.coordinate_mapping_allowed
-        ):
-            for slot, state in _slot_states(result).items():
-                history = self._slot_state_history.get(slot)
-                if history is not None:
-                    history.append(str(state["state"]))
+        if is_new_frame:
+            states = (
+                _slot_states(result)
+                if result.quality_passed and result.coordinate_mapping_allowed
+                else {}
+            )
+            uncertain = {
+                SlotState.UNKNOWN.value,
+                SlotState.OUT_OF_VIEW.value,
+                SlotState.OCCLUDED.value,
+            }
+            for slot, history in self._slot_state_history.items():
+                state = states.get(slot)
+                if state is None or state["state"] in uncertain:
+                    self._slot_dropout_streak[slot] += 1
+                    if (
+                        self._slot_dropout_streak[slot]
+                        > self.config.source_consensus_maximum_dropout_frames
+                    ):
+                        history.clear()
+                    continue
+                self._slot_dropout_streak[slot] = 0
+                history.append(str(state["state"]))
         self._refresh_ready_phase()
         self._advance_tracking_phase()
 
     def source_consensus(self, slot_name: Optional[str] = None) -> dict[str, Any]:
         """Return the recent independent evidence used to accept a source."""
-
         slot = self.source_slot if slot_name is None else str(slot_name)
         history = list(self._slot_state_history.get(slot or "", ()))
         occupied_count = sum(
@@ -301,6 +320,7 @@ class WaferTransferSession:
         latest_occupied = bool(
             history and history[-1] == SlotState.OCCUPIED.value
         )
+        dropout_count = int(self._slot_dropout_streak.get(slot or "", 0))
         return {
             "slot": slot,
             "states": history,
@@ -310,11 +330,17 @@ class WaferTransferSession:
                 self.config.source_consensus_minimum_occupied_frames
             ),
             "window_frame_count": int(self.config.source_consensus_window_frames),
+            "dropout_frame_count": dropout_count,
+            "maximum_dropout_frame_count": int(
+                self.config.source_consensus_maximum_dropout_frames
+            ),
             "latest_is_occupied": latest_occupied,
             "passed": bool(
                 latest_occupied
                 and occupied_count
                 >= self.config.source_consensus_minimum_occupied_frames
+                and dropout_count
+                <= self.config.source_consensus_maximum_dropout_frames
             ),
         }
 
@@ -322,6 +348,15 @@ class WaferTransferSession:
         slot = str(slot_name)
         if slot not in self.slot_names:
             raise ValueError(f"unknown source slot {slot}")
+        if not (
+            self.latest_result is not None
+            and self.latest_result.quality_passed
+            and self.latest_result.coordinate_mapping_allowed
+        ):
+            raise ValueError(
+                "a quality-passed coordinate-mappable overview frame is required "
+                "before source selection"
+            )
         state = _slot_states(self.latest_result).get(slot)
         if state is None:
             raise ValueError(
@@ -355,6 +390,15 @@ class WaferTransferSession:
             raise ValueError(f"unknown destination slot {slot}")
         if slot == self.source_slot:
             raise ValueError("source and destination slots must be different")
+        if not (
+            self.latest_result is not None
+            and self.latest_result.quality_passed
+            and self.latest_result.coordinate_mapping_allowed
+        ):
+            raise ValueError(
+                "a quality-passed coordinate-mappable overview frame is required "
+                "before destination selection"
+            )
         state = _slot_states(self.latest_result).get(slot)
         if state is None:
             raise ValueError(

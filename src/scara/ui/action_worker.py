@@ -81,12 +81,13 @@ MOVED_TRAY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 15.0
 MOVED_TRAY_MAXIMUM_STATE_DRIFT_XY_MM = 0.20
 MOVED_TRAY_MAXIMUM_STATE_DRIFT_JOINT = 0.20
 WAFER_PICK_XY_RUNTIME_REQUEST_KEY = "wafer_pick_xy_overhead_positioning"
-WAFER_PICK_XY_MAXIMUM_STEP_NORM_MM = 2.0
-WAFER_PICK_XY_MAXIMUM_AXIS_STEP_MM = 2.0
+WAFER_PICK_XY_MAXIMUM_STEP_NORM_MM = 10.0
+WAFER_PICK_XY_MAXIMUM_AXIS_STEP_MM = 10.0
 WAFER_PICK_XY_MAXIMUM_LOCAL_EXTENT_MM = 70.0
-WAFER_PICK_XY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM = 5.0
+WAFER_PICK_XY_MAXIMUM_SEQUENTIAL_TRANSIENT_MM = 8.0
 WAFER_PICK_XY_MAXIMUM_RZ_TOLERANCE_DEG = 0.30
-WAFER_PICK_XY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 1.0
+WAFER_PICK_XY_MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 5.0
+WAFER_PICK_XY_MAXIMUM_J4_ROTATION_DEG = 30.0
 WAFER_PICK_XY_MAXIMUM_STATE_DRIFT_XY_MM = 0.10
 WAFER_PICK_XY_MAXIMUM_STATE_DRIFT_JOINT = 0.10
 WAFER_PICK_XY_MAXIMUM_SPEED_PERCENT = 20.0
@@ -572,6 +573,19 @@ def normalize_action_task(raw_task: object) -> dict:
                     ),
                 }
             )
+            if is_wafer_pick_xy:
+                step["final_rz_deg"] = _finite(
+                    raw.get("final_rz_deg"),
+                    f"第 {index} 步 final_rz_deg",
+                )
+                step["max_j4_rotation_deg"] = _positive_at_most(
+                    raw.get(
+                        "max_j4_rotation_deg",
+                        WAFER_PICK_XY_MAXIMUM_J4_ROTATION_DEG,
+                    ),
+                    f"第 {index} 步 max_j4_rotation_deg",
+                    WAFER_PICK_XY_MAXIMUM_J4_ROTATION_DEG,
+                )
         elif kind == "move_xyzr":
             for key in ("x_mm", "y_mm", "z_mm", "r_deg"):
                 step[key] = _finite(raw.get(key, 0.0), f"第 {index} 步 {key}")
@@ -1509,6 +1523,8 @@ class ActionWorker(QThread):
             "domain_margin_mm",
             "required_j3_mm",
             "required_rz_deg",
+            "final_rz_deg",
+            "max_j4_rotation_deg",
             "max_xy_step_norm_mm",
             "max_xy_axis_mm",
             "j3_tolerance_mm",
@@ -1524,7 +1540,7 @@ class ActionWorker(QThread):
             "proposal_max_age_s",
             "fk_pose_xy_tolerance_mm",
         )
-        return {key: step[key] for key in keys}
+        return {key: step[key] for key in keys if key in step}
 
     @staticmethod
     def _runtime_controller_gates(
@@ -1588,33 +1604,51 @@ class ActionWorker(QThread):
 
         from scara.pipeline.xy_correction_planner import (
             audit_fixed_rz_xy_target,
+            audit_j4_only_orientation_target,
         )
 
-        audit = audit_fixed_rz_xy_target(
-            current_state["joints"],
-            current_state["pose"],
-            target_joints,
-            anchor_robot_xy_mm=step["anchor_robot_xy_mm"],
-            local_extent_mm=step["local_extent_mm"],
-            domain_margin_mm=step["domain_margin_mm"],
-            required_j3_mm=step["required_j3_mm"],
-            j3_tolerance_mm=step["j3_tolerance_mm"],
-            required_rz_deg=step["required_rz_deg"],
-            rz_tolerance_deg=step["rz_tolerance_deg"],
-            max_xy_step_norm_mm=step["max_xy_step_norm_mm"],
-            max_xy_axis_mm=step["max_xy_axis_mm"],
-            max_sequential_transient_xy_mm=step[
-                "max_sequential_transient_xy_mm"
-            ],
-            target_rz_tolerance_deg=step["target_rz_tolerance_deg"],
-            max_sequential_transient_rz_deg=step[
-                "max_sequential_transient_rz_deg"
-            ],
-            precompensate_rz=step["precompensate_rz"],
-            enforce_sequential_intermediate_domain=step[
-                "enforce_sequential_intermediate_domain"
-            ],
-        )
+        if step.get("_audit_mode") == "j4_only":
+            audit = audit_j4_only_orientation_target(
+                current_state["joints"],
+                current_state["pose"],
+                target_joints,
+                anchor_robot_xy_mm=step["anchor_robot_xy_mm"],
+                local_extent_mm=step["local_extent_mm"],
+                domain_margin_mm=step["domain_margin_mm"],
+                required_j3_mm=step["required_j3_mm"],
+                j3_tolerance_mm=step["j3_tolerance_mm"],
+                required_start_rz_deg=step["required_rz_deg"],
+                start_rz_tolerance_deg=step["rz_tolerance_deg"],
+                target_rz_deg=step["final_rz_deg"],
+                target_rz_tolerance_deg=step["target_rz_tolerance_deg"],
+                maximum_j4_rotation_deg=step["max_j4_rotation_deg"],
+            )
+        else:
+            audit = audit_fixed_rz_xy_target(
+                current_state["joints"],
+                current_state["pose"],
+                target_joints,
+                anchor_robot_xy_mm=step["anchor_robot_xy_mm"],
+                local_extent_mm=step["local_extent_mm"],
+                domain_margin_mm=step["domain_margin_mm"],
+                required_j3_mm=step["required_j3_mm"],
+                j3_tolerance_mm=step["j3_tolerance_mm"],
+                required_rz_deg=step["required_rz_deg"],
+                rz_tolerance_deg=step["rz_tolerance_deg"],
+                max_xy_step_norm_mm=step["max_xy_step_norm_mm"],
+                max_xy_axis_mm=step["max_xy_axis_mm"],
+                max_sequential_transient_xy_mm=step[
+                    "max_sequential_transient_xy_mm"
+                ],
+                target_rz_tolerance_deg=step["target_rz_tolerance_deg"],
+                max_sequential_transient_rz_deg=step[
+                    "max_sequential_transient_rz_deg"
+                ],
+                precompensate_rz=step["precompensate_rz"],
+                enforce_sequential_intermediate_domain=step[
+                    "enforce_sequential_intermediate_domain"
+                ],
+            )
         closure_gate = (audit.get("gates") or {}).get(
             "controller_pose_matches_fk"
         )
@@ -1737,7 +1771,10 @@ class ActionWorker(QThread):
                 )
             audit_entry["operator_decision"] = decision
             if decision == "observe":
-                if step["request_key"] != MOVED_TRAY_RUNTIME_REQUEST_KEY:
+                if step["request_key"] not in {
+                    MOVED_TRAY_RUNTIME_REQUEST_KEY,
+                    WAFER_PICK_XY_RUNTIME_REQUEST_KEY,
+                }:
                     raise RuntimeError(f"{runtime_label}不允许observe响应")
                 if str(response.get("calibration_sha256") or "").upper() != step["calibration_sha256"]:
                     raise RuntimeError(f"{runtime_label}观察响应的平面手眼hash不匹配")
@@ -1811,10 +1848,27 @@ class ActionWorker(QThread):
                         ),
                     )
             if step["request_key"] == WAFER_PICK_XY_RUNTIME_REQUEST_KEY:
-                if str(proposal.get("phase") or "") != "wafer_pick_xy_overhead":
+                phase = str(proposal.get("phase") or "")
+                if phase not in {
+                    "wafer_pick_xy_overhead",
+                    "wafer_pick_final_tray_orientation",
+                }:
                     raise RuntimeError(f"{runtime_label} proposal阶段标识无效")
-                if proposal.get("xy_only") is not True:
-                    raise RuntimeError(f"{runtime_label} proposal未声明XY-only")
+                if phase == "wafer_pick_xy_overhead":
+                    if proposal.get("xy_only") is not True:
+                        raise RuntimeError(f"{runtime_label} proposal未声明XY-only")
+                    if proposal.get("j4_only") is True:
+                        raise RuntimeError(f"{runtime_label} XY阶段错误声明J4-only")
+                    expected_locked_rz = step["required_rz_deg"]
+                else:
+                    if proposal.get("xy_only") is not False:
+                        raise RuntimeError(f"{runtime_label} 最终方向阶段不得声明XY-only")
+                    if proposal.get("j4_only") is not True:
+                        raise RuntimeError(f"{runtime_label} 最终方向阶段未声明J4-only")
+                    expected_locked_rz = step["final_rz_deg"]
+                    audit_step = dict(step)
+                    audit_step["_audit_mode"] = "j4_only"
+                    audit_step["precompensate_rz"] = False
                 forbidden_authorizations = {
                     "z_motion_authorized": proposal.get("z_motion_authorized"),
                     "vacuum_authorized": proposal.get("vacuum_authorized"),
@@ -1835,13 +1889,13 @@ class ActionWorker(QThread):
                     raise RuntimeError(f"{runtime_label} proposal改变了J3安全高度")
                 if (
                     abs(
-                        (locked_rz - step["required_rz_deg"] + 180.0)
+                        (locked_rz - expected_locked_rz + 180.0)
                         % 360.0
                         - 180.0
                     )
                     > 1e-9
                 ):
-                    raise RuntimeError(f"{runtime_label} proposal改变了锁定绝对Rz")
+                    raise RuntimeError(f"{runtime_label} proposal的目标绝对Rz与阶段不一致")
                 proposal_gates = proposal.get("safety_gates") or {}
                 if not proposal_gates or any(
                     not isinstance(gate, dict) or gate.get("passed") is not True
