@@ -1140,24 +1140,71 @@ class ScaraController(QObject):
         self._pool.start(_Command(self, f"前往「{name}」", None, fn=_go))
         return True
 
-    def _motion_guard(self) -> bool:
+    def motion_readiness_error(
+        self,
+        *,
+        maximum_speed_percent: Optional[float] = None,
+        required_mode: Optional[str] = None,
+    ) -> Optional[str]:
+        """Return the current hard motion-block reason without emitting signals."""
+
         if self._motion_sequence_lock.locked():
-            self.warning_occurred.emit("已有轨迹或多轴运动正在执行"); return False
+            return "已有轨迹或多轴运动正在执行"
         if not self._connected:
-            self.warning_occurred.emit("未连接，无法运动"); return False
+            return "未连接，无法运动"
         if (
             self._last_status.get("need_clear")
             or self._last_status.get("estop")
             or int(self._last_status.get("warn", 0)) != 0
         ):
-            self.warning_occurred.emit("有急停/报警，请先清报警再使能"); return False
+            return "有急停/报警，请先清报警再使能"
         if self._cfg.require_enable_before_motion and not bool(self._last_status.get("effectively_enabled")):
-            self.warning_occurred.emit("未使能，请先点击“使能”"); return False
+            return "未使能，请先点击“使能”"
+        if required_mode is not None:
+            current_mode = str(self._last_status.get("mode") or "?")
+            if current_mode != str(required_mode):
+                return f"当前模式为{current_mode}，本功能要求{required_mode}模式"
+        if maximum_speed_percent is not None:
+            try:
+                current_speed = float(self._last_status.get("speed"))
+                maximum_speed = float(maximum_speed_percent)
+            except (TypeError, ValueError, OverflowError):
+                return "无法确认当前速度，禁止启动运动"
+            if not math.isfinite(current_speed) or not math.isfinite(maximum_speed):
+                return "无法确认当前速度，禁止启动运动"
+            if current_speed > maximum_speed + 1e-12:
+                return (
+                    f"当前速度{current_speed:g}%，本功能要求不超过"
+                    f"{maximum_speed:g}%"
+                )
+        return None
+
+    def _motion_guard(
+        self,
+        *,
+        maximum_speed_percent: Optional[float] = None,
+        required_mode: Optional[str] = None,
+    ) -> bool:
+        reason = self.motion_readiness_error(
+            maximum_speed_percent=maximum_speed_percent,
+            required_mode=required_mode,
+        )
+        if reason is not None:
+            self.warning_occurred.emit(reason)
+            return False
         return True
 
-    def motion_ready(self) -> bool:
+    def motion_ready(
+        self,
+        *,
+        maximum_speed_percent: Optional[float] = None,
+        required_mode: Optional[str] = None,
+    ) -> bool:
         """供轨迹 UI 执行前检查连接、使能、报警和运动互斥状态。"""
-        return self._motion_guard()
+        return self._motion_guard(
+            maximum_speed_percent=maximum_speed_percent,
+            required_mode=required_mode,
+        )
 
     # —— 预设点持久化 —— #
     def _load_presets(self) -> None:

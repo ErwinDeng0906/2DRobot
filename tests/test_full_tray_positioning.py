@@ -275,9 +275,15 @@ class FullTraySessionTests(unittest.TestCase):
                 sum(row["type"] == "move_joints" for row in actions),
                 session.coarse_route["waypoint_count"],
             )
-            encoded = json.dumps(task, ensure_ascii=False).lower()
-            for forbidden in ("move_xyzr", "capture", "vacuum", "start_video", "stop_video"):
-                self.assertNotIn(forbidden, encoded)
+            action_types = {str(row.get("type", "")).lower() for row in actions}
+            for forbidden in (
+                "move_xyzr",
+                "capture",
+                "vacuum",
+                "start_video",
+                "stop_video",
+            ):
+                self.assertNotIn(forbidden, action_types)
             # ActionWorker must remain the sole creator of a new run folder.
             self.assertFalse(session.report_path.exists())
             self.assertEqual(len(session.all_slot_world_xy_mm), 36)

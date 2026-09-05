@@ -15,7 +15,14 @@ SRC = PROJECT_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from scara.pipeline.kinematics import fk_wrist, rz_of, solve_joints  # noqa: E402
+from scara.pipeline.kinematics import (  # noqa: E402
+    fk_wrist,
+    forearm_pose_W_F,
+    j4_for_rz,
+    rz_of,
+    solve_joints,
+)
+from scara.ui.action_worker import normalize_action_task  # noqa: E402
 from scara.vision.handeye_interaction import load_latest_suction_target  # noqa: E402
 from scara.vision.moved_tray_servo import registered_slot_world_xy_mm  # noqa: E402
 from scara.vision.tray_pose_estimator import load_tray_board_geometry  # noqa: E402
@@ -138,6 +145,39 @@ class WaferPickXYPositioningTests(unittest.TestCase):
             )
         return rows
 
+    @staticmethod
+    def _tray_transform_C_T(
+        session: WaferPickXYPositioningSession,
+        state: dict,
+        registration: dict,
+    ) -> list[list[float]]:
+        transform_W_T = np.asarray(registration["transform_W_T"], dtype=np.float64)
+        rotation_W_T = transform_W_T[:3, :3]
+        joints = np.asarray(state["joints"], dtype=np.float64)
+        forearm = np.asarray(
+            forearm_pose_W_F(float(joints[0]), float(joints[1])),
+            dtype=np.float64,
+        )
+        rotation_W_F = np.eye(3, dtype=np.float64)
+        rotation_W_F[:2, :2] = forearm[:2, :2]
+        rotation_F_C = np.asarray(session.handeye["R_F_C"], dtype=np.float64)
+        rotation_C_T = (
+            np.linalg.inv(rotation_F_C) @ rotation_W_F.T @ rotation_W_T
+        )
+        world_xy = np.asarray(state["pose"][:2], dtype=np.float64)
+        suction_T = np.zeros(3, dtype=np.float64)
+        suction_T[:2] = (
+            rotation_W_T[:2, :2].T
+            @ (world_xy - transform_W_T[:2, 3])
+        )
+        transform_C_T = np.eye(4, dtype=np.float64)
+        transform_C_T[:3, :3] = rotation_C_T
+        transform_C_T[:3, 3] = (
+            np.asarray(session.suction.p_C_S_mm, dtype=np.float64)
+            - rotation_C_T @ suction_T
+        )
+        return transform_C_T.astype(float).tolist()
+
     def _session(
         self,
         temporary: str,
@@ -167,6 +207,35 @@ class WaferPickXYPositioningTests(unittest.TestCase):
             "controller_state": state,
         }
 
+    def test_arm_accepts_latched_two_frame_proof_during_current_warning(self) -> None:
+        state = self._robot_state_at("P22")
+        snapshot = self._snapshot("P31", state)
+        snapshot["source_state"] = {"state": "warning"}
+        snapshot["source_consensus"] = {
+            "passed": True,
+            "evidence_passed": False,
+            "qualification_latched": True,
+            "qualification_frame_sequence": 17,
+            "occupied_frame_count": 0,
+            "required_occupied_frame_count": 2,
+            "window_frame_count": 2,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            session = WaferPickXYPositioningSession(
+                PROJECT_ROOT,
+                Path(temporary) / "run",
+                state,
+                snapshot,
+                target_name="P31",
+            )
+        self.assertTrue(session.source_confirmed_at_arm)
+        self.assertEqual(
+            17,
+            session.locked_acquisition_evidence[
+                "qualification_frame_sequence"
+            ],
+        )
+
     def test_action_task_allows_selected_slot_and_contains_no_descent_or_io(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session, _state = self._session(temporary)
@@ -191,6 +260,43 @@ class WaferPickXYPositioningTests(unittest.TestCase):
         forbidden = {"move_xyzr", "set_do", "capture", "start_video", "stop_video"}
         self.assertFalse(
             forbidden.intersection(step["type"] for step in task["actions"])
+        )
+
+    def test_tray_aligned_start_inserts_safe_j4_only_calibration_prealignment(self) -> None:
+        state = self._robot_state_at("P22")
+        joints = list(state["joints"])
+        tray_rz = float(self.registration["yaw_world_from_tray_deg"])
+        joints[3] = j4_for_rz(joints[0], joints[1], tray_rz)
+        state["joints"] = joints
+        state["pose"][5] = tray_rz
+        with tempfile.TemporaryDirectory() as temporary:
+            session = WaferPickXYPositioningSession(
+                PROJECT_ROOT,
+                Path(temporary) / "run",
+                state,
+                self._snapshot("P31", state),
+                target_name="P31",
+            )
+            task = session.action_task()
+            task = normalize_action_task(task)
+        self.assertTrue(session.prealignment_required)
+        self.assertTrue(session.prealignment_audit["passed"])
+        move = next(
+            step
+            for step in task["actions"]
+            if step["type"] == "move_joints"
+        )
+        self.assertEqual(joints[:3], move["joints"][:3])
+        self.assertAlmostEqual(
+            float(self.suction.imaging_j3_mm),
+            move["require_current_j3_mm"],
+            places=9,
+        )
+        self.assertLessEqual(abs(move["joints"][3] - joints[3]), 30.0)
+        self.assertAlmostEqual(
+            float(self.suction.rz_mean_deg),
+            rz_of(move["joints"][0], move["joints"][1], move["joints"][3]),
+            places=9,
         )
 
     def test_two_frames_produce_xy_only_candidate_with_fixed_j3(self) -> None:
@@ -218,6 +324,94 @@ class WaferPickXYPositioningTests(unittest.TestCase):
         )
         self.assertGreater(float(np.linalg.norm(command)), 5.0)
         self.assertAlmostEqual(response["target_joints"][2], state["joints"][2], places=9)
+
+    def test_locked_source_occlusion_does_not_interrupt_xy_motion_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session, state = self._session(temporary)
+            request = self._request(session, state)
+            samples = self._samples(
+                session.target_name,
+                state,
+                float(request["requested_monotonic_s"]),
+            )
+            motion_gates = {
+                "current_overview_pose_quality": {"passed": True},
+                "locked_runtime_registration": {"passed": True},
+                "locked_source_not_explicitly_contradicted": {
+                    "passed": True,
+                    "actual": "occluded",
+                },
+                "fresh_frame_synchronised_robot_state": {"passed": True},
+            }
+            for sample in samples:
+                sample["source_state"] = {"state": "occluded"}
+                sample["motion_gates"] = motion_gates
+            response = session.build_response(request, samples)
+
+        self.assertEqual("approve", response["decision"])
+        gates = response["proposal"]["safety_gates"]
+        self.assertTrue(gates["source_locked_normal_occupied_at_arm"]["passed"])
+        self.assertTrue(gates["current_overview_motion_gates"]["passed"])
+
+    def test_repeated_occlusion_completes_full_xy_and_final_j4_replay(self) -> None:
+        def state_from_joints(joints: list[float]) -> dict:
+            xy = fk_wrist(joints[0], joints[1])
+            return {
+                "captured_monotonic_s": time.monotonic(),
+                "joints": list(joints),
+                "pose": [
+                    float(xy[0]),
+                    float(xy[1]),
+                    float(joints[2]),
+                    180.0,
+                    0.0,
+                    float(rz_of(joints[0], joints[1], joints[3])),
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            session, state = self._session(temporary)
+            distances: list[float] = []
+            response = None
+            for _index in range(30):
+                state["captured_monotonic_s"] = time.monotonic()
+                request = self._request(session, state)
+                samples = self._samples(
+                    session.target_name,
+                    state,
+                    float(request["requested_monotonic_s"]),
+                )
+                for sample in samples:
+                    sample["source_state"] = {"state": "occluded"}
+                    sample["motion_gates"] = {
+                        "current_overview_pose_quality": {"passed": True},
+                        "locked_runtime_registration": {"passed": True},
+                        "locked_source_not_explicitly_contradicted": {
+                            "passed": True,
+                            "actual": "occluded",
+                        },
+                        "fresh_frame_synchronised_robot_state": {"passed": True},
+                    }
+                response = session.build_response(request, samples)
+                if response["decision"] == "complete":
+                    break
+                self.assertEqual("approve", response["decision"], response)
+                proposal = response["proposal"]
+                if proposal["phase"] == "wafer_pick_xy_overhead":
+                    distances.append(
+                        float(proposal["calculation"]["distance_before_mm"])
+                    )
+                state = state_from_joints(list(response["target_joints"]))
+
+        self.assertIsNotNone(response)
+        self.assertEqual("complete", response["decision"])
+        self.assertGreater(len(distances), 1)
+        self.assertTrue(
+            all(later < earlier for earlier, later in zip(distances, distances[1:]))
+        )
+        self.assertEqual(
+            "arrived_above_selected_wafer_and_tray_aligned", session.status
+        )
 
     def test_runtime_pnp_drift_is_a_gate_not_a_moving_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -261,6 +455,34 @@ class WaferPickXYPositioningTests(unittest.TestCase):
             response["proposal"]["safety_gates"][
                 "registration_locked_to_armed_session"
             ]["passed"]
+        )
+
+    def test_current_pose_rechecks_tray_without_overwriting_locked_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            session, state = self._session(temporary)
+            request = self._request(session, state)
+            samples = self._samples(
+                session.target_name,
+                state,
+                float(request["requested_monotonic_s"]),
+            )
+            current_transform = self._tray_transform_C_T(
+                session, state, self.registration
+            )
+            for sample in samples:
+                sample["tray_transform_C_T"] = current_transform
+            response = session.build_response(request, samples)
+
+        self.assertEqual("approve", response["decision"])
+        gate = response["proposal"]["safety_gates"][
+            "registration_locked_to_armed_session"
+        ]
+        self.assertTrue(gate["passed"])
+        self.assertAlmostEqual(0.0, gate["actual"]["translation_drift_mm"], places=6)
+        np.testing.assert_allclose(
+            response["proposal"]["window"]["target_world_xy_mm"],
+            session.locked_target_world_xy_mm,
+            atol=1e-9,
         )
 
     def test_bounded_window_tolerates_brief_rejected_frames(self) -> None:

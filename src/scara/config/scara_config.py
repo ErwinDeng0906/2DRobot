@@ -83,7 +83,10 @@ class ScaraConfig:
 
     default_speed_percent: int = 20
     min_speed_percent: int = 1
-    max_speed_percent: int = 100
+    # This installation intentionally caps every command at the validated
+    # camera-guided-motion ceiling.  ``clamp_speed`` also protects callers
+    # outside the UI, so a stale/high controller setting cannot be reissued.
+    max_speed_percent: int = 20
     default_joint_step_deg: float = 1.0
     default_cart_step_mm: float = 5.0
     move_hold_s: int = 4

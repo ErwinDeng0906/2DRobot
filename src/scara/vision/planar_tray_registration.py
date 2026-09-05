@@ -409,6 +409,7 @@ def estimate_planar_tray_registration(
     observations: Mapping[int, ArucoObservation],
     *,
     allow_partial_corners: bool = True,
+    prefer_slot_centres: bool = False,
 ) -> PlanarTrayRegistration:
     """Fit a guarded fixed-marker homography for read-only slot analysis."""
 
@@ -428,6 +429,35 @@ def estimate_planar_tray_registration(
         if observations[marker_id].complete_decoded
         and len(observations[marker_id].corners_px) == 4
     )
+
+    # Slot centres share the actual wafer-support plane (z=-2 mm). Outer
+    # markers are at several other heights: mixing their corners into one
+    # homography biases the slots as the visible marker set changes. Prefer
+    # same-plane observations when they provide sufficient spatial support.
+    if prefer_slot_centres:
+        inner_ids = [key for key in complete_ids if key in slot_by_marker_id]
+        if len(inner_ids) >= MINIMUM_CORRESPONDENCE_COUNT:
+            source = np.asarray([slots[slot_by_marker_id[key]][:2] for key in inner_ids], np.float32)
+            target = np.asarray([observations[key].center_px for key in inner_ids], np.float32)
+            matrix, inliers, errors = _fit_homography(source, target, np.asarray(inner_ids), threshold_px=GRID_RANSAC_THRESHOLD_PX)
+            if matrix is not None and np.count_nonzero(inliers) >= MINIMUM_CORRESPONDENCE_COUNT:
+                span_x, span_y = _span(source[inliers])
+                rms = float(np.sqrt(np.mean(errors[inliers] ** 2)))
+                maximum = float(np.max(errors[inliers]))
+                ratio = float(np.mean(inliers))
+                if (span_x >= MINIMUM_AXIS_SPAN_MM and span_y >= MINIMUM_AXIS_SPAN_MM
+                        and rms <= GRID_MAXIMUM_RMS_PX and maximum <= GRID_MAXIMUM_RESIDUAL_PX
+                        and ratio >= GRID_MINIMUM_INLIER_RATIO):
+                    return PlanarTrayRegistration(
+                        success=True, failure_reason=None, method='marker_grid_homography',
+                        fit_variant='slot_centres_only', homography_image_from_tray_xy=matrix,
+                        complete_marker_ids=tuple(inner_ids), partial_marker_ids=(),
+                        inlier_marker_ids=tuple(key for key, good in zip(inner_ids, inliers) if good),
+                        span_x_mm=span_x, span_y_mm=span_y, correspondence_count=len(inner_ids),
+                        inlier_correspondence_count=int(np.count_nonzero(inliers)), inlier_ratio=ratio,
+                        reprojection_rms_px=rms, reprojection_max_px=maximum,
+                        marker_diagnostics=diagnostics, partial_marker_diagnostics={},
+                    )
 
     marker_centres_T: list[list[float]] = []
     source_points: list[list[float]] = []

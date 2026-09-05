@@ -282,6 +282,24 @@ def detect_aruco_observations(
     return observations
 
 
+def observations_from_corners(corners_by_id: Mapping[int, np.ndarray]) -> dict[int, ArucoObservation]:
+    """Reuse this frame's decoded corners; no second detector/coordinate fit."""
+    result = {}
+    for marker_id, corners in corners_by_id.items():
+        points = np.asarray(corners, dtype=np.float64).reshape(4, 2)
+        perimeter, area, edge_ratio, diagonal_ratio = _marker_metrics(points)
+        edge = points[1] - points[0]
+        result[marker_id] = ArucoObservation(
+            marker_id=marker_id,
+            center_px=tuple(float(v) for v in points.mean(axis=0)),
+            corners_px=tuple(tuple(float(v) for v in p) for p in points),
+            angle_deg=math.degrees(math.atan2(float(edge[1]), float(edge[0]))),
+            perimeter_px=perimeter, area_px=area,
+            square_quality=max(0., min(1., edge_ratio * diagonal_ratio)),
+        )
+    return result
+
+
 def _polygon_coverage_ratio(points: np.ndarray, image_shape: tuple[int, ...]) -> float:
     polygon = cv2.convexHull(np.asarray(points, dtype=np.float32).reshape(-1, 2))
     area = abs(float(cv2.contourArea(polygon)))

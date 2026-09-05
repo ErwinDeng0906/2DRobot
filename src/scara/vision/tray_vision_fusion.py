@@ -9,6 +9,7 @@ fails its existing reprojection quality gates.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Optional, Sequence
 
@@ -26,6 +27,7 @@ from .slot_marker_observation import (
     associate_marker_to_slot,
     build_slot_projections,
     detect_aruco_observations,
+    observations_from_corners,
     estimate_slot_marker_registration,
     patch_points_to_image,
     warp_slot_patch,
@@ -416,15 +418,89 @@ class TrayVisionAnalyzer:
         geometry: Mapping[str, Any],
         slot_marker_layout: SlotMarkerLayout,
         config: TrayVisionFusionConfig = DEFAULT_TRAY_VISION_FUSION,
+        *,
+        consistent_slot_geometry: bool = False,
     ) -> None:
         self.pose_estimator = pose_estimator
         self.geometry = dict(geometry)
         self.slot_marker_layout = slot_marker_layout
         self.config = config
+        # Live transfer uses one observation geometry regardless of metric PnP
+        # PASS/WAIT. This flag never changes the metric pose quality contract.
+        self.consistent_slot_geometry = bool(consistent_slot_geometry)
+        self.show_raw_wafer_geometry = not self.consistent_slot_geometry
+        self._observation_anchor: Optional[PlanarTrayRegistration] = None
+        self._observation_image_shape: Optional[tuple[int, ...]] = None
+        self._observation_last_time: Optional[float] = None
+        from .marker_image_tracker import MarkerImageTracker
+        self._marker_image_tracker = MarkerImageTracker()
+        self._slot_patch_history = {}
+        slot_dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, slot_marker_layout.dictionary_name))
+        count = len(slot_dictionary.bytesList)
+        pose_dictionary = getattr(pose_estimator, 'dictionary', None)
+        self._shared_dictionary_count = count if (
+            pose_dictionary is not None and slot_dictionary.markerSize == pose_dictionary.markerSize
+            and np.array_equal(slot_dictionary.bytesList, pose_dictionary.bytesList[:count])
+        ) else 0
         geometry_slots = set(str(key) for key in self.geometry.get("slots", {}))
         layout_slots = set(slot_marker_layout.marker_id_by_slot)
         if len(geometry_slots) != 36 or geometry_slots != layout_slots:
             raise ValueError("metric geometry and slot marker layout must describe the same 36 slots")
+
+    def reset_observation_geometry(self) -> None:
+        self._observation_anchor = None
+        self._observation_image_shape = None
+        self._observation_last_time = None
+        self._marker_image_tracker.reset()
+        self._slot_patch_history.clear()
+
+    def _observation_projections(
+        self, registration: PlanarTrayRegistration, image_shape: tuple[int, ...],
+        captured: float,
+    ) -> tuple[Mapping[str, SlotProjection], dict[str, Any]]:
+        """Bound small crop-coordinate changes against a fixed image anchor.
+
+        Every call requires a newly accepted marker-plane fit. No rejected
+        frame, wafer label, robot pose or motion authorization is held here.
+        Comparing against the anchor (not the previous raw fit) prevents slow
+        cumulative camera/tray movement being hidden by the deadband.
+        """
+        current = build_planar_slot_projections(
+            self.geometry, registration, image_shape,
+            half_extent_mm=self.config.slot_half_extent_mm,
+        )
+        maximum_delta = None
+        anchor = self._observation_anchor
+        held = False
+        if (
+            anchor is not None and self._observation_image_shape == image_shape
+            and self._observation_last_time is not None
+            and 0.0 <= captured - self._observation_last_time <= 0.8
+        ):
+            previous = build_planar_slot_projections(
+                self.geometry, anchor, image_shape,
+                half_extent_mm=self.config.slot_half_extent_mm,
+            )
+            maximum_delta = max(
+                float(np.max(np.linalg.norm(
+                    np.asarray(current[key].polygon_px) - np.asarray(previous[key].polygon_px),
+                    axis=1,
+                ))) for key in current
+            )
+            if maximum_delta <= 2.0:
+                current = previous
+                held = True
+        if not held:
+            self._observation_anchor = registration
+        self._observation_image_shape = image_shape
+        self._observation_last_time = captured
+        return current, {
+            "crop_anchor_held": held,
+            "crop_anchor_max_delta_px": maximum_delta,
+            "crop_anchor_limit_px": 2.0,
+            "crop_anchor_homography": self._observation_anchor.homography_image_from_tray_xy.tolist(),
+            "metric_pose_cached": False,
+        }
 
     def _failed_result(
         self,
@@ -458,7 +534,7 @@ class TrayVisionAnalyzer:
         )
 
     @staticmethod
-    def _draw_slot(canvas: np.ndarray, analysis: SlotAnalysis) -> None:
+    def _draw_slot(canvas: np.ndarray, analysis: SlotAnalysis, *, show_raw_geometry: bool = True) -> None:
         colors = {
             SlotState.EMPTY: (60, 180, 75),
             SlotState.EMPTY_UNREAD_MARKER: (120, 210, 150),
@@ -472,6 +548,12 @@ class TrayVisionAnalyzer:
             SlotState.UNKNOWN: (255, 180, 0),
         }
         color = colors[analysis.decision.state]
+        check_required = analysis.decision.state in {
+            SlotState.WARNING, SlotState.OUTSIDE_SLOT, SlotState.STACKED,
+            SlotState.STACKED_OUTSIDE_SLOT,
+        }
+        if not show_raw_geometry and check_required:
+            color = (0, 165, 255)
         wafer = getattr(analysis, "wafer", None)
         polygon = np.asarray(analysis.projection.polygon_px, dtype=np.int32).reshape(4, 2)
         cv2.polylines(canvas, [polygon], True, color, 2, cv2.LINE_AA)
@@ -479,13 +561,13 @@ class TrayVisionAnalyzer:
             canvas,
             getattr(analysis, "base_slot_inner_boundary_image_px", ()),
             color=(255, 255, 0),
-            crossed_sides=getattr(wafer, "base_boundary_crossed_sides", ()),
+            crossed_sides=getattr(wafer, "base_boundary_crossed_sides", ()) if show_raw_geometry else (),
         )
         _draw_inner_boundary(
             canvas,
             getattr(analysis, "refined_slot_inner_boundary_image_px", ()),
             color=(0, 255, 255),
-            crossed_sides=getattr(wafer, "refined_boundary_crossed_sides", ()),
+            crossed_sides=getattr(wafer, "refined_boundary_crossed_sides", ()) if show_raw_geometry else (),
         )
         center = tuple(np.round(analysis.projection.center_px).astype(int))
         cv2.circle(canvas, center, 5, color, -1, cv2.LINE_AA)
@@ -505,6 +587,8 @@ class TrayVisionAnalyzer:
             f"{analysis.projection.slot_key} "
             f"{state_codes[analysis.decision.state]}"
         )
+        if not show_raw_geometry and check_required:
+            label = f'{analysis.projection.slot_key} CHECK'
         scale = max(0.50, min(0.82, math.sqrt(max(analysis.projection.projected_area_px, 1.0)) / 115.0))
         cv2.putText(
             canvas,
@@ -516,6 +600,8 @@ class TrayVisionAnalyzer:
             2,
             cv2.LINE_AA,
         )
+        if not show_raw_geometry:
+            return
         wafer_contour_image_px = getattr(
             analysis, "wafer_contour_image_px", ()
         )
@@ -627,6 +713,7 @@ class TrayVisionAnalyzer:
         *,
         pose: Optional[TrayPoseEstimate] = None,
         explicit_occlusion_mask: Optional[np.ndarray] = None,
+        captured_monotonic_s: Optional[float] = None,
     ) -> TrayVisionResult:
         """Analyze one overview image.  No fixed robot-arm mask is assumed."""
         if image is None or image.ndim != 3 or image.shape[2] != 3:
@@ -639,7 +726,7 @@ class TrayVisionAnalyzer:
         projection_diagnostics: dict[str, Any] = {}
         image_registration: Optional[np.ndarray] = None
         base_projections: Mapping[str, SlotProjection]
-        if strict_pose_passed:
+        if strict_pose_passed and not self.consistent_slot_geometry:
             # Normal frames keep the original Stage-3 pose and quality gates.
             # Multi-scale decoding here is observational and cannot modify PnP.
             observations = detect_aruco_observations(
@@ -666,18 +753,26 @@ class TrayVisionAnalyzer:
                 else "strict_pnp"
             )
         else:
-            # Expensive detection is deliberately restricted to rejected
-            # Stage-3 frames.  It feeds only the observation-only homography.
-            observations = detect_aruco_observations(
-                image,
-                self.slot_marker_layout.dictionary_name,
-                scales=(1.0, 1.5, 2.0),
-            )
+            # In live transfer the very same marker-plane fit supplies every
+            # crop, including strict PASS frames. Never switch crop coordinates
+            # just because the independent metric PnP gate changed state.
+            if self.consistent_slot_geometry and self._shared_dictionary_count and pose_result.detected_corners_px:
+                observations = observations_from_corners({
+                    key: value for key, value in pose_result.detected_corners_px.items()
+                    if 0 <= key < self._shared_dictionary_count
+                })
+            else:
+                observations = detect_aruco_observations(
+                    image,
+                    self.slot_marker_layout.dictionary_name,
+                    scales=(1.0, 1.5, 2.0),
+                )
             planar_registration = estimate_planar_tray_registration(
                 image,
                 self.geometry,
                 self.slot_marker_layout,
                 observations,
+                prefer_slot_centres=self.consistent_slot_geometry,
             )
             if not planar_registration.success:
                 # CLAHE is a second-stage supplement, not routine work.  It is
@@ -694,8 +789,11 @@ class TrayVisionAnalyzer:
                     self.geometry,
                     self.slot_marker_layout,
                     observations,
+                    prefer_slot_centres=self.consistent_slot_geometry,
                 )
             if not planar_registration.success:
+                if self.consistent_slot_geometry:
+                    self.reset_observation_geometry()
                 return self._failed_result(
                     pose_result,
                     observations=observations,
@@ -709,7 +807,36 @@ class TrayVisionAnalyzer:
             )
             projection_source = planar_registration.method
             projection_diagnostics = planar_registration.to_json()
+            if self.consistent_slot_geometry:
+                captured = time.monotonic() if captured_monotonic_s is None else float(captured_monotonic_s)
+                fixed_ids = set(self.slot_marker_layout.marker_id_by_slot.values()) | self.pose_estimator.configured_ids
+                observation_plane, tracking_diagnostics = self._marker_image_tracker.update(
+                    image, {key: value for key, value in observations.items() if key in fixed_ids},
+                    planar_registration, captured,
+                )
+                projections = build_planar_slot_projections(
+                    self.geometry, observation_plane, image.shape,
+                    half_extent_mm=self.config.slot_half_extent_mm,
+                )
+                self._observation_anchor = observation_plane
+                self._observation_image_shape = image.shape
+                self._observation_last_time = captured
+                projection_diagnostics.update(tracking_diagnostics)
+                projection_diagnostics['crop_anchor_held'] = tracking_diagnostics['image_tracking'] == 'stationary'
             base_projections = projections
+        # Held/observation-only crop coordinates must not silently replace the
+        # Per-slot calibrated wafer-boundary diagnostic.  Camera-1 pickup
+        # navigation authorizes the fixed nominal slot centre after its
+        # two-frame occupancy qualification; this noisy per-frame contour is
+        # retained for diagnosis rather than used to revoke clearance-height XY.
+        metric_reference = (
+            build_slot_projections(
+                self.geometry, self.pose_estimator, pose_result, image.shape,
+                half_extent_mm=self.config.slot_half_extent_mm,
+            ) if self.consistent_slot_geometry and strict_pose_passed else {}
+        )
+        if self.consistent_slot_geometry:
+            projection_diagnostics["metric_slot_checks"] = {}
         analyses: list[SlotAnalysis] = []
         canvas = pose_result.annotated_image.copy()
         for slot_key in sorted(projections):
@@ -731,7 +858,30 @@ class TrayVisionAnalyzer:
                 observations,
                 patch,
             )
-            wafer = analyze_wafer_patch(patch, self.config.wafer_quality)
+            observation_patch = patch
+            if self.consistent_slot_geometry and projection.image_coverage_ratio >= self.config.slot_decision.minimum_image_coverage_ratio:
+                # Median actual, aligned slot pixels, NOT votes over labels.
+                # The metric boundary check below still analyzes raw CURRENT
+                # pixels, so denoising cannot authorize a cached wafer.
+                captured = time.monotonic() if captured_monotonic_s is None else float(captured_monotonic_s)
+                history = self._slot_patch_history.get(slot_key, [])
+                history = [(stamp, pixels) for stamp, pixels in history if 0 < captured - stamp <= .5]
+                if history:
+                    difference = cv2.absdiff(cv2.GaussianBlur(patch, (5, 5), 0),
+                                             cv2.GaussianBlur(history[0][1], (5, 5), 0))
+                    if float(np.mean(difference)) > 4 or float(np.mean(np.max(difference, axis=2) > 20)) > .04:
+                        history = []
+                history = (history + [(captured, patch.copy())])[-3:]
+                self._slot_patch_history[slot_key] = history
+                if len(history) == 3:
+                    first, second, third = [pixels for _, pixels in history]
+                    observation_patch = cv2.max(cv2.min(first, second), cv2.min(cv2.max(first, second), third))
+                projection_diagnostics['observation_filter'] = 'aligned_patch_median_3; raw current metric check required'
+            wafer = (
+                WaferObservation.not_found('partial_view_not_evaluated')
+                if self.consistent_slot_geometry and projection.image_coverage_ratio < self.config.slot_decision.minimum_image_coverage_ratio
+                else analyze_wafer_patch(observation_patch, self.config.wafer_quality)
+            )
             base_inner_boundary: tuple[tuple[float, float], ...]
             refined_inner_boundary: tuple[tuple[float, float], ...]
             if image_registration is not None:
@@ -779,6 +929,37 @@ class TrayVisionAnalyzer:
                 occlusion_ratio=occlusion_ratio,
                 config=self.config.slot_decision,
             )
+            if (self.consistent_slot_geometry and observation_patch is not patch
+                    and decision.safe_to_use_as_empty):
+                # Empty destinations need current pixels too. A just-arriving
+                # wafer must not be hidden by the observation denoiser.
+                wafer = reconcile_projection_boundary_evidence(
+                    analyze_wafer_patch(patch, self.config.wafer_quality))
+                decision = decide_slot_state(projection, marker, wafer,
+                    occlusion_ratio=occlusion_ratio, config=self.config.slot_decision)
+            if self.consistent_slot_geometry:
+                metric_pick_passed = False
+                metric_pick_reason = "current metric pose or normal wafer unavailable"
+                if slot_key in metric_reference and decision.state is SlotState.OCCUPIED:
+                    metric_patch, _ = warp_slot_patch(
+                        image, metric_reference[slot_key],
+                        output_size=self.config.canonical_patch_size,
+                    )
+                    metric_wafer = reconcile_projection_boundary_evidence(
+                        analyze_wafer_patch(metric_patch, self.config.wafer_quality)
+                    )
+                    metric_pick_passed = bool(
+                        metric_wafer.found and metric_wafer.quality == "normal"
+                        and metric_wafer.boundary_evidence == "inside"
+                    )
+                    metric_pick_reason = (
+                        "current calibrated crop confirms normal inside wafer"
+                        if metric_pick_passed else
+                        f"current calibrated crop: {metric_wafer.quality}, boundary={metric_wafer.boundary_evidence}"
+                    )
+                projection_diagnostics["metric_slot_checks"][slot_key] = {
+                    "passed": metric_pick_passed, "reason": metric_pick_reason,
+                }
             wafer_box_image: tuple[tuple[float, float], ...] = ()
             wafer_secondary_boxes_image: tuple[
                 tuple[tuple[float, float], ...], ...
@@ -848,7 +1029,7 @@ class TrayVisionAnalyzer:
                 projection_disagreement_px=projection_disagreement,
             )
             analyses.append(analysis)
-            self._draw_slot(canvas, analysis)
+            self._draw_slot(canvas, analysis, show_raw_geometry=self.show_raw_wafer_geometry)
 
         summary = {state.value: 0 for state in SlotState}
         for analysis in analyses:
@@ -862,6 +1043,14 @@ class TrayVisionAnalyzer:
                 f"RMS={planar_registration.reprojection_rms_px:.3f}px"
             )
         )
+        if self.consistent_slot_geometry:
+            pose_rms = pose_result.reprojection_rms_px
+            pose_text = "NA" if pose_rms is None else f"{pose_rms:.3f}"
+            registration_status = (
+                f"SLOT GRID | metric {'PASS' if strict_pose_passed else 'WAIT'}"
+                f" | pose RMS={pose_text}px"
+                f" | grid RMS={planar_registration.reprojection_rms_px:.3f}px"
+            )
         status = (
             f"{registration_status} | "
             f"empty={summary['empty'] + summary['empty_unread_marker']} | "

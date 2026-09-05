@@ -1,9 +1,11 @@
 """Fail-closed XY-only positioning above a selected tray wafer.
 
-This module owns no camera, Qt widget, or robot controller.  It consumes two
-fresh camera-1 observations for each request and may return one candidate joint
-target.  ``ActionWorker`` remains the sole hardware owner and repeats the
-controller and kinematic checks immediately before every physical move.
+This module owns no camera, Qt widget, or robot controller.  Camera 1 proves the
+source and ``W<-T`` before arming.  During XY motion it still supplies two
+current marker-pose observations, but temporary wafer occlusion cannot change
+the selected slot and the accepted ``W<-T`` is never overwritten.  The
+``ActionWorker`` remains the sole hardware owner and repeats controller and
+kinematic checks immediately before every physical move.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from scara.pipeline.xy_correction_planner import (
 
 from .handeye_interaction import load_latest_suction_target, sha256_file
 from .moved_tray_servo import registered_slot_world_xy_mm
-from .runtime_tray_registration import load_planar_handeye
+from .runtime_tray_registration import estimate_transform_W_T, load_planar_handeye
 from .tray_pose_estimator import load_tray_board_geometry
 
 
@@ -49,6 +51,8 @@ DOMAIN_MARGIN_MM = 5.0
 ARRIVAL_MEDIAN_MM = 0.50
 ARRIVAL_MAXIMUM_MM = 0.80
 ARRIVAL_RMS_MM = 0.25
+TRAY_MOVEMENT_TRANSLATION_LIMIT_MM = 3.0
+TRAY_MOVEMENT_YAW_LIMIT_DEG = 1.0
 
 
 def _vector(value: Any, length: int, label: str) -> np.ndarray:
@@ -196,8 +200,6 @@ class WaferPickXYPositioningSession:
         if initial_snapshot.get("tracking_ready") is not True:
             raise RuntimeError("当前视觉质量门未全部通过，不能启动XY悬空定位")
         source_state = initial_snapshot.get("source_state") or {}
-        if source_state.get("state") != "occupied":
-            raise RuntimeError("拾取目标必须持续识别为正常单片 occupied")
         registration = initial_snapshot.get("registration") or {}
         if registration.get("status") != "success":
             raise RuntimeError("缺少成功的本次 W<-T 登记")
@@ -233,9 +235,48 @@ class WaferPickXYPositioningSession:
         if not math.isfinite(self.initial_registration_yaw_deg):
             raise RuntimeError("启动时W<-T缺少有效yaw")
         # "托盘是正的"在本阶段定义为：最终工具绝对Rz与本次相机1登记的
-        # 托盘X轴世界yaw一致。XY搜索期间仍保持吸盘标定Rz，只有视觉到位后
-        # 才允许一次J4-only旋转。
+        # 托盘X轴世界yaw一致。XY搜索期间保持吸盘标定Rz；如果启动姿态刚好
+        # 是上一次运行留下的托盘对齐Rz，则ActionWorker先做一次J4-only标定
+        # 姿态预对齐，XY到位后再做一次J4-only托盘方向对齐。
         self.final_tray_rz_deg = self.initial_registration_yaw_deg
+        source_consensus = initial_snapshot.get("source_consensus") or {}
+        selection_gates = initial_snapshot.get("selection_gates") or {}
+        source_proof_latched = bool(
+            source_consensus.get("qualification_latched") is True
+            or (
+                source_state.get("state") == "occupied"
+                and source_consensus.get("passed") is True
+            )
+        )
+        self.source_confirmed_at_arm = bool(
+            source_proof_latched
+            and selection_gates
+            and all(
+                isinstance(gate, Mapping) and gate.get("passed") is True
+                for gate in selection_gates.values()
+            )
+        )
+        if not self.source_confirmed_at_arm:
+            raise RuntimeError("启动时没有已锁存的两帧occupied硅片证据")
+        self.locked_acquisition_evidence = {
+            "frame_sequence": initial_snapshot.get("latest_frame_sequence"),
+            "frame_captured_monotonic_s": initial_snapshot.get(
+                "latest_frame_captured_monotonic_s"
+            ),
+            "source_slot": source_slot,
+            "source_state": source_state.get("state"),
+            "occupied_frame_count": source_consensus.get("occupied_frame_count"),
+            "required_occupied_frame_count": source_consensus.get(
+                "required_occupied_frame_count"
+            ),
+            "qualification_latched": source_consensus.get(
+                "qualification_latched"
+            ),
+            "qualification_frame_sequence": source_consensus.get(
+                "qualification_frame_sequence"
+            ),
+            "all_start_gates_passed": True,
+        }
 
         if abs(self.initial_joints[2] - self.required_j3_mm) > 0.20:
             raise RuntimeError(
@@ -244,8 +285,43 @@ class WaferPickXYPositioningSession:
         current_rz = rz_of(
             self.initial_joints[0], self.initial_joints[1], self.initial_joints[3]
         )
-        if angular_difference_deg(current_rz, self.required_rz_deg) > 0.30:
-            raise RuntimeError("当前绝对Rz不在标定姿态容差内")
+        self.initial_rz_deg = float(current_rz)
+        self.prealignment_required = bool(
+            angular_difference_deg(current_rz, self.required_rz_deg) > 0.30
+        )
+        self.prealignment_target_joints = self.initial_joints.astype(float).copy()
+        self.prealignment_target_joints[3] = j4_for_rz(
+            self.initial_joints[0],
+            self.initial_joints[1],
+            self.required_rz_deg,
+        )
+        self.prealignment_audit: dict[str, Any] | None = None
+        if self.prealignment_required:
+            self.prealignment_audit = audit_j4_only_orientation_target(
+                self.initial_joints.astype(float).tolist(),
+                self.initial_pose.astype(float).tolist(),
+                self.prealignment_target_joints.astype(float).tolist(),
+                anchor_robot_xy_mm=self.anchor_robot_xy_mm,
+                local_extent_mm=LOCAL_EXTENT_MM,
+                domain_margin_mm=DOMAIN_MARGIN_MM,
+                required_j3_mm=self.required_j3_mm,
+                j3_tolerance_mm=0.20,
+                required_start_rz_deg=current_rz,
+                start_rz_tolerance_deg=0.15,
+                target_rz_deg=self.required_rz_deg,
+                target_rz_tolerance_deg=0.15,
+                maximum_j4_rotation_deg=MAXIMUM_FINAL_J4_ROTATION_DEG,
+            )
+            if self.prealignment_audit.get("passed") is not True:
+                failed = [
+                    name
+                    for name, gate in self.prealignment_audit["gates"].items()
+                    if gate.get("passed") is not True
+                ]
+                raise RuntimeError(
+                    "当前Rz需要先做J4标定姿态预对齐，但安全复核失败："
+                    + ", ".join(failed)
+                )
 
         self.started_at = datetime.now().astimezone().isoformat(
             timespec="milliseconds"
@@ -276,6 +352,29 @@ class WaferPickXYPositioningSession:
                 "tolerance": 0.20,
             }
         ]
+        if self.prealignment_required:
+            actions.extend(
+                [
+                    {
+                        "type": "move_joints",
+                        "name": f"{self.target_name} 相机1标定Rz预对齐（仅J4）",
+                        "joints": self.prealignment_target_joints.astype(
+                            float
+                        ).tolist(),
+                        "tolerance": 0.10,
+                        "require_current_j3_mm": self.required_j3_mm,
+                        "j3_tolerance_mm": 0.20,
+                    },
+                    {
+                        "type": "assert_joints",
+                        "name": f"{self.target_name} J4预对齐到位复核",
+                        "joints": self.prealignment_target_joints.astype(
+                            float
+                        ).tolist(),
+                        "tolerance": 0.15,
+                    },
+                ]
+            )
         for index in range(1, RUNTIME_ACTION_SLOTS + 1):
             actions.extend(
                 [
@@ -313,9 +412,11 @@ class WaferPickXYPositioningSession:
             "api_version": 1,
             "name": f"吸盘移动到{self.target_name}硅片正上方",
             "description": (
-                "使用相机1、本次W<-T和两帧复测做分段XY悬空定位。"
+                "相机1在启动前确认硅片并锁定本次W<-T；运动中两帧只复核当前"
+                "托盘位姿与真实位移，不因机械臂短暂遮挡硅片撤销目标。"
                 "远距离单步最多9.99mm，接近目标时自动减小；XY阶段固定J3安全"
-                "观察高度与标定Rz，到位后仅旋转J4使工具对齐托盘方向；不执行"
+                "观察高度；必要时先仅转J4对齐标定Rz，XY到位后再仅转J4使工具"
+                "对齐托盘方向；不执行"
                 "下降、吸取、DO或真空。"
             ),
             "camera_model": {
@@ -359,6 +460,13 @@ class WaferPickXYPositioningSession:
         requested_at = float(request.get("requested_monotonic_s", math.nan))
         if not math.isfinite(requested_at):
             raise ValueError("执行请求缺少有效时间戳")
+        request_state = request.get("controller_state") or {}
+        request_joints = _vector(
+            request_state.get("joints"), 4, "request controller joints"
+        )
+        request_pose = _vector(
+            request_state.get("pose"), 6, "request controller pose"
+        )
 
         observed_target_world: list[np.ndarray] = []
         robot_xy: list[np.ndarray] = []
@@ -368,12 +476,19 @@ class WaferPickXYPositioningSession:
         rms_values: list[float] = []
         all_gates_pass = True
         all_accepted = True
-        all_occupied = True
+        source_locked_at_arm = self.source_confirmed_at_arm
         all_fresh = True
         sequences: list[int] = []
         captured_times: list[float] = []
         all_target_locked = True
-        all_states_valid = True
+        all_states_valid = bool(
+            abs(request_joints[2] - self.required_j3_mm) <= 0.20
+            and angular_difference_deg(
+                rz_of(request_joints[0], request_joints[1], request_joints[3]),
+                self.required_rz_deg,
+            )
+            <= 0.30
+        )
 
         for sample in rows:
             all_accepted = all_accepted and sample.get("accepted") is True
@@ -387,10 +502,7 @@ class WaferPickXYPositioningSession:
             all_target_locked = all_target_locked and (
                 str(sample.get("target_name") or "") == self.target_name
             )
-            all_occupied = all_occupied and (
-                (sample.get("source_state") or {}).get("state") == "occupied"
-            )
-            gates = sample.get("selection_gates") or {}
+            gates = sample.get("motion_gates") or sample.get("selection_gates") or {}
             all_gates_pass = all_gates_pass and bool(gates) and all(
                 isinstance(gate, Mapping) and gate.get("passed") is True
                 for gate in gates.values()
@@ -401,29 +513,44 @@ class WaferPickXYPositioningSession:
             )
             if registration.get("status") != "success":
                 all_states_valid = False
-            state = sample.get("robot_state") or {}
-            pose = _vector(state.get("pose"), 6, "sample robot pose")
-            joints = _vector(state.get("joints"), 4, "sample robot joints")
-            all_states_valid = all_states_valid and (
-                abs(joints[2] - self.required_j3_mm) <= 0.20
-                and angular_difference_deg(
-                    rz_of(joints[0], joints[1], joints[3]), self.required_rz_deg
+            # The ActionWorker request is captured immediately before it waits
+            # for this observation window, so the robot is stationary here.
+            # Recombine that authoritative state with each current C<-T pose
+            # to monitor genuine tray movement without using the lagging UI
+            # robot-state cache.  Legacy recorded samples without C<-T retain
+            # their stored registration only for offline compatibility.
+            tray_transform = sample.get("tray_transform_C_T")
+            if tray_transform is None:
+                candidate = registration
+            else:
+                candidate = estimate_transform_W_T(
+                    tray_transform,
+                    request_joints,
+                    request_pose[:2],
+                    self.handeye.get("R_F_C"),
+                    self.suction.p_C_S_mm,
                 )
-                <= 0.30
+                candidate = {"status": "success", **candidate}
+            candidate_transform = _transform(
+                candidate.get("transform_W_T"), "observed transform_W_T"
             )
             point = registered_slot_world_xy_mm(
-                self.geometry, self.target_name, registration
+                self.geometry, self.target_name, candidate
             )
             observed_target_world.append(point)
-            robot_xy.append(pose[:2])
+            robot_xy.append(request_pose[:2])
             # The robot follows the one W<-T transform accepted when this
             # session was armed.  Later frames are independent drift evidence,
             # not permission to move the target every time PnP jitters.
             distances.append(
-                float(np.linalg.norm(self.locked_target_world_xy_mm - pose[:2]))
+                float(
+                    np.linalg.norm(
+                        self.locked_target_world_xy_mm - request_pose[:2]
+                    )
+                )
             )
-            origins.append(transform[:2, 3])
-            yaws.append(_yaw_deg(transform))
+            origins.append(candidate_transform[:2, 3])
+            yaws.append(_yaw_deg(candidate_transform))
             rms_values.append(float(sample.get("reprojection_rms_px", math.inf)))
 
         target_array = np.asarray(observed_target_world, dtype=np.float64)
@@ -528,12 +655,13 @@ class WaferPickXYPositioningSession:
                 [str(row.get("target_name") or "") for row in rows],
                 f"all {self.target_name}",
             ),
-            "source_remains_normal_occupied": _gate(
-                all_occupied,
-                [(row.get("source_state") or {}).get("state") for row in rows],
-                "all occupied",
+            "source_locked_normal_occupied_at_arm": _gate(
+                source_locked_at_arm,
+                self.locked_acquisition_evidence,
+                "occupied and all source acquisition gates PASS before motion",
+                "移动中允许硅片离开视野或被机械臂遮挡，不重复改变已锁定槽位",
             ),
-            "overview_selection_gates": _gate(
+            "current_overview_motion_gates": _gate(
                 all_gates_pass, all_gates_pass, "all PASS in both frames"
             ),
             "robot_height_and_rz_locked": _gate(
@@ -966,6 +1094,11 @@ class WaferPickXYPositioningSession:
                 "xy_only_during_positioning": True,
                 "fixed_j3_mm": self.required_j3_mm,
                 "fixed_absolute_rz_during_xy_deg": self.required_rz_deg,
+                "initial_absolute_rz_deg": self.initial_rz_deg,
+                "j4_only_calibration_rz_prealignment": (
+                    self.prealignment_required
+                ),
+                "prealignment_audit": self.prealignment_audit,
                 "final_j4_only_alignment": True,
                 "final_tray_absolute_rz_deg": self.final_tray_rz_deg,
                 "maximum_final_j4_rotation_deg": MAXIMUM_FINAL_J4_ROTATION_DEG,

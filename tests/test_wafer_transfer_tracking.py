@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 import unittest
 from dataclasses import replace
@@ -290,8 +291,11 @@ class WaferTransferSessionTests(unittest.TestCase):
             frame_captured_monotonic_s=now,
             robot_state=robot_state(0.0, 0.0, captured=now),
         )
-        with self.assertRaises(ValueError):
-            session.select_source("P11")
+        session.select_source("P11")
+        self.assertEqual("P11", session.source_slot)
+        self.assertFalse(session.snapshot()["tracking_ready"])
+        with self.assertRaises(RuntimeError):
+            session.start_tracking()
         self._update_overview_frames(session, x=0.0, y=0.0)
         session.select_source("P11")
         with self.assertRaises(ValueError):
@@ -305,7 +309,7 @@ class WaferTransferSessionTests(unittest.TestCase):
         now = time.monotonic()
         session.update_overview(
             result(),
-            frame_sequence=2,
+            frame_sequence=4,
             frame_captured_monotonic_s=now,
             robot_state=robot_state(124.5, 224.5, captured=now),
         )
@@ -325,11 +329,14 @@ class WaferTransferSessionTests(unittest.TestCase):
         self.assertEqual(TransferPhase.TRACKING_PICK, session.phase)
         np.testing.assert_allclose(session.active_delta_world_xy(), [5.0, 5.0])
 
-    def test_source_selection_requires_two_consecutive_normal_frames(self) -> None:
+    def test_source_selection_is_immediate_but_navigation_requires_two_normal_frames(self) -> None:
         session = WaferTransferSession(geometry())
         self._update_overview_frames(session, count=1)
-        with self.assertRaisesRegex(ValueError, "temporally stable"):
-            session.select_source("P11")
+        session.select_source("P11")
+        session.set_registration(registration())
+        self.assertEqual(TransferPhase.SOURCE_SELECTED, session.phase)
+        with self.assertRaises(RuntimeError):
+            session.start_tracking()
         self._update_overview_frames(session, count=1)
         session.select_source("P11")
         consensus = session.snapshot()["source_consensus"]
@@ -347,10 +354,30 @@ class WaferTransferSessionTests(unittest.TestCase):
             robot_state=robot_state(120.0, 220.0, captured=captured),
         )
         self._update_overview_frames(session, count=1)
-        with self.assertRaisesRegex(ValueError, "temporally stable"):
-            session.select_source("P11")
+        session.select_source("P11")
+        session.set_registration(registration())
+        with self.assertRaises(RuntimeError):
+            session.start_tracking()
         self._update_overview_frames(session, count=1)
         session.select_source("P11")
+
+    def test_two_frame_source_qualification_survives_warning_flicker(self) -> None:
+        session = WaferTransferSession(geometry())
+        self._update_overview_frames(session, count=2)
+        session.select_source("P11")
+        session.set_registration(registration())
+        self.assertTrue(session.source_consensus()["qualification_latched"])
+        captured = time.monotonic()
+        session.update_overview(
+            result(SlotState.WARNING),
+            frame_sequence=3,
+            frame_captured_monotonic_s=captured,
+            robot_state=robot_state(120.0, 220.0, captured=captured),
+        )
+        snapshot = session.snapshot()
+        self.assertTrue(snapshot["source_consensus"]["passed"])
+        self.assertTrue(snapshot["tracking_ready"])
+        session.start_tracking()
 
     def test_brief_quality_dropout_retains_but_does_not_fake_consensus(self) -> None:
         session = WaferTransferSession(geometry())
@@ -371,7 +398,9 @@ class WaferTransferSessionTests(unittest.TestCase):
             )
         consensus = session.source_consensus("P11")
         self.assertTrue(consensus["passed"])
-        self.assertEqual(2, consensus["dropout_frame_count"])
+        self.assertEqual(0, consensus["dropout_frame_count"])
+        self.assertEqual(2, consensus["not_evaluated_frame_count"])
+        self.assertFalse(session.snapshot()["tracking_ready"])
 
         captured = time.monotonic()
         session.update_overview(
@@ -381,8 +410,11 @@ class WaferTransferSessionTests(unittest.TestCase):
             robot_state=robot_state(120.0, 220.0, captured=captured),
         )
         consensus = session.source_consensus("P11")
-        self.assertFalse(consensus["passed"])
-        self.assertEqual([], consensus["states"])
+        self.assertTrue(consensus["passed"])
+        self.assertEqual(["occupied", "occupied"], consensus["states"])
+        self.assertEqual("not_evaluated", consensus["evaluation_state"])
+        self.assertEqual(3, consensus["not_evaluated_frame_count"])
+        self.assertFalse(session.snapshot()["tracking_ready"])
 
     def test_good_frame_after_brief_dropout_reuses_fresh_positive_evidence(self) -> None:
         session = WaferTransferSession(geometry())
@@ -404,7 +436,7 @@ class WaferTransferSessionTests(unittest.TestCase):
         session.select_source("P11")
         self.assertTrue(session.source_consensus("P11")["passed"])
 
-    def test_coordinate_mapping_dropout_cannot_be_used_for_click_selection(self) -> None:
+    def test_coordinate_mapping_dropout_allows_selection_but_not_navigation(self) -> None:
         session = WaferTransferSession(geometry())
         self._update_overview_frames(session, count=2)
         captured = time.monotonic()
@@ -419,8 +451,11 @@ class WaferTransferSessionTests(unittest.TestCase):
             robot_state=robot_state(120.0, 220.0, captured=captured),
         )
         self.assertTrue(session.source_consensus("P11")["passed"])
-        with self.assertRaisesRegex(ValueError, "coordinate-mappable"):
-            session.select_source("P11")
+        session.select_source("P11")
+        session.set_registration(registration())
+        self.assertEqual("P11", session.source_slot)
+        with self.assertRaises(RuntimeError):
+            session.start_tracking()
 
     def test_repeated_frame_sequence_cannot_satisfy_consensus(self) -> None:
         session = WaferTransferSession(geometry())
@@ -435,8 +470,10 @@ class WaferTransferSessionTests(unittest.TestCase):
         consensus = session.source_consensus("P11")
         self.assertEqual(1, consensus["observed_frame_count"])
         self.assertFalse(consensus["passed"])
-        with self.assertRaisesRegex(ValueError, "temporally stable"):
-            session.select_source("P11")
+        session.select_source("P11")
+        session.set_registration(registration())
+        with self.assertRaises(RuntimeError):
+            session.start_tracking()
 
     def test_close_range_contract_blocks_until_real_evidence_arrives(self) -> None:
         session = self._ready_session()
@@ -444,7 +481,7 @@ class WaferTransferSessionTests(unittest.TestCase):
         now = time.monotonic()
         session.update_overview(
             result(),
-            frame_sequence=2,
+            frame_sequence=4,
             frame_captured_monotonic_s=now,
             robot_state=robot_state(125.0, 225.0, captured=now),
         )
@@ -475,7 +512,7 @@ class WaferTransferSessionTests(unittest.TestCase):
         now = time.monotonic()
         session.update_overview(
             result(),
-            frame_sequence=2,
+            frame_sequence=4,
             frame_captured_monotonic_s=now,
             robot_state=robot_state(125.0, 225.0, captured=now),
         )
@@ -493,7 +530,7 @@ class WaferTransferSessionTests(unittest.TestCase):
         now = time.monotonic()
         session.update_overview(
             result(),
-            frame_sequence=3,
+            frame_sequence=5,
             frame_captured_monotonic_s=now,
             robot_state=robot_state(150.0, 250.0, captured=now),
         )
@@ -580,6 +617,77 @@ class WaferTransferSessionTests(unittest.TestCase):
         self.assertEqual([], snapshot["source_consensus"]["states"])
         self.assertIn("camera1 overview invalidated", snapshot["block_reason"])
 
+    def test_xy_motion_tolerates_uncertainty_and_requires_three_explicit_empty_frames(
+        self,
+    ) -> None:
+        session = self._ready_session()
+        session.start_tracking()
+        captured = time.monotonic()
+        session.update_overview(
+            result(SlotState.OCCLUDED),
+            frame_sequence=4,
+            frame_captured_monotonic_s=captured,
+            robot_state=robot_state(120.0, 220.0, captured=captured),
+        )
+        snapshot = session.snapshot()
+        self.assertTrue(snapshot["source_consensus"]["qualification_latched"])
+        self.assertTrue(snapshot["selection_gates"]["source_normal_occupied_consensus"]["passed"])
+        self.assertTrue(
+            snapshot["xy_motion_gates"][
+                "locked_source_not_explicitly_contradicted"
+            ]["passed"]
+        )
+
+        captured = time.monotonic()
+        session.update_overview(
+            result(SlotState.WARNING),
+            frame_sequence=5,
+            frame_captured_monotonic_s=captured,
+            robot_state=robot_state(120.0, 220.0, captured=captured),
+        )
+        self.assertTrue(
+            session.snapshot()["xy_motion_gates"][
+                "locked_source_not_explicitly_contradicted"
+            ]["passed"]
+        )
+
+        for sequence in (6, 7):
+            captured = time.monotonic()
+            session.update_overview(
+                result(SlotState.EMPTY),
+                frame_sequence=sequence,
+                frame_captured_monotonic_s=captured,
+                robot_state=robot_state(120.0, 220.0, captured=captured),
+            )
+            self.assertTrue(
+                session.snapshot()["xy_motion_gates"][
+                    "locked_source_not_explicitly_contradicted"
+                ]["passed"]
+            )
+        captured = time.monotonic()
+        session.update_overview(
+            result(SlotState.EMPTY),
+            frame_sequence=8,
+            frame_captured_monotonic_s=captured,
+            robot_state=robot_state(120.0, 220.0, captured=captured),
+        )
+        self.assertFalse(
+            session.snapshot()["xy_motion_gates"][
+                "locked_source_not_explicitly_contradicted"
+            ]["passed"]
+        )
+
+    def test_runtime_registration_is_immutable_after_target_lock(self) -> None:
+        runtime = LiveWaferTransferRuntime(PROJECT_ROOT)
+        runtime.session = self._ready_session()
+        runtime.session.start_tracking()
+        before = json.dumps(runtime.session.registration, sort_keys=True)
+        runtime._registration_samples.append({"measurement_id": "old"})
+        runtime._update_registration({"measurement_id": "moving-camera-frame"})
+        self.assertEqual([], list(runtime._registration_samples))
+        self.assertEqual(before, json.dumps(runtime.session.registration, sort_keys=True))
+        self.assertNotEqual(TransferPhase.BLOCKED, runtime.session.phase)
+
     def test_runtime_camera1_invalidation_clears_registration(self) -> None:
         runtime = LiveWaferTransferRuntime(PROJECT_ROOT)
         runtime.session.set_registration(registration())
@@ -596,7 +704,7 @@ class WaferTransferSessionTests(unittest.TestCase):
         now = time.monotonic()
         session.update_overview(
             result(),
-            frame_sequence=2,
+            frame_sequence=4,
             frame_captured_monotonic_s=now,
             robot_state=robot_state(125.0, 225.0, captured=now),
         )

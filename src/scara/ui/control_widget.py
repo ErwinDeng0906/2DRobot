@@ -13,6 +13,7 @@ import math
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 import json
 from pathlib import Path
@@ -214,6 +215,13 @@ class ScaraControlWidget(QWidget):
         self._handeye_state_lock = threading.Lock()
         self._handeye_controller_connected = False
         self._latest_handeye_robot_state: Optional[dict[str, object]] = None
+        # Camera frames and controller polling are asynchronous.  Keep enough
+        # timestamped controller samples to pair each image with the state
+        # nearest its capture time instead of repeatedly comparing it with one
+        # arbitrarily phased "latest" sample.
+        self._handeye_robot_state_history: deque[dict[str, object]] = deque(
+            maxlen=64
+        )
         self._action_file: Optional[Path] = None
         self._action_builder: Optional[Callable[[], dict]] = None
         self._action_camera_calculator: Optional[Callable[[list[float]], dict]] = None
@@ -319,10 +327,19 @@ class ScaraControlWidget(QWidget):
             self._mode_grp.addButton(b, i); seg.addWidget(b)
         g.addLayout(seg)
         row = QHBoxLayout(); row.addWidget(QLabel("速度"))
-        self._speed = QSpinBox(); self._speed.setRange(1, 100); self._speed.setSuffix(" %")
-        self._speed.setValue(self._cfg.default_speed_percent)
+        self._speed = QSpinBox()
+        self._speed.setRange(
+            int(self._cfg.min_speed_percent),
+            int(self._cfg.max_speed_percent),
+        )
+        self._speed.setSuffix(" %")
+        self._speed.setValue(self._cfg.clamp_speed(self._cfg.default_speed_percent))
         self._speed_bar = QProgressBar(); self._speed_bar.setObjectName("posbar")
-        self._speed_bar.setRange(0, 100); self._speed_bar.setValue(self._cfg.default_speed_percent); self._speed_bar.setTextVisible(False)
+        self._speed_bar.setRange(0, int(self._cfg.max_speed_percent))
+        self._speed_bar.setValue(
+            self._cfg.clamp_speed(self._cfg.default_speed_percent)
+        )
+        self._speed_bar.setTextVisible(False)
         row.addWidget(self._speed_bar, 1); row.addWidget(self._speed)
         g.addLayout(row); v.addWidget(f)
 
@@ -1182,12 +1199,29 @@ class ScaraControlWidget(QWidget):
         if dialog is None:
             return
         if self._action_worker is not None and self._action_worker.isRunning():
-            self._append("XY悬空定位", "已有任务或运动会话正在运行", _D["warning"])
+            reason = "已有任务或运动会话正在运行"
+            self._append("XY悬空定位", reason, _D["warning"])
+            dialog.report_pick_xy_start_rejected(reason)
             return
         if self._cam is None or self._cam.source_index != 1 or not self._cam.isRunning():
-            self._append("XY悬空定位", "相机1未运行，已拒绝启动", _D["error"])
+            reason = "相机1未运行，已拒绝启动"
+            self._append("XY悬空定位", reason, _D["error"])
+            dialog.report_pick_xy_start_rejected(reason)
             return
-        if not self._ctrl.motion_ready():
+        if not self._ctrl.motion_ready(
+            maximum_speed_percent=20.0,
+            required_mode="T1",
+        ):
+            reason_provider = getattr(self._ctrl, "motion_readiness_error", None)
+            reason = (
+                reason_provider(
+                    maximum_speed_percent=20.0,
+                    required_mode="T1",
+                )
+                if callable(reason_provider)
+                else None
+            ) or "控制器未满足运动条件；请确认已连接、已使能且无报警/急停"
+            dialog.report_pick_xy_start_rejected(reason)
             return
 
         project_root = Path(__file__).resolve().parents[3]
@@ -1209,6 +1243,7 @@ class ScaraControlWidget(QWidget):
                     pass
             QMessageBox.critical(self, "XY悬空定位准备失败", str(exc))
             self._append("XY悬空定位", f"准备失败：{exc}", _D["error"])
+            dialog.report_pick_xy_start_rejected(f"准备失败：{exc}")
             return
 
         worker = ActionWorker(
@@ -1593,13 +1628,32 @@ class ScaraControlWidget(QWidget):
             _D["success"] if ok else _D["error"],
         )
 
-    def _handeye_robot_state_snapshot(self) -> Optional[dict[str, object]]:
-        """Return a copy of the latest UI status; never poll the controller."""
+    def _handeye_robot_state_snapshot(
+        self, captured_monotonic_s: Optional[float] = None
+    ) -> Optional[dict[str, object]]:
+        """Return the cached state nearest a capture time; never poll hardware."""
 
         with self._handeye_state_lock:
             if not self._handeye_controller_connected:
                 return None
-            snapshot = self._latest_handeye_robot_state
+            latest = self._latest_handeye_robot_state
+            if latest is None:
+                return None
+            history = getattr(self, "_handeye_robot_state_history", None)
+            snapshot = latest
+            if captured_monotonic_s is not None and history:
+                try:
+                    target = float(captured_monotonic_s)
+                except (TypeError, ValueError, OverflowError):
+                    return None
+                if not math.isfinite(target):
+                    return None
+                snapshot = min(
+                    history,
+                    key=lambda item: abs(
+                        float(item["captured_monotonic_s"]) - target
+                    ),
+                )
             if snapshot is None:
                 return None
             return {
@@ -1632,9 +1686,17 @@ class ScaraControlWidget(QWidget):
                     self._latest_handeye_robot_state = None
                     return
                 self._latest_handeye_robot_state = candidate
+                history = getattr(self, "_handeye_robot_state_history", None)
+                if history is None:
+                    history = deque(maxlen=64)
+                    self._handeye_robot_state_history = history
+                history.append(candidate)
         except (KeyError, TypeError, ValueError, OverflowError):
             with self._handeye_state_lock:
                 self._latest_handeye_robot_state = None
+                history = getattr(self, "_handeye_robot_state_history", None)
+                if history is not None:
+                    history.clear()
 
     def _close_handeye_dialog(
         self,
@@ -1967,6 +2029,7 @@ class ScaraControlWidget(QWidget):
             self._handeye_controller_connected = bool(ok)
             if not ok or not was_connected:
                 self._latest_handeye_robot_state = None
+                self._handeye_robot_state_history.clear()
         self._conn_chip.setText("● 已连接" if ok else "● 未连接")
         self._conn_chip.setStyleSheet(
             f"color:{_D['success']}; background:{_D['chip_on_bg']};"
@@ -1980,6 +2043,17 @@ class ScaraControlWidget(QWidget):
             b.setEnabled(ok)
         # DO：未连接时整块锁定，避免不经 snrobot 就能改泵/阀；清零路径不受影响
         self._set_do_ui_enabled(ok)
+        if ok:
+            # The robot controller retains its previous speed across app
+            # restarts.  Re-apply the configured safe preset on every new
+            # connection instead of leaving a stale value such as 37% active.
+            preset_speed = self._cfg.clamp_speed(
+                self._cfg.default_speed_percent
+            )
+            self._speed.blockSignals(True)
+            self._speed.setValue(preset_speed)
+            self._speed.blockSignals(False)
+            self._ctrl.cmd_set_speed(preset_speed)
         if not ok:
             self._set_css(self._btn_en, "")
             self._set_css(self._btn_clr, "")
@@ -1994,6 +2068,7 @@ class ScaraControlWidget(QWidget):
             with self._handeye_state_lock:
                 self._handeye_controller_connected = False
                 self._latest_handeye_robot_state = None
+                self._handeye_robot_state_history.clear()
         en_eff = bool(st.get("effectively_enabled"))
         need_clear = bool(st.get("need_clear"))
         estop = bool(st.get("estop") or st.get("soft_estop"))

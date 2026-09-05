@@ -584,6 +584,33 @@ class ReadOnlySourceAuditTests(unittest.TestCase):
         owner._handeye_controller_connected = False
         self.assertIsNone(ScaraControlWidget._handeye_robot_state_snapshot(owner))
 
+    def test_control_widget_pairs_camera_with_nearest_buffered_robot_state(self) -> None:
+        from scara.ui.control_widget import ScaraControlWidget
+
+        owner = SimpleNamespace(
+            _handeye_state_lock=threading.Lock(),
+            _handeye_controller_connected=True,
+            _latest_handeye_robot_state=None,
+        )
+        first = {
+            "joints": [10.0, 20.0, EXPECTED_J3_MM, 80.0],
+            "pose": [300.0, 100.0, EXPECTED_J3_MM, 0.0, 0.0, 80.0],
+        }
+        second = {
+            "joints": [11.0, 21.0, EXPECTED_J3_MM, 81.0],
+            "pose": [301.0, 101.0, EXPECTED_J3_MM, 0.0, 0.0, 81.0],
+        }
+        with patch("scara.ui.control_widget.time.monotonic", side_effect=[10.0, 10.3]):
+            ScaraControlWidget._cache_handeye_robot_state(owner, first)
+            ScaraControlWidget._cache_handeye_robot_state(owner, second)
+
+        near_first = ScaraControlWidget._handeye_robot_state_snapshot(owner, 10.04)
+        near_second = ScaraControlWidget._handeye_robot_state_snapshot(owner, 10.28)
+        latest = ScaraControlWidget._handeye_robot_state_snapshot(owner)
+        self.assertEqual(near_first["pose"], first["pose"])
+        self.assertEqual(near_second["pose"], second["pose"])
+        self.assertEqual(latest["pose"], second["pose"])
+
     def test_validation_rechecks_robot_state_age_at_click_time(self) -> None:
         current = SimpleNamespace(
             jacobian_domain_passed=True,
@@ -599,6 +626,45 @@ class ReadOnlySourceAuditTests(unittest.TestCase):
         current.robot_state_age_s = None
         self.assertFalse(
             HandEyeDemoDialog._current_domain_still_fresh(current, 0.0)
+        )
+
+    def test_xy_motion_readiness_reports_enable_mode_and_speed(self) -> None:
+        from scara.controller.scara_controller import ScaraController
+
+        owner = SimpleNamespace(
+            _motion_sequence_lock=threading.Lock(),
+            _connected=True,
+            _last_status={
+                "effectively_enabled": False,
+                "need_clear": False,
+                "estop": False,
+                "warn": 0,
+                "mode": "T1",
+                "speed": 20.0,
+            },
+            _cfg=SimpleNamespace(require_enable_before_motion=True),
+        )
+        readiness = ScaraController.motion_readiness_error
+        self.assertIn("未使能", readiness(owner) or "")
+        owner._last_status["effectively_enabled"] = True
+        owner._last_status["mode"] = "T2"
+        self.assertIn(
+            "要求T1模式",
+            readiness(owner, required_mode="T1") or "",
+        )
+        owner._last_status["mode"] = "T1"
+        owner._last_status["speed"] = 37.0
+        self.assertIn(
+            "当前速度37%",
+            readiness(owner, maximum_speed_percent=20.0) or "",
+        )
+        owner._last_status["speed"] = 20.0
+        self.assertIsNone(
+            readiness(
+                owner,
+                maximum_speed_percent=20.0,
+                required_mode="T1",
+            )
         )
 
 

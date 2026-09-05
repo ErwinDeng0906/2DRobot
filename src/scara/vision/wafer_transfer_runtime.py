@@ -56,6 +56,7 @@ class WaferTransferFrame:
     session_snapshot: dict[str, Any]
     registration_candidate: Optional[dict[str, Any]]
     annotated_bgr: np.ndarray
+    stream_epoch: int = 0
 
 
 class LiveWaferTransferRuntime:
@@ -82,13 +83,14 @@ class LiveWaferTransferRuntime:
         self.silicon_detection_config = load_silicon_detection_config(
             self.silicon_detection_config_path
         )
-        self.estimator = TrayBoardPoseEstimator(self.geometry, self.intrinsics)
+        self.estimator = TrayBoardPoseEstimator(self.geometry, self.intrinsics, edge_refinement=True)
         self.tracker = TrayPoseTracker(self.estimator)
         self.analyzer = TrayVisionAnalyzer(
             self.estimator,
             self.geometry,
             load_slot_marker_layout(self.slot_layout_path),
             self.silicon_detection_config.fusion_config,
+            consistent_slot_geometry=True,
         )
         self.session = WaferTransferSession(self.geometry)
         self.close_range_observer = (
@@ -100,6 +102,7 @@ class LiveWaferTransferRuntime:
         self._registration_samples: deque[dict[str, Any]] = deque(maxlen=5)
         self._last_result: Optional[TrayVisionResult] = None
         self._last_frame: Optional[WaferTransferFrame] = None
+        self._stream_epoch = 0
         self._registration_candidate: Optional[dict[str, Any]] = None
         self._registration_error = ""
         self._calibration_error = ""
@@ -117,6 +120,11 @@ class LiveWaferTransferRuntime:
         with self._lock:
             return self._registration_error
 
+    def set_raw_wafer_overlay(self, enabled: bool) -> None:
+        """Display only; never changes detections or movement gates."""
+        with self._lock:
+            self.analyzer.show_raw_wafer_geometry = bool(enabled)
+
     def reset_registration(self) -> None:
         with self._lock:
             self._registration_samples.clear()
@@ -124,6 +132,7 @@ class LiveWaferTransferRuntime:
             self._registration_error = self._calibration_error
             self.session.clear_registration()
             self.session.clear_overview_history("runtime registration reset")
+            self.analyzer.reset_observation_geometry()
 
     def invalidate_camera1(self, reason: str) -> None:
         """Invalidate every coordinate-bearing value after a stale/bad stream."""
@@ -135,7 +144,9 @@ class LiveWaferTransferRuntime:
             self._registration_error = message
             self._last_result = None
             self._last_frame = None
+            self._stream_epoch += 1
             self.tracker.reset()
+            self.analyzer.reset_observation_geometry()
             self.session.clear_registration()
             self.session.invalidate_overview(message)
 
@@ -204,6 +215,15 @@ class LiveWaferTransferRuntime:
 
     def _update_registration(self, sample: Optional[dict[str, Any]]) -> None:
         if sample is None or self._suction is None or self._handeye is None:
+            return
+        # W<-T is established while the robot and overview are stable.  Once
+        # the operator arms a target, keep that transform immutable: rebuilding
+        # it from a moving forearm camera and a separately sampled robot state
+        # creates apparent tray motion.  Current marker/pose quality is still
+        # required by every XY observation; only the world target is frozen.
+        if self.session.target_lock_active():
+            self._registration_samples.clear()
+            self._registration_error = ""
             return
         if (
             self._registration_samples
@@ -277,6 +297,18 @@ class LiveWaferTransferRuntime:
             self._registration_error = str(exc)
 
     def process_camera1(
+        self, image_bgr: np.ndarray, *, frame_sequence: int,
+        captured_monotonic_s: float, robot_state: Optional[Mapping[str, Any]],
+    ) -> WaferTransferFrame:
+        # Serialize stream reset/anchor reset with analysis. Selection uses the
+        # already displayed frame, even if a newer frame finishes first.
+        with self._lock:
+            return self._process_camera1_locked(
+                image_bgr, frame_sequence=frame_sequence,
+                captured_monotonic_s=captured_monotonic_s, robot_state=robot_state,
+            )
+
+    def _process_camera1_locked(
         self,
         image_bgr: np.ndarray,
         *,
@@ -286,8 +318,18 @@ class LiveWaferTransferRuntime:
     ) -> WaferTransferFrame:
         if image_bgr is None or image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
             raise ValueError("camera1 frame must be a valid BGR image")
+        if not math.isfinite(float(captured_monotonic_s)):
+            raise ValueError("camera1 timestamp must be finite")
+        with self._lock:
+            if self._last_frame is not None and (
+                int(frame_sequence) <= self._last_frame.frame_sequence
+                or float(captured_monotonic_s) < self._last_frame.captured_monotonic_s
+            ):
+                return self._last_frame
         tracked = self.tracker.update(image_bgr)
-        result = self.analyzer.analyze(image_bgr, pose=tracked.raw)
+        result = self.analyzer.analyze(
+            image_bgr, pose=tracked.raw, captured_monotonic_s=captured_monotonic_s,
+        )
         if result.quality_passed and not tracked.accepted_by_tracker:
             result = replace(
                 result,
@@ -340,6 +382,7 @@ class LiveWaferTransferRuntime:
                     else dict(self._registration_candidate)
                 ),
                 annotated_bgr=annotated,
+                stream_epoch=self._stream_epoch,
             )
             self._last_result = result
             self._last_frame = frame
@@ -436,7 +479,7 @@ class LiveWaferTransferRuntime:
             )
         self._draw_suction_navigation(canvas, result, snapshot)
         lines = [
-            f"transfer: {snapshot.get('phase', 'unknown')}",
+            f"frame={snapshot.get('latest_frame_sequence')}  transfer: {snapshot.get('phase', 'unknown')}",
             f"source={snapshot.get('source_slot') or '--'}  destination={snapshot.get('destination_slot') or '--'}",
         ]
         delta = snapshot.get("active_delta_world_xy_mm")
@@ -539,19 +582,41 @@ class LiveWaferTransferRuntime:
         )
 
     def select_pixel(
-        self, pixel: Sequence[float], *, role: str
+        self, pixel: Sequence[float], *, role: str,
+        displayed_frame: Optional[WaferTransferFrame] = None,
     ) -> tuple[str, np.ndarray, float]:
         with self._lock:
-            result = self._last_result
-            if result is None:
+            frame = displayed_frame if displayed_frame is not None else self._last_frame
+            if frame is None or self._last_frame is None:
                 raise RuntimeError("no analyzed camera1 frame is available")
-            point_T, slot_name, distance_mm = self.analyzer.map_pixel_to_tray(
-                pixel, result
-            )
-            if distance_mm > self.session.config.click_maximum_slot_distance_mm:
-                raise ValueError(
-                    f"click is {distance_mm:.3f} mm from the nearest slot; maximum is {self.session.config.click_maximum_slot_distance_mm:.3f} mm"
-                )
+            if frame.stream_epoch != self._stream_epoch:
+                raise ValueError("displayed frame belongs to an invalidated camera stream")
+            if not -0.05 <= time.monotonic() - frame.captured_monotonic_s <= 1.0:
+                raise ValueError("displayed camera frame is stale; wait for a fresh image")
+            result = frame.result
+            if not result.success or not result.slots:
+                raise ValueError("no evaluated slot geometry in the displayed frame")
+            point = np.asarray(pixel, dtype=np.float64).reshape(2)
+            if not np.all(np.isfinite(point)):
+                raise ValueError("click coordinates must be finite")
+            hits = []
+            for item in result.slots:
+                projection = item.projection
+                polygon = np.asarray(projection.polygon_px, dtype=np.float32).reshape(4, 2)
+                if cv2.pointPolygonTest(polygon, tuple(point), False) < 0:
+                    continue
+                target = np.asarray(projection.polygon_T_mm, dtype=np.float32).reshape(4, 3)
+                mapping = cv2.getPerspectiveTransform(polygon, target[:, :2].copy())
+                xy = cv2.perspectiveTransform(point.astype(np.float32).reshape(1, 1, 2), mapping).reshape(2)
+                center = np.asarray(projection.center_T_mm, dtype=np.float64)
+                distance = float(np.linalg.norm(xy - center[:2]))
+                if math.isfinite(distance):
+                    hits.append((distance, projection.slot_key, np.array([*xy, center[2]])))
+            if not hits:
+                raise ValueError("click inside a displayed tray slot to select it")
+            distance_mm, slot_name, point_T = min(hits, key=lambda hit: (hit[0], hit[1]))
+            # The image-plane mapping identifies a slot only. It cannot produce
+            # world coordinates or authorize motion, even on read-only frames.
             if role == "source":
                 self.session.select_source(slot_name)
             elif role == "destination":

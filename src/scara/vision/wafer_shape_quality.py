@@ -638,7 +638,9 @@ def _robust_oriented_box(
         edge_angle = normalize_square_angle_deg(
             math.degrees(math.atan2(float(edge[1]), float(edge[0])))
         )
-    origin = np.median(points, axis=0)
+    # The origin only translates the local coordinates; percentile extents
+    # translated back to the image are unchanged. Avoid sorting twice here.
+    origin = np.mean(points, axis=0)
     radians = math.radians(float(edge_angle))
     image_to_local = np.asarray(
         [
@@ -648,8 +650,7 @@ def _robust_oriented_box(
         dtype=np.float64,
     )
     local = (points - origin) @ image_to_local.T
-    low = np.quantile(local, 0.02, axis=0)
-    high = np.quantile(local, 0.98, axis=0)
+    low, high = np.quantile(local, (0.02, 0.98), axis=0)
     local_box = np.asarray(
         [
             [low[0], low[1]],
@@ -686,6 +687,10 @@ def _bridge_split_geometry_mask(
         return primary_mask, False
     original_contour = max(contours, key=cv2.contourArea)
     original_area = float(cv2.contourArea(original_contour))
+    if original_area < float(config.minimum_area_ratio) * patch_area:
+        # Opening can only remove pixels, so it cannot rescue an undersized
+        # component. Skip two expensive rectangle fits on empty-slot noise.
+        return primary_mask, False
     original_box = _robust_oriented_box(
         primary_mask, original_contour
     )[0:3]

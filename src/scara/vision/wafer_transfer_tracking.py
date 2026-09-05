@@ -54,6 +54,7 @@ class WaferTransferConfig:
     source_consensus_window_frames: int = 2
     source_consensus_minimum_occupied_frames: int = 2
     source_consensus_maximum_dropout_frames: int = 2
+    maximum_source_evidence_age_s: float = 2.0
     pick_requires_close_range_alignment: bool = True
     place_requires_close_range_insertability: bool = True
 
@@ -159,6 +160,8 @@ class WaferTransferSession:
             )
         if config.source_consensus_maximum_dropout_frames < 0:
             raise ValueError("source consensus dropout allowance cannot be negative")
+        if not math.isfinite(config.maximum_source_evidence_age_s) or config.maximum_source_evidence_age_s <= 0:
+            raise ValueError("source evidence age must be positive and finite")
         self.phase = TransferPhase.IDLE
         self.source_slot: Optional[str] = None
         self.destination_slot: Optional[str] = None
@@ -171,11 +174,26 @@ class WaferTransferSession:
         self.block_reason = ""
         self.close_range_gates: dict[str, dict[str, Any]] = {}
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
+        self.overview_diagnostics: deque[dict[str, Any]] = deque(maxlen=180)
         self._slot_state_history = {
             slot: deque(maxlen=config.source_consensus_window_frames)
             for slot in self.slot_names
         }
         self._slot_dropout_streak = {slot: 0 for slot in self.slot_names}
+        self._slot_evidence_times = {
+            slot: deque(maxlen=config.source_consensus_window_frames)
+            for slot in self.slot_names
+        }
+        self._not_evaluated_frames = 0
+        # Two normal occupied frames establish the operator-selected source.
+        # Classification uncertainty after that proof must not make the UI or
+        # XY loop flap.  The qualification is cleared on target/reset/stream
+        # changes, three consecutive explicit-empty decisions, or a hard
+        # stacked/outside contradiction.
+        self._qualified_source_slot: Optional[str] = None
+        self._source_qualification_frame_sequence: Optional[int] = None
+        self._source_qualification_captured_monotonic_s: Optional[float] = None
+        self._source_explicit_empty_streak = 0
 
     def _event(self, name: str, **details: Any) -> None:
         self.events.append(
@@ -194,6 +212,10 @@ class WaferTransferSession:
         self.close_range = None
         self.close_range_gates = {}
         self.block_reason = ""
+        self._qualified_source_slot = None
+        self._source_qualification_frame_sequence = None
+        self._source_qualification_captured_monotonic_s = None
+        self._source_explicit_empty_streak = 0
         self._event("reset")
 
     def block(self, reason: str) -> None:
@@ -202,6 +224,21 @@ class WaferTransferSession:
         self.phase = TransferPhase.BLOCKED
         self.block_reason = str(reason)
         self._event("session_blocked", reason=self.block_reason)
+
+    def target_lock_active(self) -> bool:
+        """Return whether camera-1 acquisition has become an immutable target."""
+
+        return self.phase in {
+            TransferPhase.TRACKING_PICK,
+            TransferPhase.WAITING_PICK_ALIGNMENT,
+            TransferPhase.VERIFYING_PICK,
+            TransferPhase.PICKED,
+            TransferPhase.TRACKING_PLACE,
+            TransferPhase.WAITING_PLACE_ALIGNMENT,
+            TransferPhase.READY_TO_PLACE,
+            TransferPhase.VERIFYING_PLACE,
+            TransferPhase.COMPLETE,
+        }
 
     def set_registration(self, registration: Optional[Mapping[str, Any]]) -> None:
         transform = _validated_transform_W_T(registration)
@@ -223,11 +260,19 @@ class WaferTransferSession:
     def clear_overview_history(self, reason: str) -> None:
         for slot, history in self._slot_state_history.items():
             history.clear()
+            self._slot_evidence_times[slot].clear()
             self._slot_dropout_streak[slot] = 0
+        self._not_evaluated_frames = 0
+        self._qualified_source_slot = None
+        self._source_qualification_frame_sequence = None
+        self._source_qualification_captured_monotonic_s = None
+        self._source_explicit_empty_streak = 0
         self._event("overview_history_cleared", reason=str(reason))
         self._refresh_ready_phase()
 
-    def invalidate_overview(self, reason: str) -> None:
+    def invalidate_overview(
+        self, reason: str, *, preserve_active_target_lock: bool = False
+    ) -> None:
         """Discard stale camera/robot evidence and block any active lock."""
 
         self.latest_result = None
@@ -236,21 +281,23 @@ class WaferTransferSession:
         self.latest_robot_state = None
         for slot, history in self._slot_state_history.items():
             history.clear()
+            self._slot_evidence_times[slot].clear()
             self._slot_dropout_streak[slot] = 0
+        self._not_evaluated_frames = 0
+        self._qualified_source_slot = None
+        self._source_qualification_frame_sequence = None
+        self._source_qualification_captured_monotonic_s = None
+        self._source_explicit_empty_streak = 0
         self.close_range = None
         self.close_range_gates = {}
-        active = self.phase in {
-            TransferPhase.TRACKING_PICK,
-            TransferPhase.WAITING_PICK_ALIGNMENT,
-            TransferPhase.VERIFYING_PICK,
-            TransferPhase.PICKED,
-            TransferPhase.TRACKING_PLACE,
-            TransferPhase.WAITING_PLACE_ALIGNMENT,
-            TransferPhase.READY_TO_PLACE,
-            TransferPhase.VERIFYING_PLACE,
-        }
+        active = self.target_lock_active()
         self._event("overview_invalidated", reason=str(reason))
-        if active:
+        if active and preserve_active_target_lock:
+            self._event(
+                "overview_monitor_unavailable_target_lock_retained",
+                reason=str(reason),
+            )
+        elif active:
             self.block(f"camera1 overview invalidated: {reason}")
         else:
             self._refresh_ready_phase()
@@ -263,7 +310,16 @@ class WaferTransferSession:
         frame_captured_monotonic_s: float,
         robot_state: Optional[Mapping[str, Any]],
     ) -> None:
-        is_new_frame = self.latest_frame_sequence != int(frame_sequence)
+        captured = float(frame_captured_monotonic_s)
+        if (
+            not math.isfinite(captured)
+            or (self.latest_frame_sequence is not None and int(frame_sequence) <= self.latest_frame_sequence)
+            or (self.latest_frame_captured_monotonic_s is not None and captured < self.latest_frame_captured_monotonic_s)
+        ):
+            # Reject the entire duplicate/old snapshot, including robot state.
+            # Distinct sequence IDs may share a coarse Windows clock tick.
+            return
+        is_new_frame = True
         self.latest_result = result
         self.latest_frame_sequence = int(frame_sequence)
         self.latest_frame_captured_monotonic_s = float(frame_captured_monotonic_s)
@@ -285,17 +341,20 @@ class WaferTransferSession:
             except (TypeError, ValueError, OverflowError):
                 self.latest_robot_state = None
         if is_new_frame:
-            states = (
-                _slot_states(result)
-                if result.quality_passed and result.coordinate_mapping_allowed
-                else {}
-            )
+            evaluated = bool(result.quality_passed and result.coordinate_mapping_allowed)
+            states = _slot_states(result) if evaluated else {}
+            self._not_evaluated_frames = 0 if evaluated else self._not_evaluated_frames + 1
             uncertain = {
                 SlotState.UNKNOWN.value,
                 SlotState.OUT_OF_VIEW.value,
                 SlotState.OCCLUDED.value,
             }
             for slot, history in self._slot_state_history.items():
+                if not evaluated:
+                    # A pose failure says nothing about wafer presence. Keep
+                    # identity/history, but the current metric gate stays shut.
+                    # source_consensus separately expires old evidence by time.
+                    continue
                 state = states.get(slot)
                 if state is None or state["state"] in uncertain:
                     self._slot_dropout_streak[slot] += 1
@@ -304,16 +363,71 @@ class WaferTransferSession:
                         > self.config.source_consensus_maximum_dropout_frames
                     ):
                         history.clear()
+                        self._slot_evidence_times[slot].clear()
                     continue
                 self._slot_dropout_streak[slot] = 0
                 history.append(str(state["state"]))
+                self._slot_evidence_times[slot].append(captured)
+            if evaluated and self.source_slot is not None:
+                selected = states.get(self.source_slot)
+                selected_state = None if selected is None else selected["state"]
+                explicit_empty = {
+                    SlotState.EMPTY.value,
+                    SlotState.EMPTY_UNREAD_MARKER.value,
+                }
+                hard_contradiction = {
+                    SlotState.STACKED.value,
+                    SlotState.OUTSIDE_SLOT.value,
+                    SlotState.STACKED_OUTSIDE_SLOT.value,
+                }
+                if selected_state in explicit_empty:
+                    self._source_explicit_empty_streak += 1
+                elif selected_state is not None:
+                    self._source_explicit_empty_streak = 0
+                if (
+                    selected_state in hard_contradiction
+                    or self._source_explicit_empty_streak >= 3
+                ):
+                    if self._qualified_source_slot == self.source_slot:
+                        self._event(
+                            "source_qualification_revoked",
+                            slot=self.source_slot,
+                            state=selected_state,
+                            explicit_empty_streak=self._source_explicit_empty_streak,
+                        )
+                    self._qualified_source_slot = None
+                    self._source_qualification_frame_sequence = None
+                    self._source_qualification_captured_monotonic_s = None
+                self._maybe_latch_source_qualification()
         self._refresh_ready_phase()
         self._advance_tracking_phase()
+        self.overview_diagnostics.append({
+            "frame_id": self.latest_frame_sequence,
+            "captured_monotonic_s": captured,
+            "metric_passed": bool(result.quality_passed and result.coordinate_mapping_allowed),
+            "reason": result.failure_reason,
+            "projection_source": result.projection_source,
+            "crop_anchor_held": result.projection_diagnostics.get("crop_anchor_held"),
+            "used_marker_ids": list(result.pose.used_marker_ids),
+            "pose_rms_px": result.pose.reprojection_rms_px,
+            "per_marker_rms_px": dict(result.pose.per_marker_rms_px),
+            "ransac_inlier_corners": result.pose.ransac_inlier_corner_count,
+            "source_slot": self.source_slot,
+            "source_state": states.get(self.source_slot or ""),
+            "robot_state_available": self.latest_robot_state is not None,
+        })
 
     def source_consensus(self, slot_name: Optional[str] = None) -> dict[str, Any]:
         """Return the recent independent evidence used to accept a source."""
         slot = self.source_slot if slot_name is None else str(slot_name)
-        history = list(self._slot_state_history.get(slot or "", ()))
+        now = time.monotonic()
+        history = [
+            state for state, captured in zip(
+                self._slot_state_history.get(slot or "", ()),
+                self._slot_evidence_times.get(slot or "", ()),
+            )
+            if -0.05 <= now - captured <= self.config.maximum_source_evidence_age_s
+        ]
         occupied_count = sum(
             state == SlotState.OCCUPIED.value for state in history
         )
@@ -321,6 +435,16 @@ class WaferTransferSession:
             history and history[-1] == SlotState.OCCUPIED.value
         )
         dropout_count = int(self._slot_dropout_streak.get(slot or "", 0))
+        evidence_passed = bool(
+            latest_occupied
+            and occupied_count
+            >= self.config.source_consensus_minimum_occupied_frames
+            and dropout_count
+            <= self.config.source_consensus_maximum_dropout_frames
+        )
+        qualification_latched = bool(
+            slot and self._qualified_source_slot == slot
+        )
         return {
             "slot": slot,
             "states": history,
@@ -335,54 +459,81 @@ class WaferTransferSession:
                 self.config.source_consensus_maximum_dropout_frames
             ),
             "latest_is_occupied": latest_occupied,
-            "passed": bool(
-                latest_occupied
-                and occupied_count
-                >= self.config.source_consensus_minimum_occupied_frames
-                and dropout_count
-                <= self.config.source_consensus_maximum_dropout_frames
+            "evaluation_state": (
+                "not_evaluated" if self._not_evaluated_frames else "evaluated"
             ),
+            "not_evaluated_frame_count": self._not_evaluated_frames,
+            "evidence_passed": evidence_passed,
+            "qualification_latched": qualification_latched,
+            "qualification_frame_sequence": (
+                self._source_qualification_frame_sequence
+                if qualification_latched
+                else None
+            ),
+            "qualification_captured_monotonic_s": (
+                self._source_qualification_captured_monotonic_s
+                if qualification_latched
+                else None
+            ),
+            "explicit_empty_streak": (
+                self._source_explicit_empty_streak
+                if slot == self.source_slot
+                else 0
+            ),
+            "passed": bool(evidence_passed or qualification_latched),
         }
 
+    def _maybe_latch_source_qualification(self) -> None:
+        slot = self.source_slot
+        if slot is None or self._qualified_source_slot == slot:
+            return
+        consensus = self.source_consensus(slot)
+        if consensus["evidence_passed"] is not True:
+            return
+        self._qualified_source_slot = slot
+        self._source_qualification_frame_sequence = self.latest_frame_sequence
+        self._source_qualification_captured_monotonic_s = (
+            self.latest_frame_captured_monotonic_s
+        )
+        self._source_explicit_empty_streak = 0
+        self._event(
+            "source_qualification_latched",
+            slot=slot,
+            frame_sequence=self.latest_frame_sequence,
+        )
+
     def select_source(self, slot_name: str) -> None:
+        if self.phase not in {
+            TransferPhase.IDLE, TransferPhase.SOURCE_SELECTED, TransferPhase.SOURCE_READY,
+            TransferPhase.ROUTE_READY, TransferPhase.BLOCKED,
+        }:
+            raise RuntimeError("cannot change the source during an active transfer")
         slot = str(slot_name)
         if slot not in self.slot_names:
             raise ValueError(f"unknown source slot {slot}")
-        if not (
-            self.latest_result is not None
-            and self.latest_result.quality_passed
-            and self.latest_result.coordinate_mapping_allowed
-        ):
-            raise ValueError(
-                "a quality-passed coordinate-mappable overview frame is required "
-                "before source selection"
-            )
         state = _slot_states(self.latest_result).get(slot)
-        if state is None:
-            raise ValueError(
-                "a quality-passed overview frame is required before source selection"
-            )
-        if state["state"] != SlotState.OCCUPIED.value:
-            raise ValueError(
-                f"source {slot} must be a normal occupied slot; current state={state['state']}"
-            )
-        consensus = self.source_consensus(slot)
-        if consensus["passed"] is not True:
-            raise ValueError(
-                f"source {slot} is not temporally stable: "
-                f"{consensus['occupied_frame_count']}/"
-                f"{consensus['window_frame_count']} recent frames are normal occupied; "
-                f"at least {consensus['required_occupied_frame_count']} are required"
-            )
+        # Selection records operator intent; start_tracking still requires all
+        # current metric, occupancy, registration and robot-state gates.
+        if self.source_slot != slot:
+            self._qualified_source_slot = None
+            self._source_qualification_frame_sequence = None
+            self._source_qualification_captured_monotonic_s = None
+            self._source_explicit_empty_streak = 0
         self.source_slot = slot
         if self.destination_slot == slot:
             self.destination_slot = None
         self.phase = TransferPhase.SOURCE_SELECTED
         self.block_reason = ""
         self._event("source_selected", slot=slot, state=state)
+        self._maybe_latch_source_qualification()
         self._refresh_ready_phase()
 
     def select_destination(self, slot_name: str) -> None:
+        if self.phase not in {
+            TransferPhase.IDLE, TransferPhase.SOURCE_SELECTED, TransferPhase.SOURCE_READY,
+            TransferPhase.ROUTE_READY, TransferPhase.BLOCKED,
+        }:
+            raise RuntimeError("cannot change the destination during an active transfer")
         slot = str(slot_name)
         if self.source_slot is None:
             raise ValueError("select a source wafer before selecting a destination")
@@ -390,24 +541,7 @@ class WaferTransferSession:
             raise ValueError(f"unknown destination slot {slot}")
         if slot == self.source_slot:
             raise ValueError("source and destination slots must be different")
-        if not (
-            self.latest_result is not None
-            and self.latest_result.quality_passed
-            and self.latest_result.coordinate_mapping_allowed
-        ):
-            raise ValueError(
-                "a quality-passed coordinate-mappable overview frame is required "
-                "before destination selection"
-            )
         state = _slot_states(self.latest_result).get(slot)
-        if state is None:
-            raise ValueError(
-                "a quality-passed overview frame is required before destination selection"
-            )
-        if state["safe_to_use_as_empty"] is not True:
-            raise ValueError(
-                f"destination {slot} is not proven empty; current state={state['state']}"
-            )
         self.destination_slot = slot
         self.block_reason = ""
         self._event("destination_selected", slot=slot, state=state)
@@ -424,6 +558,30 @@ class WaferTransferSession:
         )
         transform = _validated_transform_W_T(self.registration)
         state_fresh = self.latest_robot_state is not None
+        metric_checks = (
+            {} if self.latest_result is None
+            else self.latest_result.projection_diagnostics.get("metric_slot_checks", {})
+        )
+        source_metric = metric_checks.get(self.source_slot or "", {})
+        source_state = None if source is None else source["state"]
+        tolerated_after_proof = {
+            SlotState.WARNING.value,
+            SlotState.UNKNOWN.value,
+            SlotState.OUT_OF_VIEW.value,
+            SlotState.OCCLUDED.value,
+            SlotState.EMPTY.value,
+            SlotState.EMPTY_UNREAD_MARKER.value,
+        }
+        qualified_source_usable = bool(
+            consensus["qualification_latched"] is True
+            and (
+                source_state == SlotState.OCCUPIED.value
+                or (
+                    source_state in tolerated_after_proof
+                    and consensus["explicit_empty_streak"] < 3
+                )
+            )
+        )
         return {
             "overview_pose_quality": {
                 "passed": pose_passed,
@@ -433,22 +591,31 @@ class WaferTransferSession:
                     else self.latest_result.pose.reprojection_rms_px
                 ),
                 "limit": "existing Tray pose quality gates",
+                "reason": (
+                    "no camera frame" if self.latest_result is None
+                    else self.latest_result.failure_reason
+                ),
             },
             "source_normal_occupied_consensus": {
-                "passed": bool(
-                    source is not None
-                    and source["state"] == SlotState.OCCUPIED.value
-                    and consensus["passed"] is True
-                ),
+                "passed": qualified_source_usable,
                 "actual": {
-                    "latest_state": None if source is None else source["state"],
+                    "latest_state": source_state,
                     "occupied_frames": consensus["occupied_frame_count"],
                     "observed_frames": consensus["observed_frame_count"],
+                    "qualification_latched": consensus[
+                        "qualification_latched"
+                    ],
+                    "qualification_frame_sequence": consensus[
+                        "qualification_frame_sequence"
+                    ],
+                    "explicit_empty_streak": consensus[
+                        "explicit_empty_streak"
+                    ],
                 },
                 "limit": (
-                    f"latest={SlotState.OCCUPIED.value} and at least "
-                    f"{self.config.source_consensus_minimum_occupied_frames}/"
-                    f"{self.config.source_consensus_window_frames} recent frames occupied"
+                    f"first establish {self.config.source_consensus_minimum_occupied_frames}/"
+                    f"{self.config.source_consensus_window_frames} occupied frames; then retain "
+                    "through warning/unknown/occlusion and fewer than 3 explicit-empty frames"
                 ),
             },
             "runtime_registration": {
@@ -459,6 +626,28 @@ class WaferTransferSession:
                     else self.registration.get("status")
                 ),
                 "limit": "status=success and finite W<-T",
+            },
+            "source_nominal_slot_geometry": {
+                # Camera 1 only moves at the existing J3 clearance height and
+                # targets the nominal tray-slot centre.  Once two occupied
+                # frames have qualified that slot, the per-frame wafer contour
+                # is diagnostic information; making it an authorization gate
+                # merely reintroduces the occupied/warning flicker under a
+                # second name.  Current tray pose/marker quality is still a
+                # separate mandatory gate above, and stacked/outside states
+                # are rejected by qualified_source_usable.
+                "passed": source is not None,
+                "actual": {
+                    "slot_state": source_state,
+                    "wafer_boundary_diagnostic": source_metric or None,
+                    "qualification_latched": consensus[
+                        "qualification_latched"
+                    ],
+                },
+                "limit": (
+                    "current nominal slot projection present; per-frame wafer "
+                    "boundary is diagnostic-only for camera-1 clearance-height XY"
+                ),
             },
             "fresh_frame_synchronised_robot_state": {
                 "passed": state_fresh,
@@ -472,6 +661,70 @@ class WaferTransferSession:
                     "frame_robot_skew_s": self.config.maximum_frame_robot_skew_s,
                 },
             },
+        }
+
+    def _xy_motion_gates(self) -> dict[str, dict[str, Any]]:
+        """Gates that remain relevant after the source/world target is locked.
+
+        The selected wafer is allowed to leave view or become occluded by the
+        arm.  Current marker geometry is still mandatory so each observation
+        can independently check that the tray has not moved.  Controller state
+        for the actual command comes directly from ActionWorker, not from this
+        asynchronously sampled UI stream.
+        """
+
+        acquisition = self._source_tracking_gates()
+        transform = _validated_transform_W_T(self.registration)
+        source = _slot_states(self.latest_result).get(self.source_slot or "")
+        source_state = None if source is None else source.get("state")
+        temporarily_unseen = {
+            SlotState.WARNING.value,
+            SlotState.UNKNOWN.value,
+            SlotState.OUT_OF_VIEW.value,
+            SlotState.OCCLUDED.value,
+        }
+        explicit_empty = {
+            SlotState.EMPTY.value,
+            SlotState.EMPTY_UNREAD_MARKER.value,
+        }
+        consensus = self.source_consensus()
+        source_continuity = bool(
+            source_state == SlotState.OCCUPIED.value
+            or (self.target_lock_active() and source_state in temporarily_unseen)
+            or (
+                self.target_lock_active()
+                and source_state in explicit_empty
+                and consensus["qualification_latched"] is True
+                and consensus["explicit_empty_streak"] < 3
+            )
+        )
+        return {
+            "current_overview_pose_quality": dict(
+                acquisition["overview_pose_quality"]
+            ),
+            "locked_runtime_registration": {
+                "passed": bool(self.target_lock_active() and transform is not None),
+                "actual": {
+                    "target_lock_active": self.target_lock_active(),
+                    "registration_status": (
+                        None
+                        if self.registration is None
+                        else self.registration.get("status")
+                    ),
+                },
+                "limit": "target locked and finite W<-T retained from ARM",
+            },
+            "locked_source_not_explicitly_contradicted": {
+                "passed": source_continuity,
+                "actual": source_state,
+                "limit": (
+                    "occupied, warning/unknown/out_of_view/occluded after proof, or fewer "
+                    "than 3 consecutive explicit-empty frames; stacked/outside rejects"
+                ),
+            },
+            "fresh_frame_synchronised_robot_state": dict(
+                acquisition["fresh_frame_synchronised_robot_state"]
+            ),
         }
 
     def _route_gates(self) -> dict[str, dict[str, Any]]:
@@ -778,8 +1031,26 @@ class WaferTransferSession:
         delta = self.active_delta_world_xy()
         distance = None if delta is None else float(np.linalg.norm(delta))
         navigation_gates = self._source_tracking_gates()
+        xy_motion_gates = self._xy_motion_gates()
         route_gates = self._route_gates()
         consensus = self.source_consensus()
+        result = self.latest_result
+        pose = None if result is None else result.pose
+        pose_diagnostics = {
+            "projection_source": "unavailable" if result is None else result.projection_source,
+            "metric_passed": bool(result and result.quality_passed and result.coordinate_mapping_allowed),
+            "reason": "no camera frame" if result is None else result.failure_reason,
+            "visible_marker_ids": [] if pose is None else list(pose.visible_marker_ids),
+            "used_marker_ids": [] if pose is None else list(pose.used_marker_ids),
+            "rejected_marker_ids": [] if pose is None else list(pose.rejected_marker_ids),
+            "ransac_inlier_corners": 0 if pose is None else pose.ransac_inlier_corner_count,
+            "per_marker_rms_px": {} if pose is None else dict(pose.per_marker_rms_px),
+            "pose_rms_px": None if pose is None else pose.reprojection_rms_px,
+            "grid_rms_px": (
+                None if result is None or result.planar_registration is None
+                else result.planar_registration.reprojection_rms_px
+            ),
+        }
         return {
             "schema_version": 1,
             "phase": self.phase.value,
@@ -809,10 +1080,14 @@ class WaferTransferSession:
             ),
             "active_distance_mm": distance,
             "source_consensus": consensus,
+            "pose_diagnostics": pose_diagnostics,
+            "recent_overview_diagnostics": list(self.overview_diagnostics),
             "selection_gates": navigation_gates,
             "navigation_gates": navigation_gates,
+            "xy_motion_gates": xy_motion_gates,
             "route_gates": route_gates,
             "coordinate_ready": _validated_transform_W_T(self.registration) is not None,
+            "registration_locked": self.target_lock_active(),
             "tracking_ready": all(
                 gate["passed"] for gate in navigation_gates.values()
             ),

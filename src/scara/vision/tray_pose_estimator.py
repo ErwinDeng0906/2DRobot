@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from itertools import combinations
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -81,6 +82,7 @@ class TrayPoseEstimate:
     camera_position_T_mm: Optional[np.ndarray]
     minimum_object_depth_C_mm: Optional[float]
     annotated_image: np.ndarray
+    detected_corners_px: dict[int, np.ndarray] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         """Return a serialization-safe pose/quality record."""
@@ -224,6 +226,51 @@ def transform_points(transform: np.ndarray, points: np.ndarray) -> np.ndarray:
     return (np.asarray(transform, dtype=np.float64) @ homogeneous.T).T[:, :3]
 
 
+class _EdgeRefinedDetector:
+    """Locate globally, decode/refine metric markers from local edge pixels.
+
+    AprilTag edge fitting avoids the observed SUBPIX corner bias. Applying it
+    to bounded marker ROIs avoids repeating expensive quad segmentation over
+    the entire camera image. An insufficient seed always tries the full image.
+    """
+
+    def __init__(self, dictionary, metric_ids, minimum_count):
+        self.metric_ids = frozenset(metric_ids)
+        self.minimum_count = minimum_count
+        native = cv2.aruco.DetectorParameters()
+        native.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
+        edge = cv2.aruco.DetectorParameters()
+        edge.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
+        self.native = cv2.aruco.ArucoDetector(dictionary, native)
+        self.edge = cv2.aruco.ArucoDetector(dictionary, edge)
+
+    def detectMarkers(self, image):
+        corners, ids, rejected = self.native.detectMarkers(image)
+        if ids is None:
+            return self.edge.detectMarkers(image)
+        observations = {}
+        height, width = image.shape[:2]
+        for raw_id, raw_points in zip(ids.reshape(-1), corners):
+            key = int(raw_id)
+            points = np.asarray(raw_points, dtype=np.float32).reshape(4, 2)
+            if key not in self.metric_ids:
+                observations[key] = points.reshape(1, 4, 2)
+                continue
+            pad = max(10, int(.25 * np.max(np.ptp(points, axis=0))))
+            low = np.maximum(np.floor(points.min(axis=0)).astype(int) - pad, [0, 0])
+            high = np.minimum(np.ceil(points.max(axis=0)).astype(int) + pad + 1, [width, height])
+            local, local_ids, _ = self.edge.detectMarkers(image[low[1]:high[1], low[0]:high[0]])
+            if local_ids is not None:
+                for candidate_id, candidate in zip(local_ids.reshape(-1), local):
+                    if int(candidate_id) == key:
+                        observations[key] = np.asarray(candidate, np.float32) + low.astype(np.float32)
+                        break
+        if len(self.metric_ids & observations.keys()) < self.minimum_count:
+            return self.edge.detectMarkers(image)
+        ordered = sorted(observations)
+        return [observations[key] for key in ordered], np.asarray(ordered, np.int32).reshape(-1, 1), rejected
+
+
 class TrayBoardPoseEstimator:
     """Detect A-H and robustly estimate ``^C T_T`` for independent frames."""
 
@@ -232,6 +279,8 @@ class TrayBoardPoseEstimator:
         geometry: Mapping[str, Any],
         intrinsics: CameraIntrinsics,
         quality: TrayPoseQualityConfig = DEFAULT_POSE_QUALITY,
+        *,
+        edge_refinement: bool = False,
     ) -> None:
         validation = validate_geometry(geometry)
         if not validation["valid"]:
@@ -247,7 +296,10 @@ class TrayBoardPoseEstimator:
         self.dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
         parameters = cv2.aruco.DetectorParameters()
         # Sub-pixel refinement reduces corner quantization noise for PnP.
-        parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        parameters.cornerRefinementMethod = (
+            cv2.aruco.CORNER_REFINE_APRILTAG if edge_refinement
+            else cv2.aruco.CORNER_REFINE_SUBPIX
+        )
         self.detector = cv2.aruco.ArucoDetector(self.dictionary, parameters)
         self.object_corners_by_id: dict[int, np.ndarray] = {}
         self.label_by_id: dict[int, str] = {}
@@ -258,6 +310,9 @@ class TrayBoardPoseEstimator:
             ).reshape(4, 3)
             self.label_by_id[marker_id] = str(label)
         self.configured_ids = frozenset(self.object_corners_by_id)
+        if edge_refinement:
+            self.detector = _EdgeRefinedDetector(self.dictionary, self.configured_ids,
+                                                self.quality.minimum_visible_markers)
 
     def _empty_result(
         self,
@@ -415,6 +470,80 @@ class TrayBoardPoseEstimator:
         )
         return per_marker, global_rms
 
+    def _fit_marker_consensus(self, observations: Mapping[int, np.ndarray]):
+        """Fit complete-marker hypotheses, then validate the FINAL fit.
+
+        A point-RANSAC fit can initially blame two of four markers even when
+        three agree. Removing every blamed marker at once loses that solution.
+        Search largest sets first, without blacklisting an ID across frames.
+        Refinement is part of each hypothesis, never an unchecked last step.
+        """
+        ids = tuple(sorted(observations))
+        fallback = None
+        attempts = 0
+        for count in range(len(ids), self.quality.minimum_inlier_markers - 1, -1):
+            candidates = []
+            for subset in combinations(ids, count):
+                attempts += 1
+                if attempts > 64:
+                    return fallback, 'Marker consensus search budget exhausted'
+                active = {key: observations[key] for key in subset}
+                ok, rvec, tvec, seed_inliers = self._solve(active)
+                if not ok or rvec is None or tvec is None:
+                    continue
+                rvec, tvec = self._refine_all_active(active, rvec, tvec)
+                errors, rms = self._marker_errors(active, rvec, tvec)
+                points = np.concatenate([self.object_corners_by_id[key] for key in subset])
+                pixels = np.concatenate([active[key] for key in subset])
+                projected, _ = cv2.projectPoints(points, rvec, tvec,
+                    self.intrinsics.K, self.intrinsics.dist_coeffs)
+                residuals = np.linalg.norm(projected.reshape(-1, 2) - pixels, axis=1)
+                # Inlier diagnostics and the gate must describe this fit, not
+                # the now-obsolete point-RANSAC seed from before LM refinement.
+                final_inliers = np.flatnonzero(residuals <= self.quality.ransac_reprojection_threshold_px)
+                inliers = np.intersect1d(seed_inliers, final_inliers)
+                transform = make_transform_C_T(rvec, tvec)
+                finite = bool(np.isfinite(rms) and np.all(np.isfinite(transform)))
+                span = self._object_span(points)
+                fit = (active, rvec, tvec, inliers, errors, rms, span)
+                if fallback is None:
+                    fallback = fit
+                if not finite:
+                    continue
+                camera = invert_transform(transform)[:3, 3]
+                if (
+                    max(errors.values()) > self.quality.marker_outlier_threshold_px
+                    or rms > self.quality.maximum_global_rms_px
+                    or len(inliers) / len(points) < self.quality.minimum_ransac_inlier_corner_ratio
+                    or span < self.quality.minimum_object_span_mm
+                    or camera[2] < self.quality.minimum_camera_height_above_tray_mm
+                    or np.min(transform_points(transform, points)[:, 2]) < self.quality.minimum_object_depth_C_mm
+                ):
+                    continue
+                # Evaluate excluded markers too: a low-error small subset must
+                # not win over a larger valid consensus, and ties use evidence
+                # from ALL detections rather than just the convenient subset.
+                all_errors, _ = self._marker_errors(observations, rvec, tvec)
+                score = sum(min(value, 2 * self.quality.marker_outlier_threshold_px) ** 2
+                            for value in all_errors.values())
+                candidates.append((score, rms, subset, fit))
+            if candidates:
+                candidates.sort(key=lambda row: row[:3])
+                winner = candidates[0][3]
+                # Equally supported but incompatible poses are not permission
+                # to move. Compare their projection across the full board.
+                check_points = np.concatenate(list(self.object_corners_by_id.values()))
+                reference, _ = cv2.projectPoints(check_points, winner[1], winner[2],
+                    self.intrinsics.K, self.intrinsics.dist_coeffs)
+                for candidate in candidates[1:]:
+                    alternative = candidate[3]
+                    pixels, _ = cv2.projectPoints(check_points, alternative[1], alternative[2],
+                        self.intrinsics.K, self.intrinsics.dist_coeffs)
+                    if float(np.max(np.linalg.norm(pixels - reference, axis=2))) > self.quality.marker_outlier_threshold_px:
+                        return fallback, 'Marker consensus ambiguous: equally supported poses disagree'
+                return winner, None
+        return fallback, None
+
     def estimate(self, image: np.ndarray) -> TrayPoseEstimate:
         """Estimate ``^C T_T`` and quality metrics from one BGR image."""
         if image is None or image.ndim != 3 or image.shape[2] != 3:
@@ -435,9 +564,14 @@ class TrayBoardPoseEstimator:
             [] if marker_ids is None else [int(x) for x in marker_ids.reshape(-1)]
         )
         observations: dict[int, np.ndarray] = {}
+        decoded_corners: dict[int, np.ndarray] = {}
         display_corners: list[np.ndarray] = []
         display_ids: list[int] = []
         for corners, marker_id in zip(marker_corners, all_detected_ids):
+            candidate = np.asarray(corners, dtype=np.float64).reshape(4, 2)
+            previous = decoded_corners.get(marker_id)
+            if previous is None or abs(cv2.contourArea(candidate.astype(np.float32))) > abs(cv2.contourArea(previous.astype(np.float32))):
+                decoded_corners[marker_id] = candidate.copy()
             if marker_id not in self.configured_ids:
                 continue
             # If an ID somehow appears twice, keep the larger image quadrilateral.
@@ -471,45 +605,12 @@ class TrayBoardPoseEstimator:
                 f"可见Board跨度不足：{object_span:.1f}mm",
             )
 
-        active = dict(observations)
-        rejected_ids: set[int] = set()
-        ransac_inliers = np.empty((0,), dtype=np.int32)
-        rvec: Optional[np.ndarray] = None
-        tvec: Optional[np.ndarray] = None
-        per_marker: dict[int, float] = {}
-        global_rms: Optional[float] = None
-        for _iteration in range(self.quality.maximum_refinement_iterations):
-            ok, candidate_rvec, candidate_tvec, ransac_inliers = self._solve(active)
-            if not ok or candidate_rvec is None or candidate_tvec is None:
-                return self._empty_result(image, visible_ids, "solvePnPRansac失败")
-            rvec, tvec = candidate_rvec, candidate_tvec
-            per_marker, global_rms = self._marker_errors(active, rvec, tvec)
-            bad = {
-                marker_id
-                for marker_id, error in per_marker.items()
-                if error > self.quality.marker_outlier_threshold_px
-            }
-            if not bad:
-                break
-            if len(active) - len(bad) < self.quality.minimum_inlier_markers:
-                break
-            rejected_ids.update(bad)
-            active = {
-                marker_id: corners
-                for marker_id, corners in active.items()
-                if marker_id not in bad
-            }
-
-        # Always solve once more on the final active set.  This also covers the
-        # case where the last allowed pruning iteration removed a marker.
-        ok, final_rvec, final_tvec, ransac_inliers = self._solve(active)
-        if not ok or final_rvec is None or final_tvec is None:
+        fitted, consensus_error = self._fit_marker_consensus(observations)
+        if fitted is None:
             return self._empty_result(image, visible_ids, "最终PnP没有产生位姿")
-        rvec, tvec = final_rvec, final_tvec
+        active, rvec, tvec, ransac_inliers, per_marker, global_rms, object_span = fitted
         used_ids = tuple(sorted(active))
-        rvec, tvec = self._refine_all_active(active, rvec, tvec)
-        # Report errors only for the final active set; rejected IDs are explicit.
-        per_marker, global_rms = self._marker_errors(active, rvec, tvec)
+        rejected_ids = set(observations) - set(active)
         transform_C_T = make_transform_C_T(rvec, tvec)
         transform_T_C = invert_transform(transform_C_T)
         camera_position_T = transform_T_C[:3, 3].copy()
@@ -521,7 +622,13 @@ class TrayBoardPoseEstimator:
         inlier_ratio = len(ransac_inliers) / float(4 * len(used_ids))
         failure_reason: Optional[str] = None
         quality_passed = True
-        if len(used_ids) < self.quality.minimum_inlier_markers:
+        if consensus_error or not np.isfinite(global_rms) or not np.all(np.isfinite(transform_C_T)):
+            quality_passed = False
+            failure_reason = consensus_error or 'non-finite final pose'
+        elif object_span < self.quality.minimum_object_span_mm:
+            quality_passed = False
+            failure_reason = f"有效Board跨度不足：{object_span:.1f}mm"
+        elif len(used_ids) < self.quality.minimum_inlier_markers:
             quality_passed = False
             failure_reason = (
                 f"有效Marker不足：{len(used_ids)}/"
@@ -639,6 +746,7 @@ class TrayBoardPoseEstimator:
             camera_position_T_mm=camera_position_T,
             minimum_object_depth_C_mm=minimum_depth_C,
             annotated_image=annotated,
+            detected_corners_px=decoded_corners,
         )
 
     def project_tray_points(

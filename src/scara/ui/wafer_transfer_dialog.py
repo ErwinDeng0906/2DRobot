@@ -13,6 +13,8 @@ from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QImage, QMouseEvent, QPixmap, QResizeEvent
 from PyQt6.QtWidgets import (
     QButtonGroup,
+    QComboBox,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
@@ -130,7 +132,7 @@ class WaferTransferMonitorThread(QThread):
         self,
         camera: Any,
         runtime: LiveWaferTransferRuntime,
-        robot_state_provider: Optional[Callable[[], Optional[Mapping[str, Any]]]],
+        robot_state_provider: Optional[Callable[..., Optional[Mapping[str, Any]]]],
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -138,6 +140,48 @@ class WaferTransferMonitorThread(QThread):
         self.runtime = runtime
         self.robot_state_provider = robot_state_provider
         self._running = True
+
+    def _robot_state_nearest_capture(
+        self, captured_monotonic_s: float
+    ) -> Optional[Mapping[str, Any]]:
+        """Wait briefly for a bracket/nearby cached state, without controller I/O."""
+
+        provider = self.robot_state_provider
+        if provider is None:
+            return None
+        skew_limit = float(
+            self.runtime.session.config.maximum_frame_robot_skew_s
+        )
+        # readall polling is intentionally asynchronous and can be blocked by
+        # a just-finished move.  A short wait lets its next cached sample pair
+        # with this frame; it never polls hardware from the vision thread.
+        deadline = time.monotonic() + 0.45
+        latest: Optional[Mapping[str, Any]] = None
+        while self._running and not self.isInterruptionRequested():
+            try:
+                try:
+                    candidate = provider(float(captured_monotonic_s))
+                except TypeError:
+                    candidate = provider()
+            except Exception:
+                candidate = None
+            if isinstance(candidate, Mapping):
+                latest = candidate
+                try:
+                    state_time = float(candidate.get("captured_monotonic_s"))
+                except (TypeError, ValueError, OverflowError):
+                    state_time = math.nan
+                skew = state_time - float(captured_monotonic_s)
+                if math.isfinite(skew) and abs(skew) <= skew_limit:
+                    return candidate
+                # This frame is already older than the newest cached state by
+                # too much. A later controller sample cannot improve pairing.
+                if math.isfinite(skew) and skew > skew_limit:
+                    return candidate
+            if time.monotonic() >= deadline:
+                return latest
+            self.msleep(20)
+        return latest
 
     def stop(self, timeout_ms: int = 5000) -> bool:
         self._running = False
@@ -166,12 +210,7 @@ class WaferTransferMonitorThread(QThread):
             last_sequence = int(sequence)
             stale_since = time.monotonic()
             invalidated = False
-            state = None
-            if self.robot_state_provider is not None:
-                try:
-                    state = self.robot_state_provider()
-                except Exception:
-                    state = None
+            state = self._robot_state_nearest_capture(float(captured_at))
             try:
                 result = self.runtime.process_camera1(
                     frame,
@@ -212,7 +251,7 @@ class WaferTransferDialog(QDialog):
         parent: Optional[QWidget] = None,
         *,
         robot_state_provider: Optional[
-            Callable[[], Optional[Mapping[str, Any]]]
+            Callable[..., Optional[Mapping[str, Any]]]
         ] = None,
     ) -> None:
         super().__init__(parent)
@@ -279,6 +318,25 @@ class WaferTransferDialog(QDialog):
         controls.addStretch(1)
         root.addLayout(controls)
 
+        slot_controls = QHBoxLayout()
+        slot_controls.addWidget(QLabel("也可按编号选择："))
+        self.slot_selector = QComboBox()
+        self.slot_selector.addItems(sorted(self.runtime.session.slot_names))
+        self.select_slot_button = QPushButton("选定槽位")
+        slot_controls.addWidget(self.slot_selector)
+        slot_controls.addWidget(self.select_slot_button)
+        slot_controls.addWidget(QLabel("选择只记录目标；验证通过后才能启动移动。"))
+        slot_controls.addStretch(1)
+        root.addLayout(slot_controls)
+
+        display_controls = QHBoxLayout()
+        display_controls.addWidget(QLabel("固定框用于选槽；CHECK=需检查，不能运动。"))
+        self.raw_overlay_checkbox = QCheckBox("显示硅片轮廓（诊断）")
+        self.raw_overlay_checkbox.toggled.connect(self.runtime.set_raw_wafer_overlay)
+        display_controls.addWidget(self.raw_overlay_checkbox)
+        display_controls.addStretch(1)
+        root.addLayout(display_controls)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.preview = ClickableImageLabel()
         self.preview.setText("等待相机1画面")
@@ -296,6 +354,7 @@ class WaferTransferDialog(QDialog):
             lambda: self._set_selection_role("destination")
         )
         self.preview.image_clicked.connect(self._on_image_clicked)
+        self.select_slot_button.clicked.connect(self._on_slot_selected)
         self.track_button.clicked.connect(self._start_tracking)
         self.xy_motion_button.clicked.connect(self._on_xy_motion_button)
         self.reset_button.clicked.connect(self._reset_selection)
@@ -324,17 +383,32 @@ class WaferTransferDialog(QDialog):
             self._show_error("XY悬空定位已ARM，不允许在运动会话中更换目标")
             return
         try:
+            if self._last_frame is None:
+                raise ValueError("请等待画面，或按槽位编号选择目标")
             slot, point_T, distance = self.runtime.select_pixel(
                 (x, y),
                 role=self._selection_role,
+                displayed_frame=self._last_frame,
             )
             self._last_interaction_text = (
                 f"最近点击：像素=({x:.1f},{y:.1f})\n"
-                f"托盘坐标=({point_T[0]:+.3f},{point_T[1]:+.3f},{point_T[2]:+.3f}) mm\n"
-                f"已选择 {slot}，点击点距槽中心={distance:.3f} mm"
+                f"选择参考坐标=({point_T[0]:+.3f},{point_T[1]:+.3f}) mm（非运动坐标）\n"
+                f"已选择 {slot}；运动须另行验证。"
             )
             self._refresh_status(self.runtime.snapshot())
         except Exception as exc:  # noqa: BLE001 - selection remains unchanged
+            self._show_error(str(exc))
+
+    def _on_slot_selected(self) -> None:
+        if self._pick_xy_active:
+            self._show_error("XY悬空定位已ARM，不允许更换目标")
+            return
+        try:
+            slot = self.slot_selector.currentText()
+            self.runtime.select_slot(slot, role=self._selection_role)
+            self._last_interaction_text = f"已选择 {slot}；等待当前视觉和运动条件验证。"
+            self._refresh_status(self.runtime.snapshot())
+        except Exception as exc:  # noqa: BLE001
             self._show_error(str(exc))
 
     def _start_tracking(self) -> None:
@@ -432,9 +506,11 @@ class WaferTransferDialog(QDialog):
             "启动后会真实移动机械臂：\n"
             "1. 仅执行分段XY运动：远距离单步最多9.99 mm，接近目标自动减小；\n"
             "2. J3保持相机1安全观察高度，不执行下降；\n"
-            "3. XY到位后只旋转J4，使工具方向对齐本次相机1测得的托盘方向；\n"
-            "4. 不发送DO、真空或吸取命令；\n"
-            "5. 每步后重新采2张合格帧；4秒内画面不足会跳过本轮并自动重试，"
+            "3. 若当前Rz与相机1标定姿态不同，先保持J1/J2/J3不动、仅旋转J4"
+            "到标定Rz；\n"
+            "4. XY到位后只旋转J4，使工具方向对齐本次相机1测得的托盘方向；\n"
+            "5. 不发送DO、真空或吸取命令；\n"
+            "6. 每步后重新采2张合格帧；4秒内画面不足会跳过本轮并自动重试，"
             "明确质量门失败或误差不减小仍会停止。\n\n"
             "请确认托盘上方和逐轴扫掠路径无障碍、控制器T1模式且速度不超过20%、"
             "软限位正确且急停可用。"
@@ -484,11 +560,19 @@ class WaferTransferDialog(QDialog):
         self._refresh_status(self.runtime.snapshot())
         return session.action_task()
 
+    def report_pick_xy_start_rejected(self, reason: str) -> None:
+        """Surface a controller-side start rejection in this foreground dialog."""
+
+        self._last_interaction_text = f"XY悬空移动未启动：{str(reason)}"
+        self._refresh_status(self.runtime.snapshot())
+
     def _set_pick_xy_controls(self, active: bool) -> None:
         self.xy_motion_button.setText(
             "停止XY悬空移动" if active else "启动XY悬空移动"
         )
         for widget in (
+            self.slot_selector,
+            self.select_slot_button,
             self.source_button,
             self.destination_button,
             self.track_button,
@@ -553,7 +637,11 @@ class WaferTransferDialog(QDialog):
 
     def _pick_xy_sample(self, frame: WaferTransferFrame) -> dict[str, Any]:
         snapshot = frame.session_snapshot
-        gates = snapshot.get("selection_gates") or {}
+        # The source and W<-T were proved before ARM.  During XY motion the
+        # arm may temporarily occlude the wafer, so use the dedicated motion
+        # gates: current marker pose, locked registration, non-contradicted
+        # source identity, and fresh synchronized robot state.
+        gates = snapshot.get("xy_motion_gates") or {}
         accepted = bool(
             frame.result.quality_passed
             and frame.result.coordinate_mapping_allowed
@@ -586,9 +674,16 @@ class WaferTransferDialog(QDialog):
             "target_name": snapshot.get("source_slot"),
             "source_state": snapshot.get("source_state"),
             "source_consensus": snapshot.get("source_consensus"),
-            "selection_gates": gates,
+            "motion_gates": gates,
+            "selection_gates": snapshot.get("selection_gates"),
+            "pose_diagnostics": snapshot.get("pose_diagnostics"),
             "robot_state": snapshot.get("robot_state"),
             "registration": snapshot.get("registration"),
+            "tray_transform_C_T": (
+                None
+                if frame.result.pose.T_C_T is None
+                else frame.result.pose.T_C_T.astype(float).tolist()
+            ),
             "reprojection_rms_px": frame.result.pose.reprojection_rms_px,
             "used_marker_count": len(frame.result.pose.used_marker_ids),
             "annotated_bgr": frame.annotated_bgr.copy(),
@@ -719,6 +814,8 @@ class WaferTransferDialog(QDialog):
             lines.append(
                 f"{'PASS' if passed else 'WAIT'} {name}\n  actual={gate.get('actual')}\n  limit={gate.get('limit')}"
             )
+            if gate.get("reason"):
+                lines.append(f"  原因={gate['reason']}")
         return lines
 
     def _refresh_status(self, snapshot: Mapping[str, Any], *, extra: str = "") -> None:
@@ -728,6 +825,9 @@ class WaferTransferDialog(QDialog):
         distance = snapshot.get("active_distance_mm")
         registration = snapshot.get("registration") or {}
         consensus = snapshot.get("source_consensus") or {}
+        diagnostics = snapshot.get("pose_diagnostics") or {}
+        displayed_sequence = None if self._last_frame is None else self._last_frame.frame_sequence
+        paired = displayed_sequence == snapshot.get("latest_frame_sequence") and displayed_sequence is not None
         pending_evidence = (
             self._eligible_pick_xy_samples()
             if self._pick_xy_pending_request is not None
@@ -757,9 +857,12 @@ class WaferTransferDialog(QDialog):
                 f"yaw={float(registration.get('yaw_world_from_tray_deg')):+.3f}°"
             )
         lines = [
-            extra or self._last_interaction_text or "点击画面中的正常硅片选择拾取目标。",
+            extra or self._last_interaction_text or "点击槽位或按编号选择；选择不等于允许运动。",
             "",
             f"选择模式：{'拾取槽' if self._selection_role == 'source' else '放置槽'}",
+            f"frame_id：图像={displayed_sequence} / 面板={snapshot.get('latest_frame_sequence')} · {'同步' if paired else 'STALE'}",
+            f"槽位几何：{diagnostics.get('projection_source', 'unavailable')}",
+            f"运动位姿：{'PASS' if diagnostics.get('metric_passed') else 'WAIT'} · {diagnostics.get('reason') or '—'}",
             f"阶段：{snapshot.get('phase')}",
             f"拾取槽：{snapshot.get('source_slot') or '—'} · {source.get('state', '—')}",
             f"放置槽：{snapshot.get('destination_slot') or '—'} · {destination.get('state', '—')}",
@@ -768,15 +871,29 @@ class WaferTransferDialog(QDialog):
                 "拾取稳定证据："
                 f"{consensus.get('occupied_frame_count', 0)}/"
                 f"{consensus.get('window_frame_count', 2)} 帧正常 · "
-                f"临时掉检 {consensus.get('dropout_frame_count', 0)}/"
-                f"{consensus.get('maximum_dropout_frame_count', 2)}"
+                f"资格={'已锁存' if consensus.get('qualification_latched') else '未锁存'} · "
+                f"连续明确判空 {consensus.get('explicit_empty_streak', 0)}/3"
             ),
+            f"未评价帧：{consensus.get('not_evaluated_frame_count', 0)}（位姿无效不算硅片掉检）",
             f"W←T：{registration_text}",
             f"吸盘到当前目标：{delta_text}",
             f"相机2近距：{(snapshot.get('close_range') or {}).get('state', 'unavailable')}",
             "",
-            "当前质量门：",
-            *self._gate_lines(snapshot.get("selection_gates") or {}),
+            (
+                "XY运动质量门（硅片短暂遮挡不撤销已锁定目标）："
+                if self._pick_xy_active
+                else "启动前质量门："
+            ),
+            f"使用marker：{diagnostics.get('used_marker_ids', [])}；RANSAC内点：{diagnostics.get('ransac_inlier_corners', 0)}",
+            f"各marker RMS(px)：{diagnostics.get('per_marker_rms_px', {})}",
+            *self._gate_lines(
+                (
+                    snapshot.get("xy_motion_gates")
+                    if self._pick_xy_active
+                    else snapshot.get("selection_gates")
+                )
+                or {}
+            ),
             "",
             "相机2近距质量门：",
             *(
@@ -809,8 +926,12 @@ class WaferTransferDialog(QDialog):
         self.status.setPlainText("\n".join(lines))
         self.status.verticalScrollBar().setValue(0)
         if not self._pick_xy_active:
-            ready = bool(snapshot.get("tracking_ready"))
-            self.track_button.setEnabled(ready)
+            ready = bool(snapshot.get("tracking_ready")) and paired
+            # Once tracking has locked the target, this is no longer a valid
+            # action.  Do not make the button flash with per-frame readiness.
+            self.track_button.setEnabled(
+                ready and snapshot.get("registration_locked") is not True
+            )
             self.xy_motion_button.setEnabled(ready)
         else:
             self.xy_motion_button.setEnabled(True)
