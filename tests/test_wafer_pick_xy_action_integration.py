@@ -482,8 +482,9 @@ class WaferPickXYActionIntegrationTests(unittest.TestCase):
         )
         self.assertIsNotNone(joints)
         start_xy = fk_wrist(joints[0], joints[1])
+        target_rz = 16.3223
         target_joints = list(joints)
-        target_joints[3] = j4_for_rz(joints[0], joints[1], -1.0)
+        target_joints[3] = j4_for_rz(joints[0], joints[1], target_rz)
 
         class FakeController:
             def __init__(self):
@@ -551,9 +552,13 @@ class WaferPickXYActionIntegrationTests(unittest.TestCase):
                             "vacuum_authorized": False,
                             "do_authorized": False,
                             "locked_j3_mm": -27.0046,
-                            "locked_rz_deg": -1.0,
+                            "locked_rz_deg": target_rz,
                             "calculation": {
-                                "commanded_correction_xy_mm": [0.0, 0.0]
+                                "commanded_correction_xy_mm": [0.0, 0.0],
+                                "camera2_median_angle_error_deg": 4.5,
+                                "commanded_j4_correction_deg": -4.5,
+                                "current_absolute_rz_deg": 20.8223,
+                                "target_absolute_rz_deg": target_rz,
                             },
                             "safety_gates": {"synthetic": {"passed": True}},
                         },
@@ -571,7 +576,9 @@ class WaferPickXYActionIntegrationTests(unittest.TestCase):
                 joints[index], controller.goto_calls[0][index], places=9
             )
         self.assertAlmostEqual(float(start_xy[0]), fk_wrist(*controller.joints[:2])[0])
-        self.assertAlmostEqual(-1.0, rz_of(*controller.joints[:2], controller.joints[3]))
+        self.assertAlmostEqual(
+            target_rz, rz_of(*controller.joints[:2], controller.joints[3])
+        )
 
     def test_j4_only_audit_rejects_wrapped_full_turn_command(self) -> None:
         joints = solve_joints(

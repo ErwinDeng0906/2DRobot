@@ -208,6 +208,7 @@ class ScaraControlWidget(QWidget):
         self._owns = owns_controller
         self._ctrl = controller or ScaraController(self._cfg)
         self._cam: Optional[ScaraCameraThread] = None
+        self._wafer_pick_camera2: Optional[ScaraCameraThread] = None
         self._camera_connection_counts: dict[int, int] = {}
         self._handeye_dialog: Optional[QDialog] = None
         self._wafer_transfer_dialog: Optional[QDialog] = None
@@ -1175,6 +1176,9 @@ class ScaraControlWidget(QWidget):
             dialog.destroyed.connect(self._on_wafer_transfer_dialog_destroyed)
             dialog.pick_xy_start_requested.connect(self._start_wafer_pick_xy)
             dialog.pick_xy_stop_requested.connect(self._stop_wafer_pick_xy)
+            dialog.pick_xy_camera2_requested.connect(
+                self._start_wafer_pick_camera2
+            )
             dialog.show()
             self._append(
                 "转移视觉",
@@ -1191,6 +1195,7 @@ class ScaraControlWidget(QWidget):
 
     def _on_wafer_transfer_dialog_destroyed(self, _object=None) -> None:
         self._wafer_transfer_dialog = None
+        self._stop_wafer_pick_camera2("转移视觉窗口关闭")
 
     def _start_wafer_pick_xy(self) -> None:
         """Start selected-wafer XY-only motion through the sole hardware owner."""
@@ -1298,6 +1303,62 @@ class ScaraControlWidget(QWidget):
 
         dialog.begin_pick_xy_request(dict(request), respond)
 
+    def _start_wafer_pick_camera2(self) -> None:
+        """Open camera 2 independently while camera 1 remains the XY source."""
+
+        dialog = self._wafer_transfer_dialog
+        worker = self._action_worker
+        if dialog is None or worker is None or not worker.isRunning():
+            return
+        camera = self._wafer_pick_camera2
+        if camera is not None and camera.isRunning():
+            try:
+                dialog.attach_camera2(camera)
+            except Exception as exc:
+                worker.request_stop()
+                self._append("相机2 J4对齐", f"连接失败：{exc}", _D["error"])
+            return
+        generation = self._camera_connection_counts.get(2, 0) + 1
+        self._camera_connection_counts[2] = generation
+        camera = ScaraCameraThread(index=2, connection_generation=generation)
+        camera.error.connect(self._on_wafer_pick_camera2_error)
+        self._wafer_pick_camera2 = camera
+        try:
+            dialog.attach_camera2(camera)
+            camera.start()
+        except Exception as exc:
+            self._wafer_pick_camera2 = None
+            worker.request_stop()
+            self._append("相机2 J4对齐", f"启动失败：{exc}", _D["error"])
+            return
+        self._append(
+            "相机2 J4对齐",
+            "XY已到位，逻辑相机2正在采集；只允许J4视觉闭环修正",
+            _D["accent"],
+        )
+
+    def _on_wafer_pick_camera2_error(self, message: str) -> None:
+        self._append("相机2 J4对齐", message, _D["error"])
+        worker = self._action_worker
+        if worker is not None and worker.isRunning():
+            worker.request_stop()
+
+    def _stop_wafer_pick_camera2(
+        self, context: str, timeout_ms: int = 5000
+    ) -> bool:
+        camera = self._wafer_pick_camera2
+        if camera is None:
+            return True
+        if camera.isRunning() and not camera.stop(timeout_ms):
+            self._append(
+                "相机2 J4对齐",
+                f"{context}失败：相机2采集线程尚未退出",
+                _D["warning"],
+            )
+            return False
+        self._wafer_pick_camera2 = None
+        return True
+
     def _stop_wafer_pick_xy(self) -> None:
         worker = self._action_worker
         if (
@@ -1322,6 +1383,9 @@ class ScaraControlWidget(QWidget):
             except Exception as exc:
                 ok = False
                 message = f"{message}；XY悬空定位报告收尾失败：{exc}"
+        if not self._stop_wafer_pick_camera2("XY悬空定位结束"):
+            ok = False
+            message = f"{message}；相机2采集线程未能安全退出"
         self._set_action_controls_locked(False)
         self._btn_cam.setEnabled(True)
         self._cam_idx.setEnabled(True)
@@ -2163,6 +2227,7 @@ class ScaraControlWidget(QWidget):
                 self._zero_all_dos("退出")
             if self._cam is not None:
                 self._stop_camera_thread("退出清理相机", timeout_ms=5000)
+            self._stop_wafer_pick_camera2("退出清理相机2", timeout_ms=5000)
             if self._owns:
                 self._ctrl.cleanup()
         except Exception as exc:  # pragma: no cover

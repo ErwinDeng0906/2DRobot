@@ -1,11 +1,13 @@
-"""Fail-closed XY-only positioning above a selected tray wafer.
+"""Fail-closed XY positioning and camera-2 J4 tray alignment.
 
 This module owns no camera, Qt widget, or robot controller.  Camera 1 proves the
 source and ``W<-T`` before arming.  During XY motion it still supplies two
 current marker-pose observations, but temporary wafer occlusion cannot change
 the selected slot and the accepted ``W<-T`` is never overwritten.  The
 ``ActionWorker`` remains the sole hardware owner and repeats controller and
-kinematic checks immediately before every physical move.
+kinematic checks immediately before every physical move.  After XY arrival,
+camera 2 supplies a new two-frame visual angle window; controller Rz alone is
+never accepted as proof that the tray is visually square.
 """
 
 from __future__ import annotations
@@ -46,6 +48,11 @@ CONTROLLER_QUANTIZATION_HEADROOM_MM = 0.01
 MAXIMUM_SEQUENTIAL_TRANSIENT_XY_MM = 8.0
 MAXIMUM_SEQUENTIAL_TRANSIENT_RZ_DEG = 5.0
 MAXIMUM_FINAL_J4_ROTATION_DEG = 30.0
+MAXIMUM_CAMERA2_J4_STEP_DEG = 10.0
+MAXIMUM_CAMERA2_J4_CORRECTIONS = 3
+CAMERA2_ALIGNMENT_MEDIAN_DEG = 0.50
+CAMERA2_ALIGNMENT_MAXIMUM_DEG = 0.75
+CAMERA2_MAXIMUM_TWO_FRAME_SPREAD_DEG = 0.60
 LOCAL_EXTENT_MM = 70.0
 DOMAIN_MARGIN_MM = 5.0
 ARRIVAL_MEDIAN_MM = 0.50
@@ -84,6 +91,14 @@ def _yaw_deg(transform_W_T: np.ndarray) -> float:
     return math.degrees(
         math.atan2(float(transform_W_T[1, 0]), float(transform_W_T[0, 0]))
     )
+
+
+def _signed_angle_deg(value: float) -> float:
+    return float((float(value) + 180.0) % 360.0 - 180.0)
+
+
+def _square_axis_angle_deg(value: float) -> float:
+    return float((float(value) + 45.0) % 90.0 - 45.0)
 
 
 def _registered_tray_center_world_xy(
@@ -234,10 +249,9 @@ class WaferPickXYPositioningSession:
         )
         if not math.isfinite(self.initial_registration_yaw_deg):
             raise RuntimeError("启动时W<-T缺少有效yaw")
-        # "托盘是正的"在本阶段定义为：最终工具绝对Rz与本次相机1登记的
-        # 托盘X轴世界yaw一致。XY搜索期间保持吸盘标定Rz；如果启动姿态刚好
-        # 是上一次运行留下的托盘对齐Rz，则ActionWorker先做一次J4-only标定
-        # 姿态预对齐，XY到位后再做一次J4-only托盘方向对齐。
+        # This is only a normalization placeholder required by the task schema.
+        # The real final Rz is measured after XY arrival from two fresh camera-2
+        # frames; camera-1 world yaw is not camera-2 visual alignment evidence.
         self.final_tray_rz_deg = self.initial_registration_yaw_deg
         source_consensus = initial_snapshot.get("source_consensus") or {}
         selection_gates = initial_snapshot.get("selection_gates") or {}
@@ -335,6 +349,11 @@ class WaferPickXYPositioningSession:
         self.iterations: list[dict[str, Any]] = []
         self.final_hold: dict[str, Any] | None = None
         self.final_orientation_commanded = False
+        self.camera2_alignment_active = False
+        self.camera2_j4_correction_count = 0
+        self.camera2_cumulative_j4_correction_deg = 0.0
+        self.camera2_alignment_windows: list[dict[str, Any]] = []
+        self.camera2_orientation_lock_joints: list[float] | None = None
         self.final_orientation_audit: dict[str, Any] | None = None
         self.final_orientation_proposal: dict[str, Any] | None = None
         self.evidence_images: list[dict[str, Any]] = []
@@ -415,8 +434,8 @@ class WaferPickXYPositioningSession:
                 "相机1在启动前确认硅片并锁定本次W<-T；运动中两帧只复核当前"
                 "托盘位姿与真实位移，不因机械臂短暂遮挡硅片撤销目标。"
                 "远距离单步最多9.99mm，接近目标时自动减小；XY阶段固定J3安全"
-                "观察高度；必要时先仅转J4对齐标定Rz，XY到位后再仅转J4使工具"
-                "对齐托盘方向；不执行"
+                "观察高度；必要时先仅转J4对齐标定Rz。XY到位后由相机2连续两帧"
+                "测量画面方向，只转J4闭环修正并再次用相机2复核；不执行"
                 "下降、吸取、DO或真空。"
             ),
             "camera_model": {
@@ -748,6 +767,293 @@ class WaferPickXYPositioningSession:
             "每次实际移动后，下一独立两帧必须证明距离继续减小",
         )
 
+    def _camera2_window(
+        self,
+        request: Mapping[str, Any],
+        samples: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        rows = list(samples)
+        if len(rows) != OBSERVATION_WINDOW_SIZE:
+            raise ValueError("相机2方向复核必须恰好使用2张新鲜画面")
+        requested_at = float(request.get("requested_monotonic_s", math.nan))
+        sequences = [int(row.get("frame_sequence", -1)) for row in rows]
+        timestamps = [
+            float(row.get("captured_monotonic_s", math.nan)) for row in rows
+        ]
+        angles = [float(row.get("angle_error_deg", math.nan)) for row in rows]
+        source_ok = all(int(row.get("camera_source", -1)) == 2 for row in rows)
+        accepted = all(row.get("accepted") is True for row in rows)
+        finite = bool(
+            math.isfinite(requested_at)
+            and all(math.isfinite(value) for value in timestamps + angles)
+        )
+        ordered = bool(
+            len(set(sequences)) == OBSERVATION_WINDOW_SIZE
+            and sequences[1] > sequences[0]
+            and finite
+            and timestamps[1] > timestamps[0]
+        )
+        fresh = bool(finite and all(value >= requested_at for value in timestamps))
+        span = timestamps[-1] - timestamps[0] if finite else math.inf
+        spread = abs(_square_axis_angle_deg(angles[1] - angles[0])) if finite else math.inf
+        median_angle = float(np.median(angles)) if finite else math.nan
+        maximum_abs_angle = max(abs(value) for value in angles) if finite else math.inf
+        gates = {
+            "camera2_source_identity": _gate(source_ok, source_ok, "true"),
+            "all_frames_explicitly_accepted": _gate(accepted, accepted, "true"),
+            "distinct_ordered_frames": _gate(
+                ordered, sequences, "two unique increasing frame sequences"
+            ),
+            "frames_captured_after_request": _gate(
+                fresh,
+                timestamps,
+                f">={requested_at:.6f}",
+            ),
+            "two_frame_window_span": _gate(
+                finite and 0.0 < span <= MAXIMUM_OBSERVATION_WINDOW_SPAN_S,
+                span,
+                f"0..{MAXIMUM_OBSERVATION_WINDOW_SPAN_S:.2f} s",
+            ),
+            "two_frame_angle_consistency": _gate(
+                finite and spread <= CAMERA2_MAXIMUM_TWO_FRAME_SPREAD_DEG,
+                spread,
+                f"<={CAMERA2_MAXIMUM_TWO_FRAME_SPREAD_DEG:.2f} deg",
+            ),
+        }
+        return {
+            "camera_source": 2,
+            "measurement_ids": [str(row.get("measurement_id") or "") for row in rows],
+            "frame_sequences": sequences,
+            "captured_monotonic_s": timestamps,
+            "angle_error_deg": angles,
+            "median_angle_error_deg": median_angle,
+            "maximum_absolute_angle_error_deg": maximum_abs_angle,
+            "two_frame_spread_deg": spread,
+            "marker_ids": [list(row.get("marker_ids") or []) for row in rows],
+            "gates": gates,
+        }
+
+    def _build_camera2_response(
+        self,
+        request: Mapping[str, Any],
+        samples: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        request_id = str(request.get("request_id") or "")
+        try:
+            window = self._camera2_window(request, samples)
+            image_names = self._save_images(samples, f"cam2-{request_id}")
+            current_state = request.get("controller_state") or {}
+            current_joints = _vector(
+                current_state.get("joints"), 4, "camera2 request controller joints"
+            )
+            current_pose = _vector(
+                current_state.get("pose"), 6, "camera2 request controller pose"
+            )
+        except Exception as exc:
+            return self._abort(request_id, f"相机2两帧方向证据无效：{exc}")
+        window["evidence_image_filenames"] = image_names
+        gates = dict(window["gates"])
+        locked = _vector(
+            self.camera2_orientation_lock_joints,
+            4,
+            "camera2 orientation lock joints",
+        )
+        locked_axis_errors = np.abs(current_joints[:3] - locked[:3])
+        gates["j1_j2_j3_remain_locked"] = _gate(
+            bool(np.all(locked_axis_errors <= 0.20)),
+            locked_axis_errors.astype(float).tolist(),
+            "each <=0.20 deg/mm",
+        )
+        if not all(gate.get("passed") is True for gate in gates.values()):
+            window["safety_gates"] = gates
+            self.camera2_alignment_windows.append(window)
+            self.status = "camera2_alignment_waiting_for_consistent_frames"
+            self.result_message = "相机2两帧方向暂不一致；未运动，自动重新观察"
+            self._save()
+            return {
+                "request_id": request_id,
+                "decision": "observe",
+                "calibration_sha256": self.calibration_hash,
+                "camera2_required": True,
+                "reason": self.result_message,
+                "evaluation": window,
+            }
+
+        median_angle = float(window["median_angle_error_deg"])
+        maximum_abs_angle = float(window["maximum_absolute_angle_error_deg"])
+        current_rz = float(rz_of(current_joints[0], current_joints[1], current_joints[3]))
+        aligned = bool(
+            abs(median_angle) <= CAMERA2_ALIGNMENT_MEDIAN_DEG
+            and maximum_abs_angle <= CAMERA2_ALIGNMENT_MAXIMUM_DEG
+        )
+        alignment_gate = _gate(
+            aligned,
+            {
+                "median_deg": median_angle,
+                "maximum_deg": maximum_abs_angle,
+            },
+            (
+                f"median <={CAMERA2_ALIGNMENT_MEDIAN_DEG:.2f} deg and "
+                f"maximum <={CAMERA2_ALIGNMENT_MAXIMUM_DEG:.2f} deg"
+            ),
+        )
+        # Being outside the final angle tolerance is the reason to move J4, not
+        # a failed authorization gate.  Keep it as a diagnostic/termination
+        # gate on the evidence window; only evidence quality and the J4-only
+        # planner belong to the proposal's all-PASS safety gates.
+        window["quality_gates"] = dict(gates)
+        window["camera2_visual_alignment_gate"] = alignment_gate
+        self.camera2_alignment_windows.append(window)
+
+        if aligned:
+            final_audit = audit_j4_only_orientation_target(
+                current_joints.astype(float).tolist(),
+                current_pose.astype(float).tolist(),
+                current_joints.astype(float).tolist(),
+                anchor_robot_xy_mm=self.anchor_robot_xy_mm,
+                local_extent_mm=LOCAL_EXTENT_MM,
+                domain_margin_mm=DOMAIN_MARGIN_MM,
+                required_j3_mm=self.required_j3_mm,
+                j3_tolerance_mm=0.20,
+                required_start_rz_deg=current_rz,
+                start_rz_tolerance_deg=0.15,
+                target_rz_deg=current_rz,
+                target_rz_tolerance_deg=0.15,
+                maximum_j4_rotation_deg=MAXIMUM_CAMERA2_J4_STEP_DEG,
+            )
+            if final_audit.get("passed") is not True:
+                return self._abort(
+                    request_id,
+                    "相机2显示已转正，但最终J4-only控制器安全复核失败",
+                    {"camera2_window": window, "audit": final_audit},
+                )
+            self.final_tray_rz_deg = current_rz
+            self.final_orientation_audit = {
+                "camera2_visual_window": window,
+                "controller_j4_only_audit": final_audit,
+            }
+            self.status = "arrived_above_selected_wafer_and_tray_aligned"
+            self.result_message = (
+                f"吸盘XY已到达{self.target_name}正上方；相机2连续两帧确认托盘横平竖直"
+                f"（中值误差{median_angle:+.3f}°，最大误差{maximum_abs_angle:.3f}°）；"
+                "J1/J2/J3保持不动，真空未开启"
+            )
+            self._save()
+            return {
+                "request_id": request_id,
+                "decision": "complete",
+                "calibration_sha256": self.calibration_hash,
+                "reason": self.result_message,
+                "evaluation": self.final_orientation_audit,
+            }
+
+        if self.camera2_j4_correction_count >= MAXIMUM_CAMERA2_J4_CORRECTIONS:
+            return self._abort(
+                request_id,
+                "相机2经过最大J4修正次数后仍未确认托盘转正",
+                window,
+            )
+        remaining_budget = (
+            MAXIMUM_FINAL_J4_ROTATION_DEG
+            - self.camera2_cumulative_j4_correction_deg
+        )
+        correction = max(
+            -MAXIMUM_CAMERA2_J4_STEP_DEG,
+            min(MAXIMUM_CAMERA2_J4_STEP_DEG, -median_angle),
+        )
+        if remaining_budget <= 0.0 or abs(correction) > remaining_budget + 1e-9:
+            return self._abort(request_id, "相机2 J4累计修正超过安全上限", window)
+        target_rz = _signed_angle_deg(current_rz + correction)
+        target_joints = current_joints.copy()
+        target_joints[3] = j4_for_rz(
+            current_joints[0], current_joints[1], target_rz
+        )
+        orientation_audit = audit_j4_only_orientation_target(
+            current_joints.astype(float).tolist(),
+            current_pose.astype(float).tolist(),
+            target_joints.astype(float).tolist(),
+            anchor_robot_xy_mm=self.anchor_robot_xy_mm,
+            local_extent_mm=LOCAL_EXTENT_MM,
+            domain_margin_mm=DOMAIN_MARGIN_MM,
+            required_j3_mm=self.required_j3_mm,
+            j3_tolerance_mm=0.20,
+            required_start_rz_deg=current_rz,
+            start_rz_tolerance_deg=0.15,
+            target_rz_deg=target_rz,
+            target_rz_tolerance_deg=0.15,
+            maximum_j4_rotation_deg=MAXIMUM_CAMERA2_J4_STEP_DEG,
+        )
+        motion_gates = dict(gates)
+        motion_gates["camera2_correction_required"] = _gate(
+            not aligned,
+            {
+                "median_deg": median_angle,
+                "maximum_deg": maximum_abs_angle,
+            },
+            "outside final visual tolerance",
+        )
+        motion_gates["camera2_j4_only_planner"] = _gate(
+            orientation_audit.get("passed") is True,
+            orientation_audit.get("passed"),
+            "true",
+        )
+        if orientation_audit.get("passed") is not True:
+            return self._abort(
+                request_id,
+                "相机2 J4-only修正规划未通过安全复核",
+                {"camera2_window": window, "audit": orientation_audit},
+            )
+        proposal = {
+            "proposal_id": f"wafer-pick-camera2-j4-{request_id}",
+            "target_name": self.target_name,
+            "phase": "wafer_pick_final_tray_orientation",
+            "motion_authorized": True,
+            "xy_only": False,
+            "j4_only": True,
+            "z_motion_authorized": False,
+            "vacuum_authorized": False,
+            "do_authorized": False,
+            "locked_j3_mm": self.required_j3_mm,
+            "locked_rz_deg": target_rz,
+            "calculation": {
+                "commanded_correction_xy_mm": [0.0, 0.0],
+                "camera2_median_angle_error_deg": median_angle,
+                "camera2_control_law": "target_rz = current_rz - image_angle",
+                "commanded_j4_correction_deg": correction,
+                "current_absolute_rz_deg": current_rz,
+                "target_absolute_rz_deg": target_rz,
+            },
+            "commanded_correction_xy_mm": [0.0, 0.0],
+            "predicted_endpoint_xy_mm": current_pose[:2].astype(float).tolist(),
+            "window": window,
+            "safety_gates": motion_gates,
+            "planner": {
+                "target_joints": target_joints.astype(float).tolist(),
+                "audit": orientation_audit,
+            },
+            "movement_index": self.movement_count + self.camera2_j4_correction_count + 1,
+            "cumulative_path_after_mm": self.cumulative_path_mm,
+        }
+        self.camera2_j4_correction_count += 1
+        self.camera2_cumulative_j4_correction_deg += abs(correction)
+        self.final_tray_rz_deg = target_rz
+        self.final_orientation_commanded = True
+        self.final_orientation_proposal = proposal
+        self.status = "camera2_j4_correction_pending_visual_verification"
+        self.result_message = (
+            f"相机2两帧测得托盘方向误差{median_angle:+.3f}°；等待仅J4修正"
+            f"{correction:+.3f}°，随后必须再次通过相机2两帧复核"
+        )
+        self._save()
+        return {
+            "request_id": request_id,
+            "decision": "approve",
+            "calibration_sha256": self.calibration_hash,
+            "camera2_required": True,
+            "proposal": proposal,
+            "target_joints": target_joints.astype(float).tolist(),
+        }
+
     def build_response(
         self,
         request: Mapping[str, Any],
@@ -761,56 +1067,8 @@ class WaferPickXYPositioningSession:
         if str(request.get("calibration_sha256") or "").upper() != self.calibration_hash:
             return self._abort(request_id, "平面手眼标定hash在会话中发生变化")
 
-        # The next ActionWorker request after the J4-only command is a
-        # controller-state verification, not another camera-dependent XY step.
-        # This avoids an unnecessary final visual wait and, importantly, does
-        # not run the imaging-Rz gate after J4 has intentionally left that Rz.
-        if self.final_orientation_commanded:
-            state = request.get("controller_state") or {}
-            try:
-                current_joints = _vector(
-                    state.get("joints"), 4, "final controller joints"
-                )
-                current_pose = _vector(
-                    state.get("pose"), 6, "final controller pose"
-                )
-                final_audit = audit_j4_only_orientation_target(
-                    current_joints.astype(float).tolist(),
-                    current_pose.astype(float).tolist(),
-                    current_joints.astype(float).tolist(),
-                    anchor_robot_xy_mm=self.anchor_robot_xy_mm,
-                    local_extent_mm=LOCAL_EXTENT_MM,
-                    domain_margin_mm=DOMAIN_MARGIN_MM,
-                    required_j3_mm=self.required_j3_mm,
-                    j3_tolerance_mm=0.20,
-                    required_start_rz_deg=self.final_tray_rz_deg,
-                    start_rz_tolerance_deg=0.15,
-                    target_rz_deg=self.final_tray_rz_deg,
-                    target_rz_tolerance_deg=0.15,
-                    maximum_j4_rotation_deg=MAXIMUM_FINAL_J4_ROTATION_DEG,
-                )
-            except Exception as exc:
-                return self._abort(request_id, f"最终J4方向复核失败：{exc}")
-            if final_audit.get("passed") is not True:
-                return self._abort(
-                    request_id,
-                    "最终J4方向未通过到位复核",
-                    final_audit,
-                )
-            self.final_orientation_audit = final_audit
-            self.status = "arrived_above_selected_wafer_and_tray_aligned"
-            self.result_message = (
-                f"吸盘XY已到达{self.target_name}正上方，J4已使工具对齐托盘"
-                f"（绝对Rz={self.final_tray_rz_deg:+.3f}°）；J3未下降，真空未开启"
-            )
-            self._save()
-            return {
-                "request_id": request_id,
-                "decision": "complete",
-                "calibration_sha256": self.calibration_hash,
-                "reason": self.result_message,
-                "evaluation": final_audit,
-            }
+        if self.camera2_alignment_active:
+            return self._build_camera2_response(request, samples)
         if self.movement_count >= MAXIMUM_MOVEMENT_COUNT:
             return self._abort(request_id, "达到最大XY移动次数，未继续运动")
 
@@ -840,94 +1098,25 @@ class WaferPickXYPositioningSession:
                 current_joints = _vector(
                     state.get("joints"), 4, "request controller joints"
                 )
-                current_pose = _vector(
-                    state.get("pose"), 6, "request controller pose"
-                )
-                target_joints = current_joints.copy()
-                target_joints[3] = j4_for_rz(
-                    current_joints[0],
-                    current_joints[1],
-                    self.final_tray_rz_deg,
-                )
-                orientation_audit = audit_j4_only_orientation_target(
-                    current_joints.astype(float).tolist(),
-                    current_pose.astype(float).tolist(),
-                    target_joints.astype(float).tolist(),
-                    anchor_robot_xy_mm=self.anchor_robot_xy_mm,
-                    local_extent_mm=LOCAL_EXTENT_MM,
-                    domain_margin_mm=DOMAIN_MARGIN_MM,
-                    required_j3_mm=self.required_j3_mm,
-                    j3_tolerance_mm=0.20,
-                    required_start_rz_deg=self.required_rz_deg,
-                    start_rz_tolerance_deg=0.30,
-                    target_rz_deg=self.final_tray_rz_deg,
-                    target_rz_tolerance_deg=0.15,
-                    maximum_j4_rotation_deg=MAXIMUM_FINAL_J4_ROTATION_DEG,
-                )
             except Exception as exc:
                 return self._abort(
-                    request_id, f"最终J4托盘对齐规划失败：{exc}", window
+                    request_id, f"切换相机2前的关节锁定失败：{exc}", window
                 )
-            gates["final_j4_orientation_planner"] = _gate(
-                orientation_audit.get("passed") is True,
-                orientation_audit.get("passed"),
-                "true",
-            )
-            if not all(gate.get("passed") is True for gate in gates.values()):
-                return self._abort(
-                    request_id,
-                    "最终J4托盘对齐安全门拒绝",
-                    {**window, "safety_gates": gates, "audit": orientation_audit},
-                )
-            proposal = {
-                "proposal_id": f"wafer-pick-final-j4-{request_id}",
-                "target_name": self.target_name,
-                "phase": "wafer_pick_final_tray_orientation",
-                "motion_authorized": True,
-                "xy_only": False,
-                "j4_only": True,
-                "z_motion_authorized": False,
-                "vacuum_authorized": False,
-                "do_authorized": False,
-                "locked_j3_mm": self.required_j3_mm,
-                "locked_rz_deg": self.final_tray_rz_deg,
-                "calculation": {
-                    "commanded_correction_xy_mm": [0.0, 0.0],
-                    "target_world_xy_mm": list(window["target_world_xy_mm"]),
-                    "current_world_xy_mm": current_pose[:2].astype(float).tolist(),
-                    "distance_before_mm": distance,
-                    "current_absolute_rz_deg": float(
-                        rz_of(
-                            current_joints[0], current_joints[1], current_joints[3]
-                        )
-                    ),
-                    "target_absolute_rz_deg": self.final_tray_rz_deg,
-                },
-                "commanded_correction_xy_mm": [0.0, 0.0],
-                "predicted_endpoint_xy_mm": current_pose[:2].astype(float).tolist(),
-                "window": window,
-                "safety_gates": gates,
-                "planner": {
-                    "target_joints": target_joints.astype(float).tolist(),
-                    "audit": orientation_audit,
-                },
-                "movement_index": self.movement_count + 1,
-                "cumulative_path_after_mm": self.cumulative_path_mm,
-            }
-            self.final_orientation_commanded = True
-            self.final_orientation_proposal = proposal
-            self.status = "final_j4_tray_alignment_pending"
+            self.camera2_orientation_lock_joints = current_joints.astype(float).tolist()
+            self.camera2_alignment_active = True
+            self.status = "xy_arrived_waiting_for_camera2_alignment"
             self.result_message = (
-                f"{self.target_name}的XY已到位；等待ActionWorker独立复核并只旋转J4，"
-                f"目标绝对Rz={self.final_tray_rz_deg:+.3f}°"
+                f"{self.target_name}的XY已到位；保持J1/J2/J3不动，切换相机2并等待"
+                "连续两帧托盘方向证据；当前尚未授权J4运动"
             )
             self._save()
             return {
                 "request_id": request_id,
-                "decision": "approve",
+                "decision": "observe",
                 "calibration_sha256": self.calibration_hash,
-                "proposal": proposal,
-                "target_joints": target_joints.astype(float).tolist(),
+                "camera2_required": True,
+                "reason": self.result_message,
+                "evaluation": self.final_hold,
             }
 
         state = request.get("controller_state") or {}
@@ -1089,6 +1278,12 @@ class WaferPickXYPositioningSession:
             "final_hold": self.final_hold,
             "final_orientation_proposal": self.final_orientation_proposal,
             "final_orientation_audit": self.final_orientation_audit,
+            "camera2_alignment_active": self.camera2_alignment_active,
+            "camera2_j4_correction_count": self.camera2_j4_correction_count,
+            "camera2_cumulative_j4_correction_deg": (
+                self.camera2_cumulative_j4_correction_deg
+            ),
+            "camera2_alignment_windows": self.camera2_alignment_windows,
             "evidence_images": self.evidence_images,
             "safety_boundary": {
                 "xy_only_during_positioning": True,
@@ -1101,6 +1296,15 @@ class WaferPickXYPositioningSession:
                 "prealignment_audit": self.prealignment_audit,
                 "final_j4_only_alignment": True,
                 "final_tray_absolute_rz_deg": self.final_tray_rz_deg,
+                "final_alignment_evidence": "two fresh camera2 frames",
+                "camera2_alignment_median_tolerance_deg": (
+                    CAMERA2_ALIGNMENT_MEDIAN_DEG
+                ),
+                "camera2_alignment_maximum_tolerance_deg": (
+                    CAMERA2_ALIGNMENT_MAXIMUM_DEG
+                ),
+                "maximum_camera2_j4_step_deg": MAXIMUM_CAMERA2_J4_STEP_DEG,
+                "maximum_camera2_j4_corrections": MAXIMUM_CAMERA2_J4_CORRECTIONS,
                 "maximum_final_j4_rotation_deg": MAXIMUM_FINAL_J4_ROTATION_DEG,
                 "maximum_xy_step_mm": MAXIMUM_STEP_MM,
                 "tray_center_domain_half_width_mm": (
@@ -1131,6 +1335,9 @@ class WaferPickXYPositioningSession:
             final_ok = False
             if self.status in {
                 "final_j4_tray_alignment_pending",
+                "xy_arrived_waiting_for_camera2_alignment",
+                "camera2_alignment_waiting_for_consistent_frames",
+                "camera2_j4_correction_pending_visual_verification",
                 successful_status,
             }:
                 self.status = "worker_failed_during_final_j4_alignment"

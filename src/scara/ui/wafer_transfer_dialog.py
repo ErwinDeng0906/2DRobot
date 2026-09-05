@@ -35,9 +35,13 @@ from scara.vision.wafer_pick_xy_positioning import (
     OBSERVATION_WINDOW_SIZE,
     select_bounded_observation_window,
 )
+from scara.vision.camera2_tray_orientation import (
+    observe_camera2_tray_orientation,
+)
 
 
 _PICK_XY_REQUEST_TIMEOUT_MS = 4000
+_PICK_XY_CAMERA2_STARTUP_TIMEOUT_MS = 8000
 
 
 _STYLE = """
@@ -238,11 +242,89 @@ class WaferTransferMonitorThread(QThread):
             self.msleep(70)
 
 
+class Camera2TrayAlignmentMonitorThread(QThread):
+    """Analyze each real camera-2 frame once for tray image orientation."""
+
+    frame_ready = pyqtSignal(QImage, object)
+    monitor_error = pyqtSignal(str)
+    frame_invalidated = pyqtSignal(str)
+
+    def __init__(
+        self,
+        camera: Any,
+        robot_state_provider: Optional[Callable[..., Optional[Mapping[str, Any]]]],
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.camera = camera
+        self.robot_state_provider = robot_state_provider
+        self._running = True
+
+    def stop(self, timeout_ms: int = 5000) -> bool:
+        self._running = False
+        self.requestInterruption()
+        return bool(self.wait(int(timeout_ms)))
+
+    def run(self) -> None:
+        last_sequence: Optional[int] = None
+        stale_since = time.monotonic()
+        invalidated = False
+        last_error = ""
+        while self._running and not self.isInterruptionRequested():
+            packet = self.camera.latest_frame_packet(max_age_s=1.0)
+            if packet is None:
+                if not invalidated and time.monotonic() - stale_since > 1.0:
+                    self.frame_invalidated.emit("相机2没有新鲜画面")
+                    invalidated = True
+                self.msleep(60)
+                continue
+            frame, sequence, captured_at = packet
+            if sequence == last_sequence:
+                self.msleep(45)
+                continue
+            last_sequence = int(sequence)
+            stale_since = time.monotonic()
+            invalidated = False
+            try:
+                observation = observe_camera2_tray_orientation(
+                    frame,
+                    frame_sequence=int(sequence),
+                    captured_monotonic_s=float(captured_at),
+                )
+                robot_state = None
+                if self.robot_state_provider is not None:
+                    try:
+                        robot_state = self.robot_state_provider(float(captured_at))
+                    except TypeError:
+                        robot_state = self.robot_state_provider()
+                    except Exception:
+                        robot_state = None
+                sample = observation.to_sample(robot_state)
+                rgb = cv2.cvtColor(observation.annotated_bgr, cv2.COLOR_BGR2RGB)
+                height, width, channels = rgb.shape
+                image = QImage(
+                    rgb.data,
+                    width,
+                    height,
+                    channels * width,
+                    QImage.Format.Format_RGB888,
+                ).copy()
+                self.frame_ready.emit(image, sample)
+                last_error = ""
+            except Exception as exc:  # noqa: BLE001 - display stays fail-closed
+                message = f"相机2托盘方向分析失败：{exc}"
+                if message != last_error:
+                    self.monitor_error.emit(message)
+                    last_error = message
+            self.msleep(70)
+
+
 class WaferTransferDialog(QDialog):
     """Click source/destination slots and follow live robot-relative distance."""
 
     pick_xy_start_requested = pyqtSignal()
     pick_xy_stop_requested = pyqtSignal()
+    pick_xy_camera2_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -271,6 +353,9 @@ class WaferTransferDialog(QDialog):
         self._pick_xy_pending_responder: Optional[Callable[[dict], None]] = None
         self._pick_xy_samples: deque[dict[str, Any]] = deque(maxlen=20)
         self._pick_xy_rejection_counts: Counter[str] = Counter()
+        self._camera2_monitor: Optional[Camera2TrayAlignmentMonitorThread] = None
+        self._camera2_mode = False
+        self._last_camera2_sequence: Optional[int] = None
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle("Wafer Transfer Vision")
         self.resize(1500, 920)
@@ -457,8 +542,13 @@ class WaferTransferDialog(QDialog):
         if self._stream_invalidated:
             self._last_interaction_text = ""
             self._stream_invalidated = False
-        self.preview.set_image(image)
-        if self._pick_xy_active and self._pick_xy_pending_request is not None:
+        if not self._camera2_mode:
+            self.preview.set_image(image)
+        if (
+            not self._camera2_mode
+            and self._pick_xy_active
+            and self._pick_xy_pending_request is not None
+        ):
             sample = self._pick_xy_sample(frame)
             self._pick_xy_samples.append(sample)
             if sample.get("accepted") is not True:
@@ -469,6 +559,69 @@ class WaferTransferDialog(QDialog):
                 )
             self._try_pick_xy_response()
         self._refresh_status(frame.session_snapshot)
+
+    def attach_camera2(self, camera: Any) -> None:
+        """Attach the separately opened logical camera 2 for final J4 feedback."""
+
+        if int(camera.source_index) != 2:
+            raise RuntimeError("最终J4视觉对齐要求逻辑相机源#2")
+        if self._camera2_monitor is not None:
+            if self._camera2_monitor.isRunning():
+                return
+            self._camera2_monitor = None
+        self._camera2_mode = True
+        self._last_camera2_sequence = None
+        self.preview.clear_image("等待相机2连续两帧托盘方向画面")
+        monitor = Camera2TrayAlignmentMonitorThread(
+            camera,
+            self.robot_state_provider,
+            self,
+        )
+        monitor.frame_ready.connect(self._on_camera2_frame)
+        monitor.monitor_error.connect(self._invalidate_camera2)
+        monitor.frame_invalidated.connect(self._invalidate_camera2)
+        self._camera2_monitor = monitor
+        monitor.start()
+        self._last_interaction_text = (
+            "XY已到位，已切入相机2视觉闭环；J1/J2/J3保持锁定。"
+        )
+        self._refresh_status(self.runtime.snapshot())
+
+    def _on_camera2_frame(self, image: QImage, sample: Mapping[str, Any]) -> None:
+        if not self._camera2_mode:
+            return
+        self.preview.set_image(image)
+        self._last_camera2_sequence = int(sample.get("frame_sequence", -1))
+        if self._pick_xy_active and self._pick_xy_pending_request is not None:
+            row = dict(sample)
+            self._pick_xy_samples.append(row)
+            if row.get("accepted") is not True:
+                self._pick_xy_rejection_counts.update(
+                    str(reason)
+                    for reason in row.get("rejection_reasons") or [
+                        "相机2托盘方向证据未通过"
+                    ]
+                )
+            self._try_pick_xy_response()
+        self._refresh_status(self.runtime.snapshot())
+
+    def _invalidate_camera2(self, message: str) -> None:
+        if not self._camera2_mode:
+            return
+        self.preview.clear_image("当前没有可用的新鲜相机2画面")
+        self._last_interaction_text = f"相机2方向判断暂不可用：{message}；未授权运动"
+        self._refresh_status(self.runtime.snapshot())
+
+    def _stop_camera2_monitor(self) -> bool:
+        monitor = self._camera2_monitor
+        if monitor is None:
+            self._camera2_mode = False
+            return True
+        if monitor.isRunning() and not monitor.stop(5000):
+            return False
+        self._camera2_monitor = None
+        self._camera2_mode = False
+        return True
 
     def _on_xy_motion_button(self) -> None:
         if self._pick_xy_active:
@@ -508,7 +661,8 @@ class WaferTransferDialog(QDialog):
             "2. J3保持相机1安全观察高度，不执行下降；\n"
             "3. 若当前Rz与相机1标定姿态不同，先保持J1/J2/J3不动、仅旋转J4"
             "到标定Rz；\n"
-            "4. XY到位后只旋转J4，使工具方向对齐本次相机1测得的托盘方向；\n"
+            "4. XY到位后自动启用相机2；连续两帧测量托盘画面角度，只旋转J4"
+            "修正，并再次用相机2连续两帧确认横平竖直；\n"
             "5. 不发送DO、真空或吸取命令；\n"
             "6. 每步后重新采2张合格帧；4秒内画面不足会跳过本轮并自动重试，"
             "明确质量门失败或误差不减小仍会停止。\n\n"
@@ -607,31 +761,32 @@ class WaferTransferDialog(QDialog):
                 }
             )
             return
-        if self._pick_xy_session.final_orientation_commanded:
-            try:
-                response = self._pick_xy_session.build_response(request, [])
-            except Exception as exc:  # noqa: BLE001 - fail closed at UI boundary
-                response = {
-                    "request_id": request_id,
-                    "decision": "abort",
-                    "reason": f"最终J4方向到位复核失败：{exc}",
-                }
-            responder(response)
-            self._last_interaction_text = str(
-                response.get("reason") or "最终J4方向已完成到位复核"
-            )
-            self._refresh_status(self.runtime.snapshot())
-            return
+        needs_camera2 = bool(self._pick_xy_session.camera2_alignment_active)
+        if needs_camera2 and self._camera2_monitor is None:
+            self.pick_xy_camera2_requested.emit()
         self._pick_xy_pending_request = dict(request)
         self._pick_xy_pending_responder = responder
         self._pick_xy_samples.clear()
         self._pick_xy_rejection_counts.clear()
+        source_label = "相机2方向" if needs_camera2 else "相机1位置"
+        startup_grace = bool(needs_camera2 and self._last_camera2_sequence is None)
+        timeout_ms = (
+            _PICK_XY_CAMERA2_STARTUP_TIMEOUT_MS
+            if startup_grace
+            else _PICK_XY_REQUEST_TIMEOUT_MS
+        )
+        self._pick_xy_pending_request["_ui_timeout_ms"] = timeout_ms
         self._last_interaction_text = (
-            f"执行请求 {request_id}：等待请求之后的2张合格帧；此时尚未运动。"
+            f"执行请求 {request_id}：等待请求之后的2张合格{source_label}帧；"
+            + (
+                "相机2首次连接最多等待8秒；此时尚未运动。"
+                if startup_grace
+                else "此时尚未运动。"
+            )
         )
         self._refresh_status(self.runtime.snapshot())
         QTimer.singleShot(
-            _PICK_XY_REQUEST_TIMEOUT_MS,
+            timeout_ms,
             lambda: self._pick_xy_timeout(request_id),
         )
 
@@ -721,6 +876,8 @@ class WaferTransferDialog(QDialog):
                 "decision": "abort",
                 "reason": f"XY悬空定位计算失败：{exc}",
             }
+        if response.get("camera2_required") is True and not self._camera2_mode:
+            self.pick_xy_camera2_requested.emit()
         if callable(responder):
             responder(response)
         decision = str(response.get("decision") or "")
@@ -732,7 +889,8 @@ class WaferTransferDialog(QDialog):
             if proposal.get("phase") == "wafer_pick_final_tray_orientation":
                 calculation = proposal.get("calculation") or {}
                 self._last_interaction_text = (
-                    "XY已到位，最终J4-only候选已交ActionWorker独立复核："
+                    "相机2连续两帧已测角，J4-only候选已交ActionWorker独立复核："
+                    f"画面误差 {float(calculation.get('camera2_median_angle_error_deg')):+.3f}°；"
                     f"绝对Rz {float(calculation.get('current_absolute_rz_deg')):+.3f}° → "
                     f"{float(calculation.get('target_absolute_rz_deg')):+.3f}°。"
                 )
@@ -765,6 +923,11 @@ class WaferTransferDialog(QDialog):
             f"{reason}×{count}"
             for reason, count in self._pick_xy_rejection_counts.most_common(4)
         )
+        camera2 = bool(
+            self._pick_xy_session is not None
+            and self._pick_xy_session.camera2_alignment_active
+        )
+        timeout_seconds = float(request.get("_ui_timeout_ms", 4000)) / 1000.0
         self._pick_xy_pending_request = None
         self._pick_xy_pending_responder = None
         self._pick_xy_samples.clear()
@@ -778,7 +941,8 @@ class WaferTransferDialog(QDialog):
                         request.get("calibration_sha256") or ""
                     ).upper(),
                     "reason": (
-                        "本轮4秒内未获得2张间隔不超过1.75秒的合格相机1画面；"
+                        f"本轮{timeout_seconds:g}秒内未获得2张间隔不超过1.75秒的合格"
+                        f"{'相机2方向' if camera2 else '相机1位置'}画面；"
                         "未运动，自动进入下一观察窗口"
                         + (
                             f"；拒绝统计：{rejection_summary}"
@@ -798,6 +962,9 @@ class WaferTransferDialog(QDialog):
         self._pick_xy_pending_responder = None
         self._pick_xy_samples.clear()
         self._pick_xy_rejection_counts.clear()
+        if not self._stop_camera2_monitor():
+            ok = False
+            message = f"{message}；相机2方向分析线程未能安全退出"
         self._pick_xy_session = None
         self._set_pick_xy_controls(False)
         if session is not None:
@@ -826,8 +993,18 @@ class WaferTransferDialog(QDialog):
         registration = snapshot.get("registration") or {}
         consensus = snapshot.get("source_consensus") or {}
         diagnostics = snapshot.get("pose_diagnostics") or {}
-        displayed_sequence = None if self._last_frame is None else self._last_frame.frame_sequence
-        paired = displayed_sequence == snapshot.get("latest_frame_sequence") and displayed_sequence is not None
+        displayed_sequence = (
+            self._last_camera2_sequence
+            if self._camera2_mode
+            else (None if self._last_frame is None else self._last_frame.frame_sequence)
+        )
+        paired = bool(
+            self._camera2_mode
+            or (
+                displayed_sequence == snapshot.get("latest_frame_sequence")
+                and displayed_sequence is not None
+            )
+        )
         pending_evidence = (
             self._eligible_pick_xy_samples()
             if self._pick_xy_pending_request is not None
@@ -860,7 +1037,15 @@ class WaferTransferDialog(QDialog):
             extra or self._last_interaction_text or "点击槽位或按编号选择；选择不等于允许运动。",
             "",
             f"选择模式：{'拾取槽' if self._selection_role == 'source' else '放置槽'}",
-            f"frame_id：图像={displayed_sequence} / 面板={snapshot.get('latest_frame_sequence')} · {'同步' if paired else 'STALE'}",
+            (
+                f"frame_id：{'相机2方向帧=' if self._camera2_mode else '图像='}"
+                f"{displayed_sequence}"
+                + (
+                    " · 相机2视觉闭环"
+                    if self._camera2_mode
+                    else f" / 面板={snapshot.get('latest_frame_sequence')} · {'同步' if paired else 'STALE'}"
+                )
+            ),
             f"槽位几何：{diagnostics.get('projection_source', 'unavailable')}",
             f"运动位姿：{'PASS' if diagnostics.get('metric_passed') else 'WAIT'} · {diagnostics.get('reason') or '—'}",
             f"阶段：{snapshot.get('phase')}",
@@ -961,6 +1146,10 @@ class WaferTransferDialog(QDialog):
             self._show_error("后台视觉线程尚未退出")
             event.ignore()
             return
+        if not self._stop_camera2_monitor():
+            self._show_error("相机2方向分析线程尚未退出")
+            event.ignore()
+            return
         event.accept()
 
 
@@ -968,4 +1157,5 @@ __all__ = [
     "ClickableImageLabel",
     "WaferTransferDialog",
     "WaferTransferMonitorThread",
+    "Camera2TrayAlignmentMonitorThread",
 ]

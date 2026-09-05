@@ -146,6 +146,23 @@ class WaferPickXYPositioningTests(unittest.TestCase):
         return rows
 
     @staticmethod
+    def _camera2_samples(requested_at: float, angle_deg: float) -> list[dict]:
+        return [
+            {
+                "measurement_id": f"camera2-synthetic-{index}",
+                "frame_sequence": 100 + index,
+                "captured_monotonic_s": requested_at + 0.02 * (index + 1),
+                "accepted": True,
+                "camera_source": 2,
+                "angle_error_deg": float(angle_deg),
+                "marker_ids": [25],
+                "marker_count": 1,
+                "annotated_bgr": np.zeros((80, 120, 3), dtype=np.uint8),
+            }
+            for index in range(OBSERVATION_WINDOW_SIZE)
+        ]
+
+    @staticmethod
     def _tray_transform_C_T(
         session: WaferPickXYPositioningSession,
         state: dict,
@@ -393,7 +410,7 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                         "fresh_frame_synchronised_robot_state": {"passed": True},
                     }
                 response = session.build_response(request, samples)
-                if response["decision"] == "complete":
+                if response["decision"] in {"complete", "observe"}:
                     break
                 self.assertEqual("approve", response["decision"], response)
                 proposal = response["proposal"]
@@ -403,7 +420,26 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                     )
                 state = state_from_joints(list(response["target_joints"]))
 
-        self.assertIsNotNone(response)
+            self.assertIsNotNone(response)
+            self.assertEqual("observe", response["decision"])
+            self.assertTrue(response["camera2_required"])
+            camera2_request = self._request(session, state)
+            correction = session.build_response(
+                camera2_request,
+                self._camera2_samples(
+                    float(camera2_request["requested_monotonic_s"]), -4.5
+                ),
+            )
+            self.assertEqual("approve", correction["decision"])
+            state = state_from_joints(list(correction["target_joints"]))
+            verification_request = self._request(session, state)
+            response = session.build_response(
+                verification_request,
+                self._camera2_samples(
+                    float(verification_request["requested_monotonic_s"]), 0.15
+                ),
+            )
+
         self.assertEqual("complete", response["decision"])
         self.assertGreater(len(distances), 1)
         self.assertTrue(
@@ -581,7 +617,7 @@ class WaferPickXYPositioningTests(unittest.TestCase):
         ]
         self.assertFalse(gate["passed"])
 
-    def test_independent_two_frame_hold_then_j4_aligns_to_tray(self) -> None:
+    def test_xy_hold_then_camera2_measures_corrects_and_verifies_j4(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             session, state = self._session(
                 temporary,
@@ -589,7 +625,7 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                 current="P31",
             )
             request = self._request(session, state)
-            orientation = session.build_response(
+            hold = session.build_response(
                 request,
                 self._samples(
                     session.target_name,
@@ -597,10 +633,29 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                     float(request["requested_monotonic_s"]),
                 ),
             )
+            self.assertEqual("observe", hold["decision"])
+            self.assertTrue(hold["camera2_required"])
+
+            camera2_request = self._request(session, state)
+            orientation = session.build_response(
+                camera2_request,
+                self._camera2_samples(
+                    float(camera2_request["requested_monotonic_s"]), -4.5
+                ),
+            )
             self.assertEqual("approve", orientation["decision"])
             proposal = orientation["proposal"]
             self.assertEqual(
                 "wafer_pick_final_tray_orientation", proposal["phase"]
+            )
+            self.assertFalse(
+                proposal["window"]["camera2_visual_alignment_gate"]["passed"]
+            )
+            self.assertTrue(
+                all(
+                    gate["passed"] is True
+                    for gate in proposal["safety_gates"].values()
+                )
             )
             self.assertFalse(proposal["xy_only"])
             self.assertTrue(proposal["j4_only"])
@@ -611,13 +666,16 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                     places=9,
                 )
             self.assertAlmostEqual(
-                self.registration["yaw_world_from_tray_deg"],
+                rz_of(
+                    state["joints"][0], state["joints"][1], state["joints"][3]
+                )
+                + 4.5,
                 rz_of(
                     orientation["target_joints"][0],
                     orientation["target_joints"][1],
                     orientation["target_joints"][3],
                 ),
-                places=9,
+                places=6,
             )
 
             final_joints = list(orientation["target_joints"])
@@ -635,12 +693,14 @@ class WaferPickXYPositioningTests(unittest.TestCase):
                 ],
             }
             completed = session.build_response(
-                self._request(session, final_state),
-                [],
+                (verification_request := self._request(session, final_state)),
+                self._camera2_samples(
+                    float(verification_request["requested_monotonic_s"]), 0.12
+                ),
             )
         self.assertEqual("complete", completed["decision"])
-        self.assertIn("J4已使工具对齐托盘", completed["reason"])
-        self.assertIn("J3未下降", completed["reason"])
+        self.assertIn("相机2连续两帧确认托盘横平竖直", completed["reason"])
+        self.assertIn("J1/J2/J3保持不动", completed["reason"])
 
 
 if __name__ == "__main__":

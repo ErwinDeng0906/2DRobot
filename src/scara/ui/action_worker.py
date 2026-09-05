@@ -1865,10 +1865,85 @@ class ActionWorker(QThread):
                         raise RuntimeError(f"{runtime_label} 最终方向阶段不得声明XY-only")
                     if proposal.get("j4_only") is not True:
                         raise RuntimeError(f"{runtime_label} 最终方向阶段未声明J4-only")
-                    expected_locked_rz = step["final_rz_deg"]
+                    calculation = _json_safe_mapping(
+                        proposal.get("calculation"),
+                        f"{runtime_label} camera2 calculation",
+                    )
+                    try:
+                        measured_angle = float(
+                            calculation.get("camera2_median_angle_error_deg")
+                        )
+                        commanded_j4 = float(
+                            calculation.get("commanded_j4_correction_deg")
+                        )
+                        required_start_rz = float(
+                            calculation.get("current_absolute_rz_deg")
+                        )
+                        expected_locked_rz = float(
+                            calculation.get("target_absolute_rz_deg")
+                        )
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise RuntimeError(
+                            f"{runtime_label} 最终方向阶段缺少相机2测角数据"
+                        ) from exc
+                    if not all(
+                        math.isfinite(value)
+                        for value in (
+                            measured_angle,
+                            commanded_j4,
+                            required_start_rz,
+                            expected_locked_rz,
+                        )
+                    ):
+                        raise RuntimeError(f"{runtime_label} 相机2测角数据不是有限数值")
+                    if abs(commanded_j4) > min(
+                        step["max_j4_rotation_deg"], 10.0
+                    ) + 1e-9:
+                        raise RuntimeError(f"{runtime_label} 相机2单步J4修正超过10度")
+                    target_delta = (
+                        (expected_locked_rz - required_start_rz + 180.0)
+                        % 360.0
+                        - 180.0
+                    )
+                    if abs(target_delta - commanded_j4) > 1e-6:
+                        raise RuntimeError(
+                            f"{runtime_label} J4修正量与目标绝对Rz不一致"
+                        )
+                    expected_from_measurement = (
+                        required_start_rz - measured_angle
+                    )
+                    # A large residual is intentionally clipped to a 10-degree
+                    # step; otherwise the exact camera feedback law must hold.
+                    if abs(measured_angle) <= 10.0 + 1e-9 and abs(
+                        (expected_locked_rz - expected_from_measurement + 180.0)
+                        % 360.0
+                        - 180.0
+                    ) > 1e-6:
+                        raise RuntimeError(
+                            f"{runtime_label} J4目标与相机2方向误差的符号或数值不一致"
+                        )
+                    if abs(measured_angle) > 10.0 + 1e-9 and (
+                        abs(abs(commanded_j4) - 10.0) > 1e-6
+                        or commanded_j4 * measured_angle >= 0.0
+                    ):
+                        raise RuntimeError(
+                            f"{runtime_label} 大角度相机2修正未正确限幅或方向错误"
+                        )
                     audit_step = dict(step)
                     audit_step["_audit_mode"] = "j4_only"
                     audit_step["precompensate_rz"] = False
+                    audit_step["required_rz_deg"] = required_start_rz
+                    audit_step["final_rz_deg"] = expected_locked_rz
+                    audit_step["max_j4_rotation_deg"] = min(
+                        step["max_j4_rotation_deg"], 10.0
+                    )
+                    # Camera 2 may need several seconds for DirectShow and
+                    # auto-exposure startup. Fresh controller state is still
+                    # re-read immediately before motion, so only this
+                    # camera-backed proposal's collection lifetime is relaxed.
+                    audit_step["proposal_max_age_s"] = max(
+                        step["proposal_max_age_s"], 9.0
+                    )
                 forbidden_authorizations = {
                     "z_motion_authorized": proposal.get("z_motion_authorized"),
                     "vacuum_authorized": proposal.get("vacuum_authorized"),
